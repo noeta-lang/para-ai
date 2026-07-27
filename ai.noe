@@ -1,0 +1,631 @@
+// `para.ai` — an agent harness for Noeta.
+//
+//     use para.ai.{Agent, AgentConfig}
+//     use para.ai.providers.anthropic.Anthropic
+//
+//     agent = Agent.from(AgentConfig.new("claude-opus-5"), Anthropic.new(key))
+//     echo agent.run_sync("Say hello in Swedish")?
+//
+// This module owns the data model (`Message`, `Part`, `Role`, `Conversation`), the run loop, and
+// the error type. The codec seam is `para.ai.provider`; the vendors live under
+// `para.ai.providers.*`; `para.ai.mock` is the hermetic test double.
+//
+// **The run loop is the only place with I/O.** A provider never performs a request — it encodes one
+// and decodes the answer. Everything transport-shaped (retry with `Retry-After`, mocking,
+// recording, caching, logging) is a `para/api` middleware, written once, outside this package.
+//
+// **Telemetry is not a module.** The run loop emits OpenTelemetry GenAI spans and metrics directly
+// onto `std.tracing`/`std.metrics`, so it cannot be forgotten: nothing when no endpoint is set,
+// everything when one is, and no configuration API of our own.
+namespace para.ai
+
+use std.http.client
+use std.http.{HttpError, Request}
+use std.{env, metrics, time, tracing}
+use para.api.Api
+use para.api.middleware.Retry
+use para.ai.provider.{ModelRequest, ModelReply, Provider, StopReason, Usage, Wire}
+
+// --- The data model -------------------------------------------------------------------------------
+//
+// Every type here is a value `struct` or `enum`, never a `class`. That is not incidental: value
+// types are `Send`, reference types are not, and a run's messages have to be able to cross a
+// channel and an isolate boundary. `bytes` is `Send`, so inline images are fine.
+
+pub enum Role {
+    System
+    User
+    Assistant
+    Tool
+}
+
+// One piece of a message. Covers what the major vendors can express between them; each codec is
+// responsible for rejecting — loudly, at `encode` — what its own vendor cannot.
+//
+// Two of these are decisions rather than shapes:
+//
+//   * **`ToolCall.args` is a raw JSON string, not a decoded map.** Vendors stream tool arguments as
+//     partial JSON fragments, so keeping the raw text puts the accumulate-then-decode boundary in
+//     one place, and a malformed argument blob becomes a recoverable error with a path rather than
+//     a half-built value.
+//   * **`Thinking.signature` is round-tripped verbatim.** Anthropic requires the signature back on
+//     the next turn for the block to remain valid; discarding it silently degrades multi-turn
+//     reasoning. Nothing in para/ai interprets it.
+@derive(Equatable, Display)
+pub enum Part {
+    Text(text: string)
+    Image(mime: string, data: bytes)
+    File(mime: string, name: string, data: bytes)
+    ToolCall(id: string, name: string, args: string)
+    ToolResult(id: string, content: string, is_error: bool)
+    Thinking(text: string, signature: string)
+}
+
+// One turn of a conversation.
+//
+// `name` is the optional speaker name some vendors accept on a `user` turn (multi-participant
+// chats); a codec whose vendor has no such field ignores it rather than failing, because a name is
+// a hint and dropping it changes nothing about what was said.
+@derive(Equatable, Display)
+pub struct Message {
+    pub role: Role
+    pub parts: List<Part>
+    pub name: ?string = none
+
+    fn system(text: string): Message {
+        return Message { role: Role.System, parts: [Part.Text(text: text)] }
+    }
+
+    fn user(text: string): Message {
+        return Message { role: Role.User, parts: [Part.Text(text: text)] }
+    }
+
+    fn assistant(text: string): Message {
+        return Message { role: Role.Assistant, parts: [Part.Text(text: text)] }
+    }
+
+    // A tool's answer, addressed to the call it answers. `is_error: true` is how a failing tool is
+    // reported back to the model — a failing tool is a turn, not an outage.
+    fn tool(id: string, content: string, is_error: bool = false): Message {
+        return Message {
+            role: Role.Tool,
+            parts: [Part.ToolResult(id: id, content: content, is_error: is_error)],
+        }
+    }
+
+    // Every `Text` part, concatenated. The plain-string view of a turn — what a chat UI renders and
+    // what `run_sync` hands back. Thinking, tool calls, and attachments are deliberately absent:
+    // they are not what the message *said*.
+    fn text(): string {
+        mut out = ""
+        for p in self.parts {
+            out = out ~ match p {
+                Part.Text(t) => t,
+                _ => "",
+            }
+        }
+        return out
+    }
+
+    // Every tool call this message requests, in order. Empty unless the model asked for one.
+    fn tool_calls(): List<Part> {
+        mut out: List<Part> = []
+        for p in self.parts {
+            match p {
+                Part.ToolCall(id, name, args) => {
+                    out = out ~ [p]
+                },
+                _ => {},
+            }
+        }
+        return out
+    }
+}
+
+// A conversation, as a value. Immutable: every builder returns a new `Conversation`, so a prefix
+// can be shared across concurrent runs without any of them disturbing the others.
+@derive(Equatable, Display)
+pub struct Conversation {
+    pub messages: List<Message> = []
+
+    fn new(): Conversation {
+        return Conversation {}
+    }
+
+    // The one-user-turn conversation — the shape behind `run_sync`.
+    fn of(text: string): Conversation {
+        return Conversation { messages: [Message.user(text)] }
+    }
+
+    fn with(m: Message): Conversation {
+        return Conversation { messages: self.messages ~ [m] }
+    }
+
+    fn user(text: string): Conversation {
+        return self.with(Message.user(text))
+    }
+
+    fn assistant(text: string): Conversation {
+        return self.with(Message.assistant(text))
+    }
+
+    fn system(text: string): Conversation {
+        return self.with(Message.system(text))
+    }
+
+    fn last(): ?Message {
+        return self.messages.last()
+    }
+}
+
+// What a completed run produced: the whole conversation including the assistant's answer, the
+// aggregate token usage, how many model calls it took, and why the model stopped.
+@derive(Equatable, Display)
+pub struct Run {
+    pub messages: List<Message>
+    pub usage: Usage = Usage {}
+    pub turns: int = 0
+    pub stop: StopReason = StopReason.EndTurn
+
+    // The assistant's answer as plain text, or `""` if the run produced no assistant turn.
+    fn text(): string {
+        return match self.messages.last() {
+            some(m) => m.text(),
+            none => "",
+        }
+    }
+
+    fn conversation(): Conversation {
+        return Conversation { messages: self.messages }
+    }
+}
+
+// --- Errors ---------------------------------------------------------------------------------------
+
+// Everything that can go wrong in a run.
+//
+// A language constraint shapes this: **a type carries at most one `From` impl** (a second is a
+// coherence conflict). So `AiError` declares `impl From<HttpError>` — the conversion that appears
+// at the most `?` sites — and `JsonError` is mapped explicitly at its handful of decode points into
+// `Decode(path, message)`, preserving the path. That is a decision, not an omission: the first
+// contributor who reaches for a second `From` should know why it is not there.
+//
+// The `para/api` line holds here too: `Err` means the call failed, while an HTTP error *status*
+// from a vendor is an answer — decoded into `Provider(status, code, message)` with the vendor's own
+// typed error body, so `code == "rate_limit_error"` is matchable and nobody has to regex a message.
+//
+// `Guard(stage, guard, reason)` and `Mcp(server, code, message)` join this enum in phases 5 and 6,
+// with the types they name.
+@derive(Error)
+pub enum AiError {
+    // The request never produced a response — the network broke.
+    Transport(inner: HttpError)
+    // The vendor answered with an error status and its own typed error body.
+    Provider(status: int, code: string, message: string)
+    // A codec cannot express something the request contains. Raised at `encode`, naming the part
+    // and the provider, rather than silently dropping it.
+    Encode(provider: string, message: string)
+    // A response body did not decode. `path` is the path to the failing value, when there is one.
+    Decode(path: string, message: string)
+    // The model declined. Never a decode failure: conflating the two makes "the model declined"
+    // look like "your schema is wrong", which sends people debugging the wrong thing.
+    Refused(reason: string)
+    // A tool failed in a way the model cannot be asked to recover from. Constructed from phase 2.
+    Tool(name: string, message: string)
+    // The conversation does not fit the budget and no context strategy was configured to fit it.
+    // Constructed from phase 5.
+    ContextOverflow(needed: int, budget: int)
+    // The run was cancelled at a suspension point.
+    Cancelled
+
+    impl Display {
+        fn to_string(): string {
+            return match self {
+                AiError.Transport(inner) => "transport failed (${inner.kind()}): ${inner.message()}",
+                AiError.Provider(status, code, message) => "provider error ${status} ${code}: ${message}",
+                AiError.Encode(provider, message) => "${provider} cannot encode this request: ${message}",
+                AiError.Decode(path, message) => if path == "" then "decode failed: ${message}" else "decode failed at ${path}: ${message}",
+                AiError.Refused(reason) => "the model refused: ${reason}",
+                AiError.Tool(name, message) => "tool `${name}` failed: ${message}",
+                AiError.ContextOverflow(needed, budget) => "context overflow: ${needed} tokens needed, budget is ${budget} — configure a context strategy",
+                AiError.Cancelled => "cancelled",
+            }
+        }
+    }
+
+    impl From<HttpError> {
+        fn from(e: HttpError): AiError {
+            return AiError.Transport(inner: e)
+        }
+    }
+}
+
+// --- Configuration --------------------------------------------------------------------------------
+
+// Everything about an agent except its provider and its transport.
+//
+// It is a plain value struct, so it is `Send`: this is the thing you hand to a worker or an isolate,
+// which then builds its own `Agent` from it. An `Agent` itself is **not** `Send` — it holds an
+// `Api`, whose middleware stack is a `List<dyn Middleware>` — and phases 2 and 5 add more `dyn`
+// slots (tool sources, guards). Build the agent per worker; ship the config.
+@derive(Equatable, Display)
+pub struct AgentConfig {
+    pub model: string
+    pub system: ?string = none
+    pub max_tokens: ?int = none
+    pub temperature: ?float = none
+    pub stop: List<string> = []
+    // Names the run's root span (`invoke_agent {name}`) and its `gen_ai.agent.name` attribute. Keep
+    // it low-cardinality — it is a span attribute, not an identifier.
+    pub name: string = "agent"
+    // Vendor-specific request-body keys, as raw JSON fragments, merged verbatim by the codec.
+    // Documented as unchecked: this is the escape hatch for a knob the neutral model has not
+    // grown yet, and a malformed fragment surfaces at `encode`.
+    pub extra: Map<string, string> = {}
+
+    fn new(model: string): AgentConfig {
+        return AgentConfig { model: model }
+    }
+
+    fn with_system(text: string): AgentConfig {
+        return AgentConfig { ...self, system: some(text) }
+    }
+
+    fn with_max_tokens(n: int): AgentConfig {
+        return AgentConfig { ...self, max_tokens: some(n) }
+    }
+
+    fn with_temperature(t: float): AgentConfig {
+        return AgentConfig { ...self, temperature: some(t) }
+    }
+
+    fn with_stop(stop: List<string>): AgentConfig {
+        return AgentConfig { ...self, stop: stop }
+    }
+
+    fn named(name: string): AgentConfig {
+        return AgentConfig { ...self, name: name }
+    }
+
+    fn with_extra(key: string, json_fragment: string): AgentConfig {
+        return AgentConfig { ...self, extra: self.extra.set(key, json_fragment) }
+    }
+}
+
+// --- Telemetry ------------------------------------------------------------------------------------
+//
+// The OpenTelemetry GenAI semantic conventions, emitted from the run loop itself. Three commitments:
+//
+//   * **Message content is off by default.** Prompts and completions in spans are a privacy and
+//     compliance hazard. Opt in with `OTEL_GENAI_CAPTURE_MESSAGES=true`, matching the OTel
+//     convention rather than inventing a knob.
+//   * **No high-cardinality metric attributes.** No user ids, no thread ids, no prompt text — every
+//     distinct attribute set is a stored series, and an agent is exactly the workload that would
+//     blow that up.
+//   * **The semconv version is pinned and stated** — in the README, next to the attribute table.
+
+fn capture_messages(): bool {
+    v = (env.get("OTEL_GENAI_CAPTURE_MESSAGES") ?? "").lower()
+    return v == "true" || v == "1"
+}
+
+fn token_usage_histogram(): dyn {
+    return metrics.histogram("gen_ai.client.token.usage")
+}
+
+fn operation_duration_histogram(): dyn {
+    return metrics.histogram("gen_ai.client.operation.duration")
+}
+
+// --- The agent ------------------------------------------------------------------------------------
+
+// An agent: a configuration, a provider codec, and the transport chain to send through.
+//
+// `P` is a **bound**, not a trait object. That buys three things over `dyn Provider`: the codec
+// stays a value type, dispatch is static, and the bound types the body — a wrong argument or return
+// against a `Provider` method is a check-time error at this definition, before any call site
+// exists. The cost is real and accepted: a bound pins the provider in the type, so
+// `match env.get("AI_PROVIDER") { … }` cannot produce one `Agent` value. Runtime selection is the
+// caller's `match`, pushed to the outermost point where the arms still agree — which works because
+// `run`/`run_sync` return provider-independent types. The README leads with that pattern so nobody
+// discovers the constraint by hitting a type error.
+pub struct Agent<P: Provider> {
+    pub config: AgentConfig
+    pub provider: P
+    pub api: Api
+
+    // An agent over the default transport: a plain client wrapped in `Retry`, which honors a
+    // vendor's `Retry-After` and backs off on 429/502/503/504. `retry(0)` on the client is
+    // deliberate and load-bearing — std's own retry lives *inside* `send`, beneath every
+    // middleware, and leaving both on multiplies the attempts.
+    fn from(cfg: AgentConfig, p: P): Agent<P> {
+        return Agent.over(cfg, p, Api.new(client.new().retry(0)).with(Retry.new()))
+    }
+
+    // An agent over a transport chain you composed yourself — the door for `Mock`, `Record`,
+    // `Cache`, a custom auth layer, or a client with a different timeout.
+    fn over(cfg: AgentConfig, p: P, api: Api): Agent<P> {
+        return Agent { config: cfg, provider: p, api: api }
+    }
+
+    // The neutral request for a conversation, with the config's system prompt prepended when the
+    // conversation does not open with one of its own.
+    fn request(conv: Conversation): ModelRequest {
+        mut msgs = conv.messages
+        match self.config.system {
+            some(text) => {
+                msgs = [Message.system(text)] ~ msgs
+            },
+            none => {},
+        }
+        return ModelRequest {
+            model: self.config.model,
+            messages: msgs,
+            max_tokens: self.config.max_tokens,
+            temperature: self.config.temperature,
+            stop: self.config.stop,
+            extra: self.config.extra,
+        }
+    }
+
+    // One model call: encode, send through the chain, decode, and emit the `chat {model}` span and
+    // the two GenAI metrics around it. The only I/O in the package.
+    fn call(req: ModelRequest): Result<ModelReply, AiError> {
+        wire = self.provider.encode(req)?
+        vendor = self.provider.name()
+
+        span = tracing.span("chat ${req.model}")
+        span.set_attribute("gen_ai.operation.name", "chat")
+        span.set_attribute("gen_ai.provider.name", vendor)
+        span.set_attribute("gen_ai.request.model", req.model)
+        match req.max_tokens {
+            some(n) => {
+                span.set_attribute("gen_ai.request.max_tokens", n)
+            },
+            none => {},
+        }
+        match req.temperature {
+            some(t) => {
+                span.set_attribute("gen_ai.request.temperature", t)
+            },
+            none => {},
+        }
+        if capture_messages() {
+            span.add_event("gen_ai.client.inference.operation.details")
+            span.set_attribute("gen_ai.input.messages", wire.body)
+        }
+
+        started = time.monotonic()
+        outcome: Result<ModelReply, AiError> = self.perform(wire)
+        elapsed = (time.monotonic() - started).to_float() / 1000.0
+
+        mut attrs = {
+            "gen_ai.operation.name": "chat",
+            "gen_ai.provider.name": vendor,
+            "gen_ai.request.model": req.model,
+        }
+        match outcome {
+            Ok(reply) => {
+                span.set_attribute("gen_ai.response.model", reply.model)
+                span.set_attribute("gen_ai.response.finish_reasons", reply.stop.semconv())
+                span.set_attribute("gen_ai.usage.input_tokens", reply.usage.input_tokens)
+                span.set_attribute("gen_ai.usage.output_tokens", reply.usage.output_tokens)
+                if capture_messages() {
+                    span.set_attribute("gen_ai.output.messages", "${reply.parts}")
+                }
+                record_tokens(vendor, req.model, reply.usage)
+            },
+            Err(e) => {
+                span.record_error("${e}")
+                attrs = attrs.set("error.type", error_type(e))
+            },
+        }
+        operation_duration_histogram().record_with(elapsed, attrs)
+        span.end()
+        return outcome
+    }
+
+    // The transport half of `call`, kept apart so the span above wraps exactly the request and
+    // nothing else.
+    fn perform(wire: Wire): Result<ModelReply, AiError> {
+        req: Request = self.api.prepare(wire.method, wire.url, wire.body, wire.headers)
+        // `?` here is the `impl From<HttpError>` conversion: a transport failure — and only a
+        // transport failure — is an `Err` out of `send`. An HTTP error *status* arrives as `Ok`.
+        resp = self.api.send(req)?
+        if !resp.ok() {
+            return Err(self.provider.decode_error(resp.status(), resp.body()))
+        }
+        return self.provider.decode_reply(resp.body())
+    }
+
+    // Run a conversation to an answer.
+    //
+    // `async` because phase 3's streaming makes it genuinely so — the body will become a fold over
+    // `stream`, and a caller written today should not have to change then. In phase 1 the work
+    // inside is synchronous, because `para/api`'s transport is: `Api.send` is a blocking call, and
+    // wrapping a sync send in a future would be a lie about where the suspension points are.
+    async fn run(conv: Conversation): Result<Run, AiError> {
+        return self.drive(conv)
+    }
+
+    // The string-in / string-out door.
+    //
+    // Deliberate, and the same idea as para/aether's `app.handle(method, path, body)`: a plain
+    // string entry point is what makes a framework testable in a `@test` block. It stays
+    // synchronous so it is callable from anywhere, including a plain `fn`.
+    fn run_sync(text: string): Result<string, AiError> {
+        run = self.drive(Conversation.of(text))?
+        return Ok(run.text())
+    }
+
+    // The run loop.
+    //
+    // Phase 1 performs exactly one model call, because the only thing that continues the loop is a
+    // tool-use stop and phase 1 sends no tools. When the model *does* answer `ToolUse` — a scripted
+    // `Mock`, or a vendor that volunteers one — the run finishes and hands the requested calls back
+    // in `Run.messages` rather than looping forever against a dispatcher that does not exist yet.
+    // Phase 2 replaces that arm with dispatch-and-continue, and this is where the guard stages and
+    // the context strategy attach.
+    fn drive(conv: Conversation): Result<Run, AiError> {
+        root = tracing.span("invoke_agent ${self.config.name}")
+        root.set_attribute("gen_ai.operation.name", "invoke_agent")
+        root.set_attribute("gen_ai.agent.name", self.config.name)
+        root.set_attribute("gen_ai.provider.name", self.provider.name())
+        root.set_attribute("gen_ai.request.model", self.config.model)
+
+        outcome: Result<Run, AiError> = self.one_turn(conv)
+        match outcome {
+            Ok(run) => {
+                root.set_attribute("gen_ai.usage.input_tokens", run.usage.input_tokens)
+                root.set_attribute("gen_ai.usage.output_tokens", run.usage.output_tokens)
+                root.set_attribute("gen_ai.response.finish_reasons", run.stop.semconv())
+                root.set_attribute("para.ai.run.turns", run.turns)
+            },
+            Err(e) => {
+                root.record_error("${e}")
+            },
+        }
+        root.end()
+        return outcome
+    }
+
+    fn one_turn(conv: Conversation): Result<Run, AiError> {
+        reply = self.call(self.request(conv))?
+        if reply.stop == StopReason.Refusal {
+            return Err(AiError.Refused(reason: refusal_text(reply)))
+        }
+        answered = conv.with(Message { role: Role.Assistant, parts: reply.parts })
+        return Ok(Run {
+            messages: answered.messages,
+            usage: reply.usage,
+            turns: 1,
+            stop: reply.stop,
+        })
+    }
+}
+
+// Record one call's token usage on `gen_ai.client.token.usage`, split by token type — the shape
+// the GenAI convention specifies, and the reason it is a histogram rather than a counter (the
+// distribution of prompt sizes is the interesting part).
+fn record_tokens(vendor: string, model: string, usage: Usage): void {
+    h = token_usage_histogram()
+    base = {"gen_ai.operation.name": "chat", "gen_ai.provider.name": vendor, "gen_ai.request.model": model}
+    h.record_with(usage.input_tokens.to_float(), base.set("gen_ai.token.type", "input"))
+    h.record_with(usage.output_tokens.to_float(), base.set("gen_ai.token.type", "output"))
+}
+
+// The `error.type` metric attribute: the error's *class*, never its message. A message is
+// unbounded-cardinality and would turn one histogram into thousands of series.
+fn error_type(e: AiError): string {
+    return match e {
+        AiError.Transport(inner) => inner.kind(),
+        AiError.Provider(status, code, message) => if code == "" then "${status}" else code,
+        AiError.Encode(p, m) => "encode",
+        AiError.Decode(path, m) => "decode",
+        AiError.Refused(reason) => "refusal",
+        AiError.Tool(name, m) => "tool",
+        AiError.ContextOverflow(needed, budget) => "context_overflow",
+        AiError.Cancelled => "cancelled",
+    }
+}
+
+// What a refusing model said, when it said anything. Vendors differ on whether a refusal carries
+// prose; an empty reason is reported as such rather than as a blank string.
+fn refusal_text(reply: ModelReply): string {
+    mut out = ""
+    for p in reply.parts {
+        out = out ~ match p {
+            Part.Text(t) => t,
+            _ => "",
+        }
+    }
+    return if out == "" then "no reason given" else out
+}
+
+@test {
+    fn a_message_reads_back_its_text_parts(): void {
+        m = Message {
+            role: Role.Assistant,
+            parts: [
+                Part.Thinking(text: "hidden", signature: "s"),
+                Part.Text(text: "Hej"),
+                Part.Text(text: " då"),
+            ],
+        }
+        // Thinking is not what the message said.
+        assert(m.text() == "Hej då")
+    }
+
+    fn a_message_reports_the_tool_calls_it_requests(): void {
+        m = Message {
+            role: Role.Assistant,
+            parts: [
+                Part.Text(text: "let me look"),
+                Part.ToolCall(id: "a", name: "weather", args: "{}"),
+                Part.ToolCall(id: "b", name: "clock", args: "{}"),
+            ],
+        }
+        assert(m.tool_calls().len() == 2)
+        assert(Message.user("hi").tool_calls() == [])
+    }
+
+    fn conversation_builders_are_immutable(): void {
+        base = Conversation.of("one")
+        grown = base.user("two")
+        assert(base.messages.len() == 1, "the original is untouched")
+        assert(grown.messages.len() == 2)
+        assert(grown.messages[1].text() == "two")
+    }
+
+    fn a_tool_message_addresses_the_call_it_answers(): void {
+        m = Message.tool("call_7", "18°C", true)
+        assert(m.role == Role.Tool)
+        assert(m.parts == [Part.ToolResult(id: "call_7", content: "18°C", is_error: true)])
+        // The flag defaults to a successful result.
+        assert(Message.tool("call_7", "ok").parts == [Part.ToolResult(id: "call_7", content: "ok", is_error: false)])
+    }
+
+    fn config_builders_return_new_values(): void {
+        base = AgentConfig.new("m")
+        tuned = base.with_system("be brief").with_max_tokens(64).with_temperature(0.0).named("brief")
+        assert(base.system == none, "the original is untouched")
+        assert(tuned.system == some("be brief"))
+        assert(tuned.max_tokens == some(64))
+        assert(tuned.temperature == some(0.0))
+        assert(tuned.name == "brief")
+        assert(tuned.model == "m")
+    }
+
+    fn errors_render_their_own_sentence(): void {
+        assert("${AiError.Provider(status: 429, code: "rate_limit_error", message: "slow down")}"
+            == "provider error 429 rate_limit_error: slow down")
+        assert("${AiError.Decode(path: "content[0].text", message: "expected a string")}"
+            == "decode failed at content[0].text: expected a string")
+        assert("${AiError.Decode(path: "", message: "boom")}" == "decode failed: boom")
+        assert("${AiError.Refused(reason: "policy")}" == "the model refused: policy")
+        assert("${AiError.Encode(provider: "anthropic", message: "no video")}"
+            == "anthropic cannot encode this request: no video")
+        // `@derive(Error)` routes `message()` through `Display`, so the two can never disagree.
+        assert(AiError.Cancelled.message() == "cancelled")
+    }
+
+    // `error.type` is a metric attribute, so it must be the error's class and never its message —
+    // one histogram, not one series per failure string.
+    fn error_type_is_low_cardinality(): void {
+        assert(error_type(AiError.Provider(status: 429, code: "rate_limit_error", message: "x")) == "rate_limit_error")
+        // A vendor that sends no code falls back to the status, not to the message.
+        assert(error_type(AiError.Provider(status: 503, code: "", message: "upstream said no")) == "503")
+        assert(error_type(AiError.Decode(path: "a.b", message: "nope")) == "decode")
+        assert(error_type(AiError.Refused(reason: "policy")) == "refusal")
+    }
+
+    fn message_capture_is_off_unless_the_standard_env_var_says_otherwise(): void {
+        assert(!capture_messages(), "prompts and completions in spans are opt-in")
+        env.set("OTEL_GENAI_CAPTURE_MESSAGES", "true")
+        assert(capture_messages())
+        env.set("OTEL_GENAI_CAPTURE_MESSAGES", "TRUE")
+        assert(capture_messages(), "the value is read case-insensitively")
+        env.set("OTEL_GENAI_CAPTURE_MESSAGES", "no")
+        assert(!capture_messages())
+    }
+}

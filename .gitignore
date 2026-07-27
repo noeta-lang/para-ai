@@ -1,2 +1,5 @@
 target/
-noeta.lock
+# The package's own lock pins a developer-machine path dependency, so it stays out; the examples'
+# locks ARE committed (see AGENTS.md).
+/noeta.lock
+.claude/
