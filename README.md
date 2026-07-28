@@ -4,7 +4,7 @@ An agent harness for Noeta: a **provider codec seam**, one run loop over `para/a
 
 The split that decides everything else: **a provider is a codec, not a client.** The thing that varies between model vendors is the wire format; auth headers, retries, timeouts, mocking, recording, and tracing are identical across all of them. So a `Provider` turns a neutral `ModelRequest` into a request description and a response body back into a neutral `ModelReply` — and never performs I/O. The transport is written once, over a `para.api.Api`, which means a 429 backoff is not para/ai code.
 
-> **Status: phases 1–4, 6, and 8.** Core data model, the `Provider` seam, the run loop, errors, telemetry, **tool calling**, **streaming** (`StreamDecoder`, the neutral `Event` enum, `agent.stream(conv, tx)`, and a scripted `FrameStream` so a streaming test needs no socket), the **`@prompt` expression tier with automatic provider prompt caching**, the **MCP client** (stdio and streamable HTTP, tools as a `ToolSource`, resources, prompts, and a sampling seam that is off by default) — and **all five provider codecs**: Anthropic, OpenAI, OpenRouter, Google, and Ollama, across three codec families. AG-UI encoding and the SSE responder, guardrails, context strategies, and structured output are later phases; [DESIGN.md](DESIGN.md) is the whole plan and §18 is the order. What is *not* here is not stubbed — it is absent, and the seams it will attach to are marked in the source.
+> **Status: phases 1–4, 6, 7, and 8.** Core data model, the `Provider` seam, the run loop, errors, telemetry, **tool calling**, **streaming** (`StreamDecoder`, the neutral `Event` enum, `agent.stream(conv, tx)`, and a scripted `FrameStream` so a streaming test needs no socket), the **`@prompt` expression tier with automatic provider prompt caching**, the **MCP client** (stdio and streamable HTTP, tools as a `ToolSource`, resources, prompts, and a sampling seam that is off by default), **AG-UI over SSE** (`agui.respond(agent, req)` over `std.http.server.sse`, and a `Tape` so the served frames are assertable without a socket) — and **all five provider codecs**: Anthropic, OpenAI, OpenRouter, Google, and Ollama, across three codec families. Guardrails, context strategies, and structured output are later phases; [DESIGN.md](DESIGN.md) is the whole plan and §18 is the order. What is *not* here is not stubbed — it is absent, and the seams it will attach to are marked in the source.
 
 ## What it provides
 
@@ -546,7 +546,7 @@ async fn render(rx: Receiver<Event>): void {
 
 Every `Event` variant is a value type, so a `Sender<Event>` crosses tasks **and** isolates and the whole thing composes with parallel serving. The run loop emits `RunStarted`, the text / thinking / tool-call deltas with their block starts and ends, one `ToolCallResult` per dispatched call, and **exactly one** terminal `RunFinished` or `RunError` on every path out — including the failing ones. A stream that merely stops is indistinguishable from one still thinking.
 
-`StateSnapshot`, `StateDelta`, `StepStarted`, `StepFinished`, and `Custom` are in the enum but nothing in the loop emits one. They are there so that adding them in phase 7 does not break an exhaustive `match` a consumer wrote today; the step vocabulary is phase 7's to decide, with AG-UI in hand.
+`StateSnapshot`, `StateDelta`, `StepStarted`, `StepFinished`, and `Custom` are in the enum but nothing in the loop emits one. They are for consumers to produce, and [AG-UI](#ag-ui-serving-a-run-to-a-front-end) encodes every one of them — a `StateSnapshot` a caller emits reaches a front end as `STATE_SNAPSHOT` without the loop having an opinion about what state is.
 
 ### Which layers cover which path
 
@@ -591,6 +591,65 @@ assert(c.events() == [
 ```
 
 `chunked(n)` delivers text and tool arguments in runs of `n` characters, so a scripted stream behaves like a real one — a sentence arriving as a dozen frames. `Replay` is the lower-level door for the shapes a script cannot express: a stream that stops mid-message, or one that carries nothing at all.
+
+## AG-UI: serving a run to a front end
+
+[AG-UI](https://docs.ag-ui.com) is the protocol a chat front end speaks to an agent: the client posts a `RunAgentInput` — the thread, the conversation so far, its state — and reads back a server-sent event stream of what the agent is doing, token by token and tool call by tool call. `para.ai.agui` is the encoding of `Event` onto that wire, and the responder that serves it. The endpoint is one line:
+
+```noeta
+use para.ai.agui
+
+#[Post("/agent")]
+fn chat(req: Request): Response {
+    return agui.respond(agent, req)
+}
+```
+
+`respond` decodes the input, opens a `text/event-stream` response with **`std.http.server.sse`**, spawns the run, and drains its channel encoding each event as a frame. Nothing in it builds a response, sets a header, or manages a connection — `server.sse` is the one-way twin of `server.websocket`, so a long-lived stream is an ordinary in-flight handler to the serve loop and interleaves with other requests rather than blocking them.
+
+**The encoding is a pure, total, variant-local mapping**: one `Event` in, one `Frame` out, no state carried between calls. That is what §11 shaped the enum for, and it is why an AG-UI bug here is a table row rather than a state machine.
+
+| `Event` | AG-UI |
+| --- | --- |
+| `RunStarted` | `RUN_STARTED` `{threadId, runId}` |
+| `TextStart` / `TextDelta` / `TextEnd` | `TEXT_MESSAGE_START` / `_CONTENT` / `_END` `{messageId, …}` |
+| `ThinkingDelta` | `REASONING_MESSAGE_CHUNK` `{messageId, delta}` |
+| `ToolCallStart` / `ToolCallArgsDelta` / `ToolCallEnd` | `TOOL_CALL_START` / `_ARGS` / `_END` `{toolCallId, …}` |
+| `ToolCallResult` | `TOOL_CALL_RESULT` `{messageId, toolCallId, content, role}` |
+| `StateSnapshot` / `StateDelta` | `STATE_SNAPSHOT` `{snapshot}` / `STATE_DELTA` `{delta}` |
+| `StepStarted` / `StepFinished` | `STEP_STARTED` / `STEP_FINISHED` `{stepName}` |
+| `RunFinished` | `RUN_FINISHED` `{threadId, runId, result, outcome}` |
+| `RunError` | `RUN_ERROR` `{message, code}` |
+| `Custom` | `CUSTOM` `{name, value}` |
+
+Four rows are decisions rather than transcription, and the source says so at each:
+
+- **A thinking delta is a `REASONING_MESSAGE_CHUNK`.** AG-UI's streaming reasoning message is bracketed by four other events; `Event.ThinkingDelta` has no start or end, deliberately. The `*_CHUNK` form is self-delimiting — the first chunk with a `messageId` implicitly opens the message and the next non-reasoning event closes it — so the bracket is the client's to synthesize and the mapping stays one-to-one. (`THINKING_*` is the older spelling, deprecated in favor of `REASONING_*` and removed in AG-UI 1.0.)
+- **A `ToolCallResult`'s `messageId` is its call id with `-result` appended.** AG-UI's event carries two ids where `Event` carries one; deriving the first from the second keeps it stable and collision-free, and it is what the protocol's own Claude Agent SDK integration does.
+- **`is_error` rides in `rawEvent`, and only when true.** `TOOL_CALL_RESULT` has no error field at all, so a failing tool would otherwise be indistinguishable from a succeeding one. `rawEvent` is the protocol's documented escape hatch; the alternative in the wild is to rewrite `content` into `{"error": true, "content": …}`, which corrupts the payload the model actually saw.
+- **`RunFinished` carries its usage under `result`.** `result` is `any` in the protocol, and the run's token usage is the only thing the event carries besides the run id.
+
+**The two AG-UI facts that are easy to get wrong** are handled explicitly and asserted from both ends. A `RunError` is a **frame**, not a dropped connection — the run loop emits one on every failing path, and the responder drains its channel to exhaustion so the run cannot outrun its reader. And every stream ends with **exactly one** terminal `RUN_FINISHED` or `RUN_ERROR`.
+
+A body that is not a `RunAgentInput` is a `400` naming the reason rather than a stream: AG-UI requires every stream to open with `RUN_STARTED`, which carries a thread id and a run id, and a body that did not decode has neither. Everything that goes wrong *after* that point is a `RUN_ERROR` frame, because by then there is a run to report on.
+
+`RunAgentInput.threadId` and `runId` reach the run itself — `agent.stream(conv, tx, thread_id, run_id)` takes both, defaulted — so the events a client reads carry the identifiers that client sent, and the run's `para.ai.run.id` span attribute correlates a trace with the caller's own record.
+
+`decode_input` also hands back `state`, `forwardedProps`, `context`, and the client's own `tools`. `state` and `forwardedProps` stay **raw JSON text**, because they are `any` in the protocol and text is the representation that survives a round trip byte for byte — the same form `Event.StateSnapshot(json)` takes, so echoing state back is `Event`'s own vocabulary rather than a conversion. `respond_to(agent, input)` is the door for a caller who wants to read any of them before the run starts.
+
+### Testing an AG-UI stream
+
+`stream_sync` drives the **same** session `respond` hands to the serve loop, writing into a `Tape` instead of a socket. So the exact frames a browser would have received are a `@test` block with no port and no key:
+
+```noeta
+tape = agui.Tape.new()
+n = agui.stream_sync(agent, agui.RunInput { thread_id: "t7", run_id: "r7", messages: [Message.user("shout hej")] }, tape)
+
+assert(tape.payloads()[0] == "{\"runId\":\"r7\",\"threadId\":\"t7\",\"type\":\"RUN_STARTED\"}")
+assert(tape.wire().starts_with("data: " ~ tape.payloads()[0] ~ "\n\n"))
+```
+
+`Tape.payloads()` is the JSON documents a client would have parsed; `Tape.wire()` is the bytes, so the SSE framing is assertable too, and `wire_of(frame)` mirrors std's own encoder for a single frame. Between `mock.Collector` and `agui.Tape` a streaming bug has nowhere to hide: the first catches a wrong event, the second a wrong encoding of a right one, and `wire()` a wrong framing of a right encoding.
 
 ## Testing: the `Mock` provider
 
@@ -705,9 +764,10 @@ Three commitments:
 - [`examples/memory/`](examples/memory) — **memory as an MCP server**: a sixty-line POSIX-shell memory server the example spawns over stdio, an agent whose entire tool vocabulary came from that subprocess, and a fact that survives between runs because it left the process. Declares no `#[Tool]` of its own, and a test asserts that from the trust-boundary index. Hermetic, no key, no npm install.
 - [`examples/prompt_cache/`](examples/prompt_cache) — a `@prompt` system prompt with a stable preamble and a per-customer tail: the exact statics/holes decomposition, a recall that proves reading the cache prefix never evaluated it, and the encoded Anthropic body with `cache_control` on the stable block and nowhere else. Hermetic, no key.
 
+- [`examples/agui/`](examples/agui) — **an AG-UI server**: `server.sse` behind a plain `(Request) -> Response` router, the endpoint as one line, and a hermetic `@test` block asserting the exact frame sequence of a tool-calling run and of a failing one through `agui.stream_sync`. No port, no key.
 - [`examples/providers/`](examples/providers) — five vendors, three codec families, one program: the runtime-selection `match` at six arms, the whole run loop driven over each real codec from a captured vendor body (buffered through `para/api`'s `Mock`, streamed through `Replay`) — and **two live checks against a local Ollama**, which skip when none is running and are made un-skippable in CI by `OLLAMA_REQUIRED=1`.
 
-The design's other examples (`chat-cli`, `agui-server`, `structured`) arrive with the phases they exercise; `local-ollama` is folded into `examples/providers` above, since the example that selects a provider at runtime is already the one that has an Ollama to talk to.
+The design's other examples (`chat-cli`, `structured`) arrive with the phases they exercise; `agui-server` is `examples/agui` above; `local-ollama` is folded into `examples/providers` above, since the example that selects a provider at runtime is already the one that has an Ollama to talk to.
 
 ## Requirements
 
