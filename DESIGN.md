@@ -78,6 +78,23 @@ Two consequences worth naming now:
 
 OpenRouter earns its place for a second reason: `Summarize` (§10) and `Judge` (§9) both want a *cheap* model alongside the main one, and one OpenRouter key covers both without a second credential path.
 
+### 2.1.1 What phase 4 built, and where it diverges
+
+Built as specified: five providers across three codec families, `OpenAiCompat` parameterized on base URL, vendor name, auth scheme, extra headers, and a raw-JSON body hook, with the pure-codec rule and the `estimate_tokens(): ?int` honesty rule holding throughout.
+
+**The pass condition held.** `OpenAi`, `OpenRouter`, and `OllamaCompat` are field-less structs whose only members are constructors returning an `OpenAiCompat`; not one of them declares a `Provider` impl, an `encode`, a decoder, or a `decode_error`. The evidence is a test rather than a claim — `a_configuration_is_fields_not_code` compares each constructor's result against a literal `OpenAiCompat` — and the payoff the section predicted is real: a sixth compatible provider is `OpenAiCompat.at(url, key, vendor)`, asserted in the same test against a Groq base URL.
+
+Four divergences from the table above, each with its reason:
+
+- **Reasoning-token accounting is not an OpenRouter delta.** The table lists it as one. OpenRouter reports it in `usage.completion_tokens_details.reasoning_tokens`, which is OpenAI's own field, so the family base reads it and OpenRouter contributed no code for it. Its real deltas are three field values plus three helpers that set body keys and headers through the hook.
+- **Three capability flags joined the parameterization**, beyond the base URL, auth scheme, and body hook the section names: `max_tokens_key` (OpenAI's reasoning models reject the deprecated `max_tokens`; everyone else normalizes it), `documents` (the `file` content part is OpenAI's and OpenRouter's, not Ollama's `/v1`), and `reasoning_back` (OpenRouter and Ollama accept a reasoning block on input, OpenAI does not). Each is a fact about what an endpoint can *express*, which is exactly the axis a codec's `encode` must refuse along — so they are configuration, not branching.
+- **Ollama's native endpoint is a genuinely separate codec**, as the table's second row allows. It is not a delta from `openai_compat`: `arguments` is an object rather than a string, a tool result is addressed by `tool_name` rather than a call id, images are bare base64 on the message, sampling lives under `options` with different key names, and the stream is NDJSON. Sharing one codec across that many disagreements would have meant a mode switch inside it, which is the thing this section exists to prevent.
+- **Two vendors report an ordinary stop reason for a tool call.** Gemini's `finishReason` is `STOP` and Ollama's `done_reason` is `"stop"` on a turn whose only content is a function call. Both codecs therefore *derive* `StopReason.ToolUse` from the presence of a call part. Nothing in §2.1 anticipated this, and it is the single most consequential per-vendor fact in the phase: a codec that trusted the vendor's word would end every tool loop on its first turn, with the model's request unanswered and the run reported as complete.
+
+One thing the neutral model could not carry, named rather than dropped: Gemini can return **generated media** in a candidate part, and `Delta` has no increment for an image. That decodes to a loud `AiError.Decode` naming the path, not a picture quietly missing from an answer.
+
+**Ollama did make CI honest.** `examples/providers` runs the whole loop against a local Ollama, buffered and streamed, with no credential — skipped when nothing is listening, and un-skippable in CI via `OLLAMA_REQUIRED=1`, because `noeta test` captures a passing test's stdout and a skip nobody can see is a check that has quietly stopped running.
+
 ### 2.2 Reflection is the schema, everywhere
 
 para/cli established that the function signature is the CLI spec. para/aether established that the handler signature is the DI spec. para/ai says: **the function signature is the tool spec, and the struct is the output schema.**
@@ -847,7 +864,7 @@ Each phase is independently useful and independently shippable.
 1. **Core + Anthropic + Mock, non-streaming.** Data model, `Provider` codec, run loop over `para/api`, `AiError`, `run_sync`, telemetry spans. Proves the codec seam with one provider.
 2. **Tools.** `#[Tool]`/`#[Arg]`, `params_of` → schema, coercion, `invoke` dispatch, the trust-boundary role, bounded concurrent dispatch.
 3. **Streaming.** ~~The native frame reader (SSE + NDJSON)~~ (it went to `std.http` — U-3), `StreamDecoder`, the `Event` channel. Non-streaming becomes a fold over it. **Built**, with the divergences in §11.1.
-4. **`OpenAiCompat` + Google, then OpenRouter and Ollama on top.** Should be pure codec work by now; if it is not, the seam in phase 1 was drawn wrong and this is where we find out. OpenRouter and Ollama arriving as *configurations* rather than files is the pass condition for phase 1's design — and Ollama unlocks keyless integration tests in CI for everything after this point.
+4. **`OpenAiCompat` + Google, then OpenRouter and Ollama on top.** Should be pure codec work by now; if it is not, the seam in phase 1 was drawn wrong and this is where we find out. OpenRouter and Ollama arriving as *configurations* rather than files is the pass condition for phase 1's design — and Ollama unlocks keyless integration tests in CI for everything after this point. **Built, and the pass condition held**; the divergences are in §2.1.1.
 5. **Structured responses + guardrails.** `extract::<T>`, `Validate` at the door, bounded repair, the `Guard` trait and standard guards.
 6. **MCP.** stdio first (no native code), then streamable HTTP. Memory example lands here.
 7. **AG-UI.** The SSE responder, the aether integration, the event-sequence test harness.

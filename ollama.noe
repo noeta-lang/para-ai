@@ -1,0 +1,1123 @@
+// `para.ai.providers.ollama` — Ollama's **native** `/api/chat` codec.
+//
+//     use para.ai.providers.ollama.Ollama
+//
+//     agent = Agent.from(AgentConfig.new("llama3.2"), Ollama.local())
+//
+// The same server also speaks OpenAI's Chat Completions at `/v1`, which is
+// `para.ai.providers.openai.OllamaCompat` — two doors onto one process. **This one exists because
+// the compatible door cannot express what the native one can:** `keep_alive`, the `options` sampling
+// block, `think`, per-message `images`, and a reply's `thinking` field have no OpenAI-compatible
+// spelling. If none of those matter, `OllamaCompat` is four field values and this file is not needed.
+//
+// Six things about this wire format are easy to get wrong, and all six are handled here:
+//
+//   * **The stream is newline-delimited JSON, not server-sent events.** Every line is a whole
+//     document, there is no `data:` prefix, and there is no terminator frame — the last line carries
+//     `"done": true`.
+//   * **`/api/chat` streams by default.** A buffered call has to say `"stream": false` explicitly,
+//     or the body arrives as many documents and the whole-body decode fails on the second one.
+//   * **A tool call's `arguments` is an object**, not the JSON string OpenAI's compatible layer
+//     uses. Sending a string makes the model see one parameter that is a blob of text.
+//   * **A tool result is addressed by `tool_name`**, not by a call id — Ollama's tool calls carry no
+//     id at all — so this codec resolves a neutral `ToolResult`'s id back to the name of the call it
+//     answers, exactly as the Gemini codec does.
+//   * **`done_reason` is `"stop"` for a tool call**, so `StopReason.ToolUse` is derived from the
+//     parts rather than read off the vendor's word for it.
+//   * **Images are a per-message array of bare base64**, not content parts and not data URIs.
+namespace para.ai.providers.ollama
+
+use std.http.{Frame}
+use std.{env, json}
+use para.ai.{AiError, Message, Part, Role}
+use para.ai.provider
+use para.ai.provider.{Delta, ModelReply, ModelRequest, Provider, StopReason, StreamDecoder, Usage, Wire}
+use para.ai.tools.{ToolSpec}
+
+// Ollama's native chat API, as a codec.
+//
+// **No key, and that is the point.** Ollama is the one provider in this package that can be
+// exercised end to end in CI with no secret, which is why `examples/local-ollama` is the suite's
+// only non-mock integration test (DESIGN §2.1, §15).
+@derive(Equatable, Display)
+pub struct Ollama {
+    pub host: string = "http://localhost:11434"
+    // How long the server keeps the model in memory after this call. Empty means "send no key", and
+    // the server's own default (five minutes) stands. A duration string — `"10m"`, `"0"` to unload
+    // at once, or a negative one like `"-1m"` to keep it loaded indefinitely.
+    pub keep_alive: string = ""
+    // Raw JSON fragments merged into the request's `options` block, after the ones derived from the
+    // neutral request. This is where `num_ctx`, `seed`, `top_k`, `repeat_penalty`, and the rest of
+    // the sampling surface live — unchecked in content, checked in syntax, like every other escape
+    // hatch in this package.
+    pub options: Map<string, string> = {}
+    // Ask a thinking-capable model to reason before answering. `none` sends no key at all, which is
+    // not the same request as `"think": false` — the latter turns thinking *off* on a model that
+    // would otherwise do it. The graded form (`"low"`/`"medium"`/`"high"`) is reachable through
+    // `ModelRequest.extra`.
+    pub think: ?bool = none
+
+    fn local(): Ollama {
+        return Ollama {}
+    }
+
+    // `host` is an origin — `http://localhost:11434` — and `/api/chat` is appended to it.
+    fn at(host: string): Ollama {
+        return Ollama { host: normalize_host(host) }
+    }
+
+    // `OLLAMA_HOST` is the variable the vendor's own CLI reads, and it is conventionally written
+    // without a scheme (`localhost:11434`), so it is completed rather than rejected.
+    fn from_env(): Ollama {
+        return Ollama.at(env.get("OLLAMA_HOST") ?? "http://localhost:11434")
+    }
+
+    fn with_keep_alive(duration: string): Ollama {
+        return Ollama { ...self, keep_alive: duration }
+    }
+
+    fn with_option(key: string, json_fragment: string): Ollama {
+        return Ollama { ...self, options: self.options.set(key, json_fragment) }
+    }
+
+    fn thinking(on: bool): Ollama {
+        return Ollama { ...self, think: some(on) }
+    }
+}
+
+pub fn normalize_host(host: string): string {
+    if host.starts_with("http://") || host.starts_with("https://") {
+        return host
+    }
+    return "http://" ~ host
+}
+
+// --- Encoding -------------------------------------------------------------------------------------
+
+fn refuse(message: string): AiError {
+    return AiError.Encode(provider: "ollama", message: message)
+}
+
+fn wire_role(r: Role): string {
+    return match r {
+        Role.System => "system",
+        Role.Assistant => "assistant",
+        Role.Tool => "tool",
+        _ => "user",
+    }
+}
+
+// `args` is raw JSON text and Ollama wants a **map of named parameters**, so it is embedded as real
+// JSON — the opposite of the `/v1` layer on the same server, which wants a string holding JSON.
+fn function_block(name: string, input: dyn): Result<Map<string, dyn>, AiError> {
+    match input.as<Map<string, dyn>>() {
+        some(obj) => {
+            f: Map<string, dyn> = {"name": name, "arguments": obj}
+            return Ok({"function": f})
+        },
+        none => {},
+    }
+    return Err(refuse("tool call `${name}` arguments must be a JSON object — Ollama's `function.arguments` is a map of named parameters"))
+}
+
+fn encode_tool_call(name: string, args: string): Result<Map<string, dyn>, AiError> {
+    return match provider.parse_value(args, "tool call `${name}` arguments") {
+        Ok(input) => function_block(name, input),
+        // A decode failure on the way *out* is an encode failure — re-labeled so the error names the
+        // direction the caller was going.
+        Err(e) => Err(refuse("${e}")),
+    }
+}
+
+// One neutral turn as one wire message.
+//
+// Everything a turn says lands in the same object: prose in `content`, reasoning in `thinking`,
+// attachments in `images`, requests in `tool_calls`. There is no content-part array here at all,
+// which is why an unsupported attachment has to be refused rather than encoded as something else.
+fn encode_message(codec: Ollama, m: Message, names: Map<string, string>): Result<Map<string, dyn>, AiError> {
+    mut text = ""
+    mut thinking = ""
+    mut images: List<dyn> = []
+    mut calls: List<dyn> = []
+    mut result_name = ""
+    mut is_result = false
+    for p in m.parts {
+        match p {
+            Part.Text(t) => {
+                text = text ~ t
+            },
+            // Ollama has no signature slot, and nothing in its protocol validates one. A signature
+            // that arrived from another vendor's history is therefore inert here by construction —
+            // it is a vendor token rather than content, and there is no field it could ride in.
+            Part.Thinking(t, signature) => {
+                thinking = thinking ~ t
+            },
+            Part.Image(mime, data) => {
+                images = images ~ [provider.base64(data)]
+            },
+            Part.ToolCall(cid, cname, args) => {
+                calls = calls ~ [encode_tool_call(cname, args)?]
+            },
+            Part.ToolResult(rid, content, is_error) => {
+                resolved = names.get(rid) ?? ""
+                if resolved == "" {
+                    return Err(refuse("cannot answer tool call `${rid}` — Ollama addresses a tool result by `tool_name`, and no tool call with that id appears earlier in this conversation"))
+                }
+                result_name = resolved
+                is_result = true
+                text = text ~ tool_result_text(content, is_error)
+            },
+            Part.File(mime, name, data) => {
+                return Err(refuse("cannot send `${name}` — Ollama's native chat API carries images only; extract the text first, or send it as a Text part"))
+            },
+        }
+    }
+    mut msg: Map<string, dyn> = {"role": wire_role(m.role), "content": text}
+    if thinking != "" {
+        msg = msg.set("thinking", thinking)
+    }
+    if images.len() > 0 {
+        msg = msg.set("images", images)
+    }
+    if calls.len() > 0 {
+        msg = msg.set("tool_calls", calls)
+    }
+    if is_result {
+        msg = msg.set("tool_name", result_name)
+    }
+    return Ok(msg)
+}
+
+// Ollama has no error flag on a tool message either, so a failing result is prefixed rather than
+// sent back reading exactly like a success — the same lossy mapping, and the same reason, as the
+// OpenAI-compatible codec's. A model that cannot tell a failure from an answer retries the same
+// broken call until the turn budget runs out.
+fn tool_result_text(content: string, is_error: bool): string {
+    return if is_error then "Error: " ~ content else content
+}
+
+fn remember_calls(names: Map<string, string>, parts: List<Part>): Map<string, string> {
+    mut out = names
+    for p in parts {
+        match p {
+            Part.ToolCall(id, name, args) => {
+                out = out.set(id, name)
+            },
+            _ => {},
+        }
+    }
+    return out
+}
+
+// **One `tool` message per result.** A neutral turn can carry two parallel results and a wire message
+// carries one `tool_name`, so a turn holding both becomes two entries — the same split the
+// OpenAI-compatible codec makes, for the same reason.
+fn split_results(codec: Ollama, m: Message, names: Map<string, string>): Result<List<dyn>, AiError> {
+    mut out: List<dyn> = []
+    for p in m.parts {
+        one = Message { role: m.role, parts: [p] }
+        out = out ~ [encode_message(codec, one, names)?]
+    }
+    return Ok(out)
+}
+
+// **`Message.cache_breakpoint` is deliberately not read here.** Ollama has no explicit breakpoint:
+// the server keeps a KV cache for the prefix of the prompt it last served a model, matched byte for
+// byte and with no marker of any kind — the same contract OpenAI's and Google's implicit caches
+// offer. So the hint is ignored, and "ignored" has to mean *byte-identical*, because a key invented
+// to carry it would change the prefix and defeat the cache it was meant to serve. Asserted below.
+fn encode_messages(codec: Ollama, msgs: List<Message>): Result<List<dyn>, AiError> {
+    mut out: List<dyn> = []
+    mut names: Map<string, string> = {}
+    for m in msgs {
+        names = remember_calls(names, m.parts)
+        if m.role == Role.Tool && m.parts.len() > 1 {
+            out = out ~ split_results(codec, m, names)?
+        } else {
+            out = out ~ [encode_message(codec, m, names)?]
+        }
+    }
+    return Ok(out)
+}
+
+// The tool declarations, in the same shape the OpenAI-compatible layer uses — this is the one place
+// the two protocols agree exactly.
+fn encode_tools(specs: List<ToolSpec>): Result<List<dyn>, AiError> {
+    mut out: List<dyn> = []
+    for t in specs {
+        mut schema: dyn = 0
+        match provider.parse_value(t.parameters, "tool `${t.name}` schema") {
+            Ok(s) => {
+                schema = s
+            },
+            Err(e) => {
+                return Err(refuse("${e}"))
+            },
+        }
+        f: Map<string, dyn> = {
+            "name": t.name,
+            "description": t.description,
+            "parameters": schema,
+        }
+        entry: Map<string, dyn> = {"type": "function", "function": f}
+        out = out ~ [entry]
+    }
+    return Ok(out)
+}
+
+// Every sampling knob lives under `options` here, under the vendor's own names — `num_predict` for a
+// token budget, not `max_tokens`. The codec's standing fragments are merged after the derived ones,
+// so a configuration can reach a knob the neutral request has no word for.
+fn encode_options(codec: Ollama, req: ModelRequest): Result<Map<string, dyn>, AiError> {
+    mut opts: Map<string, dyn> = {}
+    match req.max_tokens {
+        some(n) => {
+            opts = opts.set("num_predict", n)
+        },
+        none => {},
+    }
+    match req.temperature {
+        some(t) => {
+            opts = opts.set("temperature", t)
+        },
+        none => {},
+    }
+    if req.stop.len() > 0 {
+        stop: List<dyn> = req.stop.map(fn(s) => s)
+        opts = opts.set("stop", stop)
+    }
+    for k in codec.options.keys() {
+        opts = opts.set(k, provider.parse_value(codec.options[k], "ollama option `${k}`")?)
+    }
+    return Ok(opts)
+}
+
+// --- Decoding -------------------------------------------------------------------------------------
+
+fn decode_stop(raw: string): StopReason {
+    return match raw {
+        "stop" => StopReason.EndTurn,
+        "" => StopReason.EndTurn,
+        "length" => StopReason.MaxTokens,
+        // `load` and `unload` answer a request that only touched the model's residency, and whatever
+        // the vendor adds next: kept verbatim rather than flattened into a clean finish.
+        _ => StopReason.Other(raw: raw),
+    }
+}
+
+// Ollama counts prompt and generated tokens under its own names and reports neither a cache nor a
+// reasoning bucket — a local model has no prompt cache to bill for, and its thinking tokens are
+// generated tokens like any other.
+fn decode_usage(doc: Map<string, dyn>): Usage {
+    return Usage {
+        input_tokens: provider.int_at(doc, "prompt_eval_count"),
+        output_tokens: provider.int_at(doc, "eval_count"),
+    }
+}
+
+fn any_usage(u: Usage): bool {
+    return u.input_tokens + u.output_tokens > 0
+}
+
+// The neutral delta ids this codec hands out, shared by both transports so one `fold` serves them.
+fn text_id(): string {
+    return "0"
+}
+
+fn thinking_id(): string {
+    return "0:thinking"
+}
+
+// One `message` object as neutral deltas. `at` is the running count of tool calls seen so far in this
+// reply, which is what names them — Ollama's tool calls carry no id of their own — and it comes back
+// so the caller can advance it.
+fn decode_message(msg: Map<string, dyn>, at: int): (List<Delta>, int) {
+    mut out: List<Delta> = []
+    mut calls = at
+    thinking = provider.str_at(msg, "thinking")
+    if thinking != "" {
+        out = out ~ [Delta.ThinkingDelta(id: thinking_id(), text: thinking)]
+    }
+    content = provider.str_at(msg, "content")
+    if content != "" {
+        out = out ~ [Delta.TextDelta(id: text_id(), text: content)]
+    }
+    for c in provider.list_at(msg, "tool_calls") {
+        f = provider.obj_at(c.as<Map<string, dyn>>() ?? {}, "function")
+        cid = "call_${calls}"
+        out = out ~ [
+            Delta.ToolCallStart(id: cid, name: provider.str_at(f, "name")),
+            // Ollama streams a tool call **whole**, so its arguments never need accumulating — the
+            // one vendor in this package where a single fragment is the entire call.
+            Delta.ToolCallArgs(id: cid, fragment: json.stringify(f.get("arguments") ?? {})),
+        ]
+        calls = calls + 1
+    }
+    return (out, calls)
+}
+
+// **`ToolUse` is derived, not read.** Ollama's `done_reason` for a turn that asks for a tool is
+// `"stop"`, exactly as Gemini's `finishReason` is — so a codec that trusted it would end every tool
+// loop on its first turn with the model's request unanswered.
+fn decode_done(raw: string, asked_for_a_tool: bool): StopReason {
+    if asked_for_a_tool && (raw == "stop" || raw == "") {
+        return StopReason.ToolUse
+    }
+    return decode_stop(raw)
+}
+
+// Ollama's error body is a bare sentence under `error`, not an object: `{"error": "model 'x' not
+// found, try pulling it first"}`. There is no code to match on, so the message is all there is — and
+// reporting it verbatim is better than inventing a code for it.
+fn typed_error(status: int, doc: Map<string, dyn>): AiError {
+    raw = doc.get("error") ?? ""
+    match raw.as<string>() {
+        some(s) => {
+            return AiError.Provider(status: status, code: "", message: s)
+        },
+        none => {},
+    }
+    // Some builds answer with the object form the `/v1` layer uses. Read it rather than losing it.
+    inner = provider.obj_at(doc, "error")
+    return AiError.Provider(
+        status: status,
+        code: provider.str_at(inner, "type"),
+        message: provider.str_at(inner, "message"),
+    )
+}
+
+// --- The streaming protocol -------------------------------------------------------------------
+//
+// `/api/chat` streams **newline-delimited JSON**, and that is the whole difference from the other
+// two families:
+//
+//     {"model":"llama3.2","created_at":"…","message":{"role":"assistant","content":"The"},"done":false}
+//     {"model":"llama3.2","created_at":"…","message":{"role":"assistant","content":" sky"},"done":false}
+//     …
+//     {"model":"llama3.2","created_at":"…","message":{"role":"assistant","content":""},"done":true,
+//      "done_reason":"stop","total_duration":4883583458,"prompt_eval_count":26,"eval_count":282}
+//
+// No `data:` prefix, no event names, no `[DONE]` — every line is a complete document and the last
+// one says so. `std.http`'s `Framing.Ndjson` cuts exactly that, so the decoder below reads
+// `frame.data` as a whole document rather than as a field of one. `Wire.as_ndjson()` is how a codec
+// asks for that cut, and it is the reason `Framing` has three members rather than two.
+//
+// Three properties of that shape decide the decoder's design:
+//
+//   * **The terminator carries the answer's accounting.** `done: true` arrives with the stop reason
+//     and both token counts on the *same* line, so unlike Anthropic there is no split-usage problem
+//     — but a stream cut before it has no counts at all and no way to know it ended early, which is
+//     exactly what `finish()` refuses.
+//   * **Tool calls arrive whole.** One line carries the name and the complete arguments object, so
+//     the decoder needs no index-to-id map — only the running counter that names them, and that has
+//     to be state because the count spans lines.
+//   * **The `done: true` line usually carries an empty `content`.** Emitting a zero-length
+//     `TextDelta` for it would put an empty token in every event stream.
+
+pub class OllamaStream {
+    mut usage: Usage
+    mut model: string
+    mut calls: int
+    mut opened: bool
+    mut done: bool
+
+    fn new(): OllamaStream {
+        return OllamaStream { usage: Usage {}, model: "", calls: 0, opened: false, done: false }
+    }
+
+    // **Inline, not a standalone `impl StreamDecoder for OllamaStream` block, and that is
+    // load-bearing.** Written standalone, the impl is invisible to `dyn` coercion whenever this
+    // module is not the entry, so `Ollama.decoder()` fails to check from a consuming package while
+    // this file's own suite passes. See AGENTS.md.
+    impl StreamDecoder {
+        fn push(frame: Frame): Result<List<Delta>, AiError> {
+            if frame.data == "" {
+                return Ok([])
+            }
+            doc = provider.parse_object(frame.data, "ollama stream line")?
+            // A vendor error mid-stream — a model evicted, a context overflow. There is no HTTP
+            // status to report and `0` says exactly that.
+            if doc.has("error") {
+                return Err(typed_error(0, doc))
+            }
+            self.opened = true
+            mut out: List<Delta> = []
+            served = provider.str_at(doc, "model")
+            if served != "" && self.model == "" {
+                self.model = served
+                out = out ~ [Delta.ModelDelta(model: served)]
+            }
+            (more, advanced) = decode_message(provider.obj_at(doc, "message"), self.calls)
+            self.calls = advanced
+            out = out ~ more
+            if (doc.get("done") ?? false).as<bool>() ?? false {
+                self.done = true
+                out = out ~ [Delta.Stop(reason: decode_done(provider.str_at(doc, "done_reason"), self.calls > 0))]
+                fresh = decode_usage(doc)
+                if any_usage(fresh) {
+                    self.usage = provider.merge_usage(self.usage, fresh)
+                    out = out ~ [Delta.UsageDelta(usage: self.usage)]
+                }
+            }
+            return Ok(out)
+        }
+
+        fn finish(): Result<Usage, AiError> {
+            if !self.opened {
+                return Err(AiError.Decode(
+                    path: "",
+                    message: "the Ollama line stream carried no documents — nothing was streamed. A non-2xx answer streams its error body like any other body, so a rejected request or an unknown model can arrive here as an empty stream",
+                ))
+            }
+            if !self.done {
+                return Err(AiError.Decode(
+                    path: "",
+                    message: "the Ollama line stream ended before a line carrying `\"done\": true` — the reply is truncated, and reporting it as a complete answer would be worse than failing",
+                ))
+            }
+            return Ok(self.usage)
+        }
+    }
+}
+
+impl Provider for Ollama {
+    fn name(): string {
+        return "ollama"
+    }
+
+    fn encode(req: ModelRequest): Result<Wire, AiError> {
+        mut body: Map<string, dyn> = {
+            "model": req.model,
+            "messages": encode_messages(self, req.messages)?,
+            // **Always present, and never omitted.** `/api/chat` streams by *default*, so a buffered
+            // request that leaves this out gets many documents where the whole-body decode expects
+            // one — and fails on the second line rather than anywhere near the cause.
+            "stream": req.stream,
+        }
+        // No tools, no key. An empty `tools` array is not the same request as an absent one.
+        if req.tools.len() > 0 {
+            body = body.set("tools", encode_tools(req.tools)?)
+        }
+        opts = encode_options(self, req)?
+        if opts.keys().len() > 0 {
+            body = body.set("options", opts)
+        }
+        if self.keep_alive != "" {
+            body = body.set("keep_alive", self.keep_alive)
+        }
+        match self.think {
+            some(on) => {
+                body = body.set("think", on)
+            },
+            none => {},
+        }
+        // The escape hatch, merged verbatim and last, so it can also override a key this codec set —
+        // including `options` and the graded `think`. Unchecked in content, checked in syntax.
+        for k in req.extra.keys() {
+            body = body.set(k, provider.parse_value(req.extra[k], "extra key `${k}`")?)
+        }
+
+        wire = Wire {
+            url: self.host ~ "/api/chat",
+            method: "post",
+            // **No credential of any kind**, which is what makes this the one provider CI can
+            // exercise for real.
+            headers: {"content-type": "application/json"},
+            body: json.stringify(body),
+        }
+        // Newline-delimited JSON, not server-sent events. The body key and the framing are set
+        // together and never apart.
+        return Ok(if req.stream then wire.as_ndjson() else wire)
+    }
+
+    fn decode_deltas(body: string): Result<List<Delta>, AiError> {
+        doc = provider.parse_object(body, "ollama reply")?
+        if doc.has("error") {
+            return Err(typed_error(0, doc))
+        }
+        mut out: List<Delta> = [Delta.ModelDelta(model: provider.str_at(doc, "model"))]
+        (more, calls) = decode_message(provider.obj_at(doc, "message"), 0)
+        out = out ~ more
+        return Ok(out ~ [
+            Delta.Stop(reason: decode_done(provider.str_at(doc, "done_reason"), calls > 0)),
+            Delta.UsageDelta(usage: decode_usage(doc)),
+        ])
+    }
+
+    fn decode_reply(body: string): Result<ModelReply, AiError> {
+        return Ok(provider.fold(self.decode_deltas(body)?, ""))
+    }
+
+    fn decoder(): dyn StreamDecoder {
+        return OllamaStream.new()
+    }
+
+    fn decode_error(status: int, body: string): AiError {
+        return match provider.parse_object(body, "ollama error") {
+            Ok(doc) => typed_error(status, doc),
+            // An HTML error page from a proxy, or an empty 502: the raw text is the only evidence of
+            // what actually answered, so it is reported verbatim rather than swallowed.
+            Err(_) => AiError.Provider(status: status, code: "", message: body),
+        }
+    }
+
+    // **`none`, and that is a real answer.** Ollama's tokenizer lives inside the served model — a
+    // different one per model, loaded on the server — so there is nothing a pure codec could run
+    // locally. Returning a fabricated number here would be trusted absolutely and be wrong, which
+    // surfaces as a truncated context in the middle of a run.
+    fn estimate_tokens(msgs: List<Message>): ?int {
+        return none
+    }
+}
+
+// --- Test helpers ---------------------------------------------------------------------------------
+
+fn encode_or_fail(codec: Ollama, req: ModelRequest): Wire {
+    match codec.encode(req) {
+        Ok(w) => {
+            return w
+        },
+        Err(e) => {
+            assert(false, "encode failed: ${e}")
+        },
+    }
+    return Wire { url: "" }
+}
+
+fn decode_or_fail(codec: Ollama, body: string): ModelReply {
+    match codec.decode_reply(body) {
+        Ok(r) => {
+            return r
+        },
+        Err(e) => {
+            assert(false, "decode failed: ${e}")
+        },
+    }
+    return ModelReply { parts: [] }
+}
+
+// Cut a verbatim NDJSON transcript into the frames `std.http`'s reader hands back. One line, one
+// frame, the document verbatim in `data` and nothing in `event` — which is the whole of the cut, and
+// why this helper is four lines where the SSE one is twenty.
+fn ndjson_frames(lines: List<string>): List<Frame> {
+    mut out: List<Frame> = []
+    for line in lines {
+        if line != "" {
+            out = out ~ [Frame { event: "", data: line, id: "", retry: none }]
+        }
+    }
+    return out
+}
+
+fn stream_or_fail(decoder: dyn StreamDecoder, lines: List<string>): List<Delta> {
+    mut out: List<Delta> = []
+    for f in ndjson_frames(lines) {
+        match decoder.push(f) {
+            Ok(more) => {
+                out = out ~ more
+            },
+            Err(e) => {
+                assert(false, "push failed on `${f.data}`: ${e}")
+            },
+        }
+    }
+    return out
+}
+
+// A verbatim newline-delimited transcript of a streamed `POST /api/chat` — the line shape Ollama
+// publishes, document for document, including the `"images": null` a total reader has to shrug off
+// and the terminal line whose `content` is empty and whose accounting is the answer's. Held as raw
+// wire lines rather than as pre-cut `Frame`s so that what the decoder is proved against is *the
+// vendor's bytes*, diffable against the vendor's own documentation, rather than a frame list written
+// to match this decoder.
+fn captured_text_stream(): List<string> {
+    return [
+        "{\"model\":\"llama3.2\",\"created_at\":\"2023-08-04T08:52:19.385406455-07:00\",\"message\":{\"role\":\"assistant\",\"content\":\"The\",\"images\":null},\"done\":false}",
+        "{\"model\":\"llama3.2\",\"created_at\":\"2023-08-04T08:52:19.385406455-07:00\",\"message\":{\"role\":\"assistant\",\"content\":\" sky\",\"images\":null},\"done\":false}",
+        "{\"model\":\"llama3.2\",\"created_at\":\"2023-08-04T08:52:19.385406455-07:00\",\"message\":{\"role\":\"assistant\",\"content\":\" is blue.\",\"images\":null},\"done\":false}",
+        "{\"model\":\"llama3.2\",\"created_at\":\"2023-08-04T19:22:45.499127Z\",\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done_reason\":\"stop\",\"done\":true,\"total_duration\":4883583458,\"load_duration\":1334875,\"prompt_eval_count\":26,\"prompt_eval_duration\":342546000,\"eval_count\":282,\"eval_duration\":4535599000}",
+    ]
+}
+
+// A streamed turn that thinks and then calls a tool. Two things this pins that the text transcript
+// does not: `thinking` arrives incrementally alongside `content` on the same `message`, and a tool
+// call arrives **whole** in one line — name and complete arguments object together — which is why
+// this is the one vendor whose streamed arguments never need accumulating.
+fn captured_thinking_tool_call_stream(): List<string> {
+    return [
+        "{\"model\":\"qwen3\",\"created_at\":\"2025-05-30T00:00:01.0Z\",\"message\":{\"role\":\"assistant\",\"content\":\"\",\"thinking\":\"The user wants the weather.\"},\"done\":false}",
+        "{\"model\":\"qwen3\",\"created_at\":\"2025-05-30T00:00:01.2Z\",\"message\":{\"role\":\"assistant\",\"content\":\"\",\"thinking\":\" I should call get_weather.\"},\"done\":false}",
+        "{\"model\":\"qwen3\",\"created_at\":\"2025-05-30T00:00:01.4Z\",\"message\":{\"role\":\"assistant\",\"content\":\"Let me check.\"},\"done\":false}",
+        "{\"model\":\"qwen3\",\"created_at\":\"2025-05-30T00:00:01.6Z\",\"message\":{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"function\":{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Malmö\"}}}]},\"done\":false}",
+        "{\"model\":\"qwen3\",\"created_at\":\"2025-05-30T00:00:01.8Z\",\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done_reason\":\"stop\",\"done\":true,\"total_duration\":885095291,\"load_duration\":3753500,\"prompt_eval_count\":122,\"eval_count\":33}",
+    ]
+}
+
+// A captured non-streaming `POST /api/chat` response.
+fn captured_text_reply(): string {
+    return "{\"model\":\"llama3.2\",\"created_at\":\"2023-12-12T14:13:43.416799Z\",\"message\":{\"role\":\"assistant\",\"content\":\"Hej! Hur mår du?\"},\"done\":true,\"done_reason\":\"stop\",\"total_duration\":8113331500,\"load_duration\":6396458,\"prompt_eval_count\":61,\"prompt_eval_duration\":398801000,\"eval_count\":468,\"eval_duration\":7701267000}"
+}
+
+// The published tool-calling response. Note `done_reason: "stop"` on a turn whose only content is a
+// tool call, and the complete `arguments` **object** where the `/v1` layer on the same server sends
+// a string.
+fn captured_tool_call_reply(): string {
+    return "{\"model\":\"llama3.2\",\"created_at\":\"2024-07-22T20:33:28.123648Z\",\"message\":{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"function\":{\"name\":\"get_current_weather\",\"arguments\":{\"format\":\"celsius\",\"location\":\"Paris, FR\"}}}]},\"done_reason\":\"stop\",\"done\":true,\"total_duration\":885095291,\"load_duration\":3753500,\"prompt_eval_count\":122,\"prompt_eval_duration\":328493000,\"eval_count\":33,\"eval_duration\":552222000}"
+}
+
+@test {
+    // A known request, asserted against the exact bytes it produces. `json.stringify` emits map keys
+    // in sorted order, so this is stable — and an exact-string assertion is the only kind that
+    // catches a key silently changing name or moving nesting level.
+    fn encode_produces_exactly_this_json(): void {
+        req = ModelRequest {
+            model: "llama3.2",
+            messages: [
+                Message.system("Answer in Swedish."),
+                Message.user("Say hello."),
+            ],
+            max_tokens: some(64),
+            temperature: some(0.0),
+            stop: ["\n\n"],
+        }
+        wire = encode_or_fail(Ollama.local(), req)
+        assert(wire.url == "http://localhost:11434/api/chat")
+        assert(wire.method == "post")
+        assert(wire.body == "{\"messages\":[{\"content\":\"Answer in Swedish.\",\"role\":\"system\"},{\"content\":\"Say hello.\",\"role\":\"user\"}],\"model\":\"llama3.2\",\"options\":{\"num_predict\":64,\"stop\":[\"\\n\\n\"],\"temperature\":0.0},\"stream\":false}",
+            "exact request body, got: ${wire.body}")
+    }
+
+    // **`/api/chat` streams by default**, so a buffered request has to say so explicitly or the
+    // whole-body decode fails on the second document.
+    fn a_buffered_request_says_stream_false_explicitly(): void {
+        buffered = encode_or_fail(Ollama.local(), ModelRequest { model: "m", messages: [Message.user("hi")] })
+        assert(buffered.body.contains("\"stream\":false"), buffered.body)
+        assert(!buffered.streamed(), "and the wire says so")
+
+        streamed = encode_or_fail(Ollama.local(), ModelRequest {
+            model: "m",
+            messages: [Message.user("hi")],
+            stream: true,
+        })
+        assert(streamed.body.contains("\"stream\":true"), streamed.body)
+        assert(streamed.streamed())
+        // The one place in this package where the cut is not server-sent events.
+        assert(streamed.ndjson(), "Ollama's native stream is newline-delimited JSON")
+    }
+
+    // No credential of any kind, which is what makes this the one provider CI can exercise for real.
+    fn there_is_no_authorization_header_at_all(): void {
+        wire = encode_or_fail(Ollama.local(), ModelRequest { model: "m", messages: [Message.user("hi")] })
+        assert(wire.headers == {"content-type": "application/json"}, "${wire.headers}")
+    }
+
+    // Sampling lives under `options` with the vendor's own names, and `keep_alive` and `think` are
+    // top-level — none of which the OpenAI-compatible door on the same server can express, which is
+    // the whole reason this codec exists.
+    fn the_native_only_knobs_land_where_the_vendor_wants_them(): void {
+        codec = Ollama.local()
+            .with_keep_alive("10m")
+            .with_option("num_ctx", "8192")
+            .with_option("seed", "42")
+            .thinking(true)
+        wire = encode_or_fail(codec, ModelRequest {
+            model: "qwen3",
+            messages: [Message.user("hi")],
+            max_tokens: some(256),
+        })
+        assert(wire.body.contains("\"keep_alive\":\"10m\""), wire.body)
+        assert(wire.body.contains("\"think\":true"), wire.body)
+        assert(wire.body.contains("\"options\":{\"num_ctx\":8192,\"num_predict\":256,\"seed\":42}"), wire.body)
+
+        // `none` sends no key at all, which is not the same request as `"think": false` — the latter
+        // turns thinking off on a model that would otherwise do it.
+        assert(!encode_or_fail(Ollama.local(), ModelRequest { model: "m", messages: [] }).body.contains("\"think\""))
+        assert(encode_or_fail(Ollama.local().thinking(false), ModelRequest { model: "m", messages: [] })
+            .body.contains("\"think\":false"))
+    }
+
+    fn a_malformed_option_fragment_is_caught_at_encode(): void {
+        match Ollama.local().with_option("num_ctx", "{oops").encode(ModelRequest { model: "m", messages: [] }) {
+            Ok(_) => {
+                assert(false, "a malformed option must not encode")
+            },
+            Err(e) => {
+                assert("${e}".contains("num_ctx"), "${e}")
+                assert("${e}".contains("ollama"), "${e}")
+            },
+        }
+    }
+
+    // Images are a per-message array of bare base64 — no content parts, no data URI, no media type.
+    fn an_image_is_bare_base64_on_the_message(): void {
+        wire = encode_or_fail(Ollama.local(), ModelRequest {
+            model: "llava",
+            messages: [Message {
+                role: Role.User,
+                parts: [Part.Text(text: "what is this?"), Part.Image(mime: "image/png", data: "foobar".to_bytes())],
+            }],
+        })
+        assert(wire.body.contains("{\"content\":\"what is this?\",\"images\":[\"Zm9vYmFy\"],\"role\":\"user\"}"), wire.body)
+    }
+
+    // The native API carries images and nothing else, so a document is refused rather than dropped.
+    fn a_document_is_refused_because_the_native_api_has_no_slot_for_one(): void {
+        match Ollama.local().encode(ModelRequest {
+            model: "m",
+            messages: [Message {
+                role: Role.User,
+                parts: [Part.File(mime: "application/pdf", name: "draft.pdf", data: "x".to_bytes())],
+            }],
+        }) {
+            Ok(_) => {
+                assert(false, "a PDF must not silently encode")
+            },
+            Err(e) => {
+                assert("${e}".contains("draft.pdf"), "${e}")
+                assert("${e}".contains("images only"), "${e}")
+            },
+        }
+    }
+
+    // **The name resolution that makes this codec's tool loop work.** A tool result is addressed by
+    // `tool_name` and the neutral model carries only the id, so the id is resolved against the tool
+    // calls earlier in the same conversation. A turn holding two parallel results becomes two
+    // messages, because one message carries one `tool_name`.
+    fn a_tool_result_is_addressed_by_the_name_of_the_call_it_answers(): void {
+        wire = encode_or_fail(Ollama.local(), ModelRequest {
+            model: "m",
+            messages: [
+                Message.user("weather in both?"),
+                Message {
+                    role: Role.Assistant,
+                    parts: [
+                        Part.ToolCall(id: "call_0", name: "get_weather", args: "{\"city\":\"Malmö\"}"),
+                        Part.ToolCall(id: "call_1", name: "distance_km", args: "{\"from\":\"Malmö\",\"to\":\"Lund\"}"),
+                    ],
+                },
+                Message {
+                    role: Role.Tool,
+                    parts: [
+                        Part.ToolResult(id: "call_0", content: "18C", is_error: false),
+                        Part.ToolResult(id: "call_1", content: "no road on file", is_error: true),
+                    ],
+                },
+            ],
+        })
+        assert(wire.body.contains("{\"content\":\"18C\",\"role\":\"tool\",\"tool_name\":\"get_weather\"}"), wire.body)
+        // No `is_error` flag here either, so a failing result says so in its text.
+        assert(wire.body.contains("{\"content\":\"Error: no road on file\",\"role\":\"tool\",\"tool_name\":\"distance_km\"}"),
+            wire.body)
+        // Both calls ride one assistant message, and `arguments` is a real map.
+        assert(wire.body.contains("\"tool_calls\":[{\"function\":{\"arguments\":{\"city\":\"Malmö\"},\"name\":\"get_weather\"}}"),
+            wire.body)
+    }
+
+    fn a_tool_result_with_no_matching_call_is_refused(): void {
+        match Ollama.local().encode(ModelRequest {
+            model: "m",
+            messages: [Message.tool("call_99", "18C", false)],
+        }) {
+            Ok(_) => {
+                assert(false, "an unaddressable tool result must not encode")
+            },
+            Err(e) => {
+                assert("${e}".contains("call_99"), "${e}")
+                assert("${e}".contains("tool_name"), "the message says what Ollama addresses by: ${e}")
+            },
+        }
+    }
+
+    // Reasoning rides its own field on the assistant message, which is the round trip a thinking
+    // model needs across turns.
+    fn thinking_rides_its_own_field_on_the_turn(): void {
+        wire = encode_or_fail(Ollama.local(), ModelRequest {
+            model: "qwen3",
+            messages: [Message {
+                role: Role.Assistant,
+                parts: [Part.Thinking(text: "let me see", signature: ""), Part.Text(text: "Stockholm.")],
+            }],
+        })
+        assert(wire.body.contains("{\"content\":\"Stockholm.\",\"role\":\"assistant\",\"thinking\":\"let me see\"}"), wire.body)
+    }
+
+    fn encode_sends_the_tools_as_function_declarations(): void {
+        wire = encode_or_fail(Ollama.local(), ModelRequest {
+            model: "m",
+            messages: [Message.user("weather?")],
+            tools: [ToolSpec {
+                name: "weather",
+                description: "Current weather for a city",
+                parameters: "{\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"}",
+            }],
+        })
+        assert(wire.body.contains("\"tools\":[{\"function\":{\"description\":\"Current weather for a city\",\"name\":\"weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"}},\"type\":\"function\"}]"),
+            wire.body)
+        assert(!encode_or_fail(Ollama.local(), ModelRequest {
+            model: "m",
+            messages: [Message.user("hi")],
+        }).body.contains("\"tools\""))
+    }
+
+    fn encode_rejects_a_tool_whose_schema_is_not_json(): void {
+        match Ollama.local().encode(ModelRequest {
+            model: "m",
+            messages: [Message.user("hi")],
+            tools: [ToolSpec { name: "broken", description: "", parameters: "{oops" }],
+        }) {
+            Ok(_) => {
+                assert(false, "a malformed schema must not encode")
+            },
+            Err(e) => {
+                assert("${e}".contains("broken"), "${e}")
+                assert("${e}".contains("ollama"), "${e}")
+            },
+        }
+    }
+
+    // Phase 8 places a cache breakpoint on a `@prompt`'s stable prefix. Ollama's KV cache is
+    // implicit and byte-matched, so the correct handling is to ignore the hint — and "ignore" has to
+    // mean byte-identical, or the marker defeats the cache it was meant to serve.
+    fn a_cache_breakpoint_is_ignored_byte_for_byte(): void {
+        plain = ModelRequest {
+            model: "m",
+            messages: [Message.system("a long stable system prefix"), Message.user("hi")],
+        }
+        marked = ModelRequest {
+            model: "m",
+            messages: [Message.system("a long stable system prefix").cached(), Message.user("hi")],
+        }
+        assert(encode_or_fail(Ollama.local(), plain).body == encode_or_fail(Ollama.local(), marked).body,
+            "Ollama caches implicitly, so the breakpoint must not change a byte")
+    }
+
+    fn a_host_without_a_scheme_is_completed(): void {
+        assert(normalize_host("localhost:11434") == "http://localhost:11434")
+        assert(normalize_host("https://ollama.internal") == "https://ollama.internal")
+        assert(Ollama.at("box.local:11434").host == "http://box.local:11434")
+    }
+
+    // --- Decoding a real captured response body --------------------------------------------------
+
+    fn decode_reads_a_captured_text_reply(): void {
+        reply = decode_or_fail(Ollama.local(), captured_text_reply())
+        assert(reply.parts == [Part.Text(text: "Hej! Hur mår du?")])
+        assert(reply.stop == StopReason.EndTurn)
+        assert(reply.model == "llama3.2")
+        // Ollama reports neither a cache nor a reasoning bucket — a local model has no prompt cache
+        // to bill for, and its thinking tokens are generated tokens like any other.
+        assert(reply.usage == Usage { input_tokens: 61, output_tokens: 468 }, "${reply.usage}")
+    }
+
+    // **The one that would silently break every tool loop.** Ollama reports `done_reason: "stop"`
+    // for a turn whose only content is a tool call, so `ToolUse` is derived from the parts — and the
+    // arguments come back as the raw JSON text of a real object, not of a string.
+    fn a_tool_call_is_tool_use_even_though_the_vendor_says_stop(): void {
+        reply = decode_or_fail(Ollama.local(), captured_tool_call_reply())
+        assert(reply.stop == StopReason.ToolUse, "derived from the parts, not read off done_reason")
+        assert(reply.parts == [Part.ToolCall(
+            id: "call_0",
+            name: "get_current_weather",
+            args: "{\"format\":\"celsius\",\"location\":\"Paris, FR\"}",
+        )], "${reply.parts}")
+    }
+
+    // A reply → request round trip: what the model said, sent straight back as history, has to be
+    // re-encodable. Here that exercises the id-to-name resolution end to end — the id the decoder
+    // synthesized is the one the encoder has to resolve.
+    fn a_decoded_reply_re_encodes_as_history(): void {
+        codec = Ollama.local()
+        reply = decode_or_fail(codec, captured_tool_call_reply())
+        wire = encode_or_fail(codec, ModelRequest {
+            model: "llama3.2",
+            messages: [
+                Message.user("weather in Paris?"),
+                Message { role: Role.Assistant, parts: reply.parts },
+                Message.tool("call_0", "18°C, clear", false),
+            ],
+        })
+        assert(wire.body.contains("{\"content\":\"18°C, clear\",\"role\":\"tool\",\"tool_name\":\"get_current_weather\"}"),
+            "the synthesized id resolved back to the vendor's name: ${wire.body}")
+        assert(wire.body.contains("{\"arguments\":{\"format\":\"celsius\",\"location\":\"Paris, FR\"},\"name\":\"get_current_weather\"}"),
+            wire.body)
+    }
+
+    fn decode_maps_every_done_reason(): void {
+        assert(decode_stop("stop") == StopReason.EndTurn)
+        assert(decode_stop("") == StopReason.EndTurn)
+        assert(decode_stop("length") == StopReason.MaxTokens)
+        assert(decode_stop("load") == StopReason.Other(raw: "load"), "a residency answer is not a finished turn")
+        assert(decode_stop("unload") == StopReason.Other(raw: "unload"))
+        // And the derivation on top of it.
+        assert(decode_done("stop", true) == StopReason.ToolUse)
+        assert(decode_done("stop", false) == StopReason.EndTurn)
+        assert(decode_done("length", true) == StopReason.MaxTokens, "a truncated turn is truncated even so")
+    }
+
+    fn decode_reports_a_malformed_body_rather_than_aborting(): void {
+        match Ollama.local().decode_reply("<html>502 Bad Gateway</html>") {
+            Ok(_) => {
+                assert(false, "HTML is not a reply")
+            },
+            Err(e) => {
+                assert("${e}".contains("ollama reply"), "${e}")
+            },
+        }
+    }
+
+    // --- Error bodies ------------------------------------------------------------------------------
+
+    // Ollama's error body is a bare sentence, not an object — there is no code to match on, so the
+    // message is all there is, and reporting it verbatim beats inventing a code for it.
+    fn decode_error_reads_the_vendors_bare_error(): void {
+        e = Ollama.local().decode_error(404, "{\"error\":\"model 'llama9' not found, try pulling it first\"}")
+        assert(match e {
+            AiError.Provider(status, code, message) => status == 404 && code == ""
+                && message.contains("try pulling it first"),
+            _ => false,
+        }, "${e}")
+    }
+
+    fn decode_error_keeps_an_undecodable_body_verbatim(): void {
+        e = Ollama.local().decode_error(502, "<html>Bad Gateway</html>")
+        assert(match e {
+            AiError.Provider(status, code, message) => status == 502 && code == ""
+                && message == "<html>Bad Gateway</html>",
+            _ => false,
+        }, "${e}")
+    }
+
+    // O-5, demonstrated: Ollama's tokenizer lives inside the served model, so there is nothing a
+    // pure codec could run locally.
+    fn estimate_tokens_is_none_because_the_tokenizer_lives_in_the_model(): void {
+        assert(Ollama.local().estimate_tokens([Message.user("hello")]) == none)
+    }
+
+    // --- Streaming ---------------------------------------------------------------------------------
+
+    // The captured NDJSON transcript, line by line. Every delta, in order — a "did it finish"
+    // assertion would pass on a decoder that emitted the terminal line's empty `content` or lost the
+    // token counts that ride on it.
+    fn a_captured_text_stream_decodes_line_by_line(): void {
+        decoder: dyn StreamDecoder = OllamaStream.new()
+        deltas = stream_or_fail(decoder, captured_text_stream())
+        assert(deltas == [
+            Delta.ModelDelta(model: "llama3.2"),
+            Delta.TextDelta(id: "0", text: "The"),
+            Delta.TextDelta(id: "0", text: " sky"),
+            Delta.TextDelta(id: "0", text: " is blue."),
+            Delta.Stop(reason: StopReason.EndTurn),
+            Delta.UsageDelta(usage: Usage { input_tokens: 26, output_tokens: 282 }),
+        ], "${deltas}")
+        assert(decoder.finish() == Ok(Usage { input_tokens: 26, output_tokens: 282 }))
+
+        reply = provider.fold(deltas, "")
+        assert(reply.parts == [Part.Text(text: "The sky is blue.")])
+        assert(reply.model == "llama3.2")
+        assert(reply.stop == StopReason.EndTurn)
+    }
+
+    // The captured thinking-and-tool transcript. Reasoning accumulates across lines onto its own
+    // block, and the tool call arrives whole — one line carrying the name and the complete arguments
+    // object, which no other vendor in this package does.
+    fn a_captured_thinking_tool_call_stream_decodes_line_by_line(): void {
+        decoder: dyn StreamDecoder = OllamaStream.new()
+        deltas = stream_or_fail(decoder, captured_thinking_tool_call_stream())
+        assert(deltas == [
+            Delta.ModelDelta(model: "qwen3"),
+            Delta.ThinkingDelta(id: "0:thinking", text: "The user wants the weather."),
+            Delta.ThinkingDelta(id: "0:thinking", text: " I should call get_weather."),
+            Delta.TextDelta(id: "0", text: "Let me check."),
+            Delta.ToolCallStart(id: "call_0", name: "get_weather"),
+            Delta.ToolCallArgs(id: "call_0", fragment: "{\"city\":\"Malmö\"}"),
+            Delta.Stop(reason: StopReason.ToolUse),
+            Delta.UsageDelta(usage: Usage { input_tokens: 122, output_tokens: 33 }),
+        ], "${deltas}")
+        assert(decoder.finish() == Ok(Usage { input_tokens: 122, output_tokens: 33 }))
+
+        reply = provider.fold(deltas, "")
+        assert(reply.stop == StopReason.ToolUse)
+        assert(reply.parts == [
+            Part.Thinking(text: "The user wants the weather. I should call get_weather.", signature: ""),
+            Part.Text(text: "Let me check."),
+            Part.ToolCall(id: "call_0", name: "get_weather", args: "{\"city\":\"Malmö\"}"),
+        ], "${reply.parts}")
+    }
+
+    // **A truncated stream must not look like a complete answer.** The lines that did arrive decode
+    // perfectly well, and only the missing `"done": true` says the reply is half of one — which here
+    // also means the whole call's accounting is missing, because it rides on that same line.
+    fn a_truncated_stream_is_refused_rather_than_answered(): void {
+        full = captured_text_stream()
+        cut = full.slice(0, full.len() - 1)
+        decoder: dyn StreamDecoder = OllamaStream.new()
+        deltas = stream_or_fail(decoder, cut)
+        assert(deltas.len() > 0, "the lines that arrived still decode")
+        match decoder.finish() {
+            Ok(u) => {
+                assert(false, "a stream with no `done` line is not a finished reply: ${u}")
+            },
+            Err(e) => {
+                assert("${e}".contains("done"), "${e}")
+                assert("${e}".contains("truncated"), "${e}")
+            },
+        }
+    }
+
+    fn a_stream_that_never_started_says_what_probably_happened(): void {
+        probe: dyn StreamDecoder = OllamaStream.new()
+        match probe.finish() {
+            Ok(u) => {
+                assert(false, "an empty stream is not a reply: ${u}")
+            },
+            Err(e) => {
+                assert("${e}".contains("no documents"), "${e}")
+                assert("${e}".contains("error body"), "the message names the reason it cannot tell: ${e}")
+            },
+        }
+    }
+
+    // A vendor error mid-stream: the transport reports nothing wrong and the only evidence is in the
+    // lines. The status is `0` because there genuinely is none.
+    fn an_error_line_mid_stream_is_the_vendors_error(): void {
+        probe: dyn StreamDecoder = OllamaStream.new()
+        frame = Frame {
+            event: "",
+            data: "{\"error\":\"an existing connection was forcibly closed by the remote host\"}",
+            id: "",
+            retry: none,
+        }
+        match probe.push(frame) {
+            Ok(_) => {
+                assert(false, "an error line must not decode as content")
+            },
+            Err(e) => {
+                assert(match e {
+                    AiError.Provider(status, code, message) => status == 0 && code == ""
+                        && message.contains("forcibly closed"),
+                    _ => false,
+                }, "${e}")
+            },
+        }
+    }
+
+    // The whole point of `decode_deltas`: the buffered door speaks the same vocabulary the streaming
+    // door does, so everything downstream of it is one implementation — including the ids, which is
+    // why the same `call_0` comes out of both.
+    fn the_buffered_door_produces_deltas_too(): void {
+        match Ollama.local().decode_deltas(captured_tool_call_reply()) {
+            Ok(deltas) => {
+                assert(deltas == [
+                    Delta.ModelDelta(model: "llama3.2"),
+                    Delta.ToolCallStart(id: "call_0", name: "get_current_weather"),
+                    Delta.ToolCallArgs(id: "call_0", fragment: "{\"format\":\"celsius\",\"location\":\"Paris, FR\"}"),
+                    Delta.Stop(reason: StopReason.ToolUse),
+                    Delta.UsageDelta(usage: Usage { input_tokens: 122, output_tokens: 33 }),
+                ], "${deltas}")
+            },
+            Err(e) => {
+                assert(false, "${e}")
+            },
+        }
+    }
+}

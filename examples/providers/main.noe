@@ -1,0 +1,353 @@
+// Five vendors, three codec families, one program — the whole of phase 4 in one file.
+//
+// Three things this example exists to show:
+//
+//   * **Runtime provider selection is the caller's `match`, and it scales.** `Provider` is a bound,
+//     never a trait object, so `Agent<Anthropic>`, `Agent<OpenAiCompat>`, `Agent<Google>`,
+//     `Agent<Ollama>`, and `Agent<Mock>` are five different types and no single binding can hold
+//     any of them. That is the pattern rather than a workaround: the arms diverge at construction
+//     and re-converge at `Result<string, AiError>`, so `ask` below is one line per provider and not
+//     a duplicated program (DESIGN §2.3).
+//   * **OpenRouter and Ollama's `/v1` are *configurations*, not codecs.** `OpenAi.new(key)`,
+//     `OpenRouter.new(key)`, and `OllamaCompat.local()` all produce the same `OpenAiCompat` type
+//     with different field values, which is why the `openai`, `openrouter`, and `ollama-compat`
+//     arms differ by exactly one constructor call. A sixth compatible provider is
+//     `OpenAiCompat.at(url, key, name)`.
+//   * **A real vendor codec is testable with no key and no socket.** The `@test` block below runs
+//     the whole run loop — encode, send, decode, fold — over captured vendor bodies, buffered
+//     through `para/api`'s `Mock` middleware and streamed through `para.ai.mock.Replay`. Then it
+//     does the one thing mocks cannot: **if a local Ollama is running, it talks to it for real**,
+//     buffered and streamed, and skips without failing when there is none.
+//
+//     noeta run  main.noe                          # no key, no Ollama: answers from the mock
+//     AI_PROVIDER=google noeta run main.noe        # a real Gemini call
+//     ollama serve & noeta test main.noe           # the live checks stop skipping
+//     noeta test main.noe                          # the assertions
+namespace noeta.providers
+
+use std.http.{Frame}
+use std.http.client
+use std.{env, io}
+use para.api.Api
+use para.api.middleware
+use para.ai.{Agent, AgentConfig, AiError, Message}
+use para.ai.mock.{Mock, Replay}
+use para.ai.provider.{ModelRequest}
+use para.ai.providers.anthropic.Anthropic
+use para.ai.providers.google.Google
+use para.ai.providers.ollama.Ollama
+use para.ai.providers.openai.{OllamaCompat, OpenAi, OpenRouter}
+
+// --- Choosing a provider --------------------------------------------------------------------------
+
+// The agent's configuration is a plain value — no provider, no transport. This is the `Send` half:
+// the thing you would hand to a worker or an isolate, which then builds its own `Agent` from it.
+fn config(model: string): AgentConfig {
+    return AgentConfig.new(model)
+        .with_system("You are terse. Answer in one short sentence.")
+        .with_max_tokens(256)
+        .named("providers")
+}
+
+// `AI_PROVIDER` if it is set; otherwise the first vendor whose credential is in the environment, and
+// a local Ollama before the scripted mock — because a real model that costs nothing is a better
+// default than a canned answer.
+fn chosen(): string {
+    named = env.get("AI_PROVIDER") ?? ""
+    if named != "" {
+        return named
+    }
+    if env.get("ANTHROPIC_API_KEY") != none {
+        return "anthropic"
+    }
+    if env.get("OPENAI_API_KEY") != none {
+        return "openai"
+    }
+    if env.get("OPENROUTER_API_KEY") != none {
+        return "openrouter"
+    }
+    if env.get("GEMINI_API_KEY") != none || env.get("GOOGLE_API_KEY") != none {
+        return "google"
+    }
+    if ollama_reachable() {
+        return "ollama"
+    }
+    return "mock"
+}
+
+// Model names are the one thing that genuinely does not generalize across vendors, so each arm
+// names its own. `AI_MODEL` overrides all of them.
+fn model_for(which: string): string {
+    named = env.get("AI_MODEL") ?? ""
+    if named != "" {
+        return named
+    }
+    return match which {
+        "anthropic" => "claude-opus-4-5",
+        "openai" => "gpt-4o-mini",
+        "openrouter" => "openai/gpt-4o-mini",
+        "google" => "gemini-2.5-flash",
+        "ollama" => ollama_model(),
+        "ollama-compat" => ollama_model(),
+        _ => "mock-model",
+    }
+}
+
+fn ollama_model(): string {
+    return env.get("OLLAMA_MODEL") ?? "llama3.2"
+}
+
+// The scripted stand-in used when nothing else is available — and by the first test below.
+fn offline(): Mock {
+    return Mock.new().reply_text("Hej! Trevligt att träffas.")
+}
+
+// **The runtime-selection `match`, pushed to the outermost point where the arms still agree.**
+//
+// Six providers across three codec families, and the whole cost of that is six lines: `run_sync`
+// returns a provider-independent `Result<string, AiError>`, so the type parameter never escapes.
+// Note how little separates the three `openai_compat` arms — one constructor call each, because
+// they are one codec configured three ways.
+fn ask(text: string): Result<string, AiError> {
+    which = chosen()
+    cfg = config(model_for(which))
+    return match which {
+        "anthropic" => Agent.from(cfg, Anthropic.from_env() ?? Anthropic.new("")).run_sync(text),
+        "openai" => Agent.from(cfg, OpenAi.from_env() ?? OpenAi.new("")).run_sync(text),
+        "openrouter" => Agent.from(cfg, OpenRouter.from_env() ?? OpenRouter.new("")).run_sync(text),
+        "google" => Agent.from(cfg, Google.from_env() ?? Google.new("")).run_sync(text),
+        "ollama" => Agent.from(cfg, Ollama.from_env()).run_sync(text),
+        "ollama-compat" => Agent.from(cfg, OllamaCompat.from_env()).run_sync(text),
+        _ => offline().agent(cfg).run_sync(text),
+    }
+}
+
+// --- The one provider that needs no secret ----------------------------------------------------------
+//
+// Ollama is why this package has end-to-end coverage at all (DESIGN §2.1, §15). Every other vendor
+// puts a real call behind a paid key and therefore behind "someone should set that up"; a local
+// Ollama gives the run loop a genuine non-mock check that CI can run with no credential. The checks
+// below **skip** when nothing is listening — an absent local model is not a failing test.
+
+fn ollama_host(): string {
+    return Ollama.from_env().host
+}
+
+// A cheap liveness probe with a short deadline, so a machine with no Ollama pays 400ms once rather
+// than a connect timeout per test.
+fn ollama_reachable(): bool {
+    return match client.new().timeout(400).get(ollama_host() ~ "/api/tags") {
+        Ok(r) => r.ok(),
+        Err(_) => false,
+    }
+}
+
+// **A skipped check nobody notices has quietly stopped running.** `noeta test` captures a passing
+// test's stdout, so the skip note below is invisible in the human report — which would make "the
+// live check runs in CI" an assumption rather than a fact. So CI sets `OLLAMA_REQUIRED=1` after
+// starting the server: with it, an unreachable Ollama is a *failure* naming the host it tried.
+// Without it — a laptop, a contributor's first clone — it is a skip that never reddens the suite.
+// That is what "never failing for its absence" and "CI makes it honest" mean together.
+fn ollama_required(): bool {
+    v = (env.get("OLLAMA_REQUIRED") ?? "").lower()
+    return v == "true" || v == "1"
+}
+
+// Whether the live checks below should run at all. Skipping is silent in the report by design; the
+// note goes to stdout for `--json` and for the failure path, and `noeta run` prints the same status
+// where a human will actually see it.
+fn live_ollama(what: string): bool {
+    if ollama_reachable() {
+        return true
+    }
+    assert(!ollama_required(),
+        "OLLAMA_REQUIRED is set and nothing answered at ${ollama_host()} — ${what} may not be skipped here")
+    io.outln("skipping ${what}: nothing answering at ${ollama_host()} — start `ollama serve` and `ollama pull ${ollama_model()}` to run it")
+    return false
+}
+
+// --- Captured vendor bodies -------------------------------------------------------------------------
+//
+// Real response bodies from three different vendors, so the tests below exercise the actual codecs
+// rather than a stand-in for them. Each provider's own suite holds the exhaustive fixture tables;
+// these exist to drive the *run loop* over a real codec, which is the part a package suite cannot
+// reach on its own.
+
+fn openai_reply(): string {
+    return "{\"id\":\"chatcmpl-B9MHD\",\"object\":\"chat.completion\",\"created\":1741570283,\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Hej! Trevligt att träffas.\",\"refusal\":null},\"logprobs\":null,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":19,\"completion_tokens\":10,\"total_tokens\":29}}"
+}
+
+fn google_reply(): string {
+    return "{\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"Hej! Trevligt att träffas.\"}],\"role\": \"model\"},\"finishReason\": \"STOP\",\"index\": 0}],\"usageMetadata\": {\"promptTokenCount\": 19,\"candidatesTokenCount\": 10,\"totalTokenCount\": 29},\"modelVersion\": \"gemini-2.5-flash\"}"
+}
+
+fn ollama_reply(): string {
+    return "{\"model\":\"llama3.2\",\"created_at\":\"2023-12-12T14:13:43.416799Z\",\"message\":{\"role\":\"assistant\",\"content\":\"Hej! Trevligt att träffas.\"},\"done\":true,\"done_reason\":\"stop\",\"prompt_eval_count\":19,\"eval_count\":10}"
+}
+
+fn frame(data: string): Frame {
+    return Frame { event: "", data: data, id: "", retry: none }
+}
+
+// An OpenAI-compatible event stream, as the frames `std.http`'s SSE reader hands back — the `data:`
+// prefix is already gone by the time a decoder sees one, and `[DONE]` arrives as a frame whose
+// payload is not a JSON document at all.
+fn openai_frames(): List<Frame> {
+    return [
+        frame("{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}"),
+        frame("{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hej!\"},\"finish_reason\":null}]}"),
+        frame("{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" Trevligt att träffas.\"},\"finish_reason\":null}]}"),
+        frame("{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}"),
+        frame("{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-mini\",\"choices\":[],\"usage\":{\"prompt_tokens\":19,\"completion_tokens\":10,\"total_tokens\":29}}"),
+        frame("[DONE]"),
+    ]
+}
+
+// Ollama's native stream, as the frames `Framing.Ndjson` hands back: one whole JSON document per
+// frame, no prefix, no terminator frame — the last document says `"done": true` and carries the
+// call's whole accounting with it.
+fn ollama_frames(): List<Frame> {
+    return [
+        frame("{\"model\":\"llama3.2\",\"created_at\":\"2023-12-12T14:13:43Z\",\"message\":{\"role\":\"assistant\",\"content\":\"Hej!\"},\"done\":false}"),
+        frame("{\"model\":\"llama3.2\",\"created_at\":\"2023-12-12T14:13:43Z\",\"message\":{\"role\":\"assistant\",\"content\":\" Trevligt att träffas.\"},\"done\":false}"),
+        frame("{\"model\":\"llama3.2\",\"created_at\":\"2023-12-12T14:13:44Z\",\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\",\"prompt_eval_count\":19,\"eval_count\":10}"),
+    ]
+}
+
+// A transport chain that answers one route from a canned body and refuses everything else. An
+// unmatched request does not fall through to the network, so a test that got the URL wrong fails
+// loudly rather than quietly reaching a vendor.
+fn canned(path: string, body: string): Api {
+    return Api.new(client.new().retry(0)).with(middleware.Mock.new().route("post", path, 200, body))
+}
+
+// `noeta test` never runs top-level statements, so these lines are the entry point only.
+io.outln("provider: ${chosen()} (model ${model_for(chosen())})")
+io.outln(if ollama_reachable()
+    then "a local Ollama is answering at ${ollama_host()} — `noeta test main.noe` will talk to it for real"
+    else "no local Ollama at ${ollama_host()} — the live checks in `noeta test main.noe` will skip")
+io.outln(match ask("Say hello in Swedish.") {
+    Ok(answer) => answer,
+    Err(e) => "error: ${e}",
+})
+
+@test {
+    // The selection falls back to the scripted mock when there is no credential and no local model,
+    // which is what makes `noeta run main.noe` work on a machine with neither.
+    fn the_mock_arm_answers_when_nothing_else_is_configured(): void {
+        assert(offline().agent(config("mock-model")).run_sync("Say hello in Swedish.")
+            == Ok("Hej! Trevligt att träffas."))
+    }
+
+    // --- The run loop over a real codec, buffered ---------------------------------------------
+    //
+    // Encode, send through the `para/api` chain, decode, fold — with a captured vendor body in
+    // place of the network. This is the coverage a codec's own fixture table cannot give: it proves
+    // the codec's `Wire` is one the run loop can actually send, and that what comes back survives
+    // the whole path to a string.
+
+    fn a_buffered_run_goes_through_the_real_openai_codec(): void {
+        agent = Agent.over(config("gpt-4o-mini"), OpenAi.new("sk-test"),
+            canned("/v1/chat/completions", openai_reply()))
+        assert(agent.run_sync("Say hello in Swedish.") == Ok("Hej! Trevligt att träffas."))
+    }
+
+    // The same body, the same run loop, and a different origin — because OpenRouter is a
+    // configuration of the same codec rather than a second one.
+    fn a_buffered_run_goes_through_openrouter_and_ollamas_v1(): void {
+        router = Agent.over(config("openai/gpt-4o-mini"), OpenRouter.new("sk-or"),
+            canned("/api/v1/chat/completions", openai_reply()))
+        assert(router.run_sync("Say hello in Swedish.") == Ok("Hej! Trevligt att träffas."))
+
+        local = Agent.over(config("llama3.2"), OllamaCompat.local(),
+            canned("/v1/chat/completions", openai_reply()))
+        assert(local.run_sync("Say hello in Swedish.") == Ok("Hej! Trevligt att träffas."))
+    }
+
+    // Gemini puts the model and the method in the *path*, so this route is the assertion that the
+    // URL a codec builds is the one it means to call.
+    fn a_buffered_run_goes_through_the_real_google_codec(): void {
+        agent = Agent.over(config("gemini-2.5-flash"), Google.new("AIza-test"),
+            canned("/v1beta/models/gemini-2.5-flash:generateContent", google_reply()))
+        assert(agent.run_sync("Say hello in Swedish.") == Ok("Hej! Trevligt att träffas."))
+    }
+
+    fn a_buffered_run_goes_through_ollamas_native_codec(): void {
+        agent = Agent.over(config("llama3.2"), Ollama.local(), canned("/api/chat", ollama_reply()))
+        assert(agent.run_sync("Say hello in Swedish.") == Ok("Hej! Trevligt att träffas."))
+    }
+
+    // --- The run loop over a real codec, streamed ----------------------------------------------
+    //
+    // `Replay` is a `Streamer` over a fixed frame list, so a streamed run is as hermetic as a
+    // buffered one. Two things only this can check: that each codec's `decoder()` coerces to
+    // `dyn StreamDecoder` **from a consuming package** — a standalone `impl` block resolves inside
+    // its own module and fails here — and that `Wire.framing` picks the right cut.
+
+    fn a_streamed_run_goes_through_the_real_openai_decoder(): void {
+        agent = Agent.over(config("gpt-4o-mini").streamed(), OpenAi.new("sk-test"),
+            Api.new(client.new().retry(0))).frames(Replay.of(openai_frames()))
+        assert(agent.run_sync("Say hello in Swedish.") == Ok("Hej! Trevligt att träffas."))
+    }
+
+    // The NDJSON half of the streaming seam, end to end. Ollama's native endpoint is the reason
+    // `Framing` has three members rather than two, and this is where that pays off.
+    fn a_streamed_run_goes_through_ollamas_ndjson_decoder(): void {
+        agent = Agent.over(config("llama3.2").streamed(), Ollama.local(),
+            Api.new(client.new().retry(0))).frames(Replay.of(ollama_frames()))
+        assert(agent.run_sync("Say hello in Swedish.") == Ok("Hej! Trevligt att träffas."))
+    }
+
+    // A codec asks for its own cut, and the run loop reads the wire rather than the request flag.
+    fn each_family_asks_for_the_framing_its_vendor_speaks(): void {
+        req = ModelRequest { model: "m", messages: [Message.user("hi")], stream: true }
+        assert(match OpenAi.new("k").encode(req) { Ok(w) => w.streamed() && !w.ndjson(), Err(_) => false },
+            "the compatible family speaks server-sent events")
+        assert(match Google.new("k").encode(req) { Ok(w) => w.streamed() && !w.ndjson(), Err(_) => false },
+            "Gemini speaks server-sent events, via `?alt=sse`")
+        assert(match Ollama.local().encode(req) { Ok(w) => w.streamed() && w.ndjson(), Err(_) => false },
+            "Ollama's native endpoint speaks newline-delimited JSON")
+    }
+
+    // --- The live checks ---------------------------------------------------------------------------
+    //
+    // The only tests in this repo that open a socket, and the only ones that can fail because
+    // something outside it is wrong. That is the point: a mock proves the run loop does what we told
+    // it to, and only a real server proves the request we encode is one it accepts.
+
+    // Buffered, against a real local model. This is the check that would have caught a body key the
+    // vendor rejects, which no fixture table can.
+    fn a_local_ollama_answers_for_real(): void {
+        if !live_ollama("the live buffered Ollama check") {
+            return
+        }
+        agent = Agent.from(config(ollama_model()).with_max_tokens(64), Ollama.from_env())
+        match agent.run_sync("Reply with exactly one word: pong") {
+            Ok(answer) => {
+                assert(answer.len() > 0, "a live model answered with nothing at all")
+                io.outln("live Ollama (buffered) said: ${answer}")
+            },
+            Err(e) => {
+                assert(false, "the live Ollama run failed — is `${ollama_model()}` pulled? ${e}")
+            },
+        }
+    }
+
+    // Streamed, over real NDJSON off a real socket. Everything above replays frames someone typed;
+    // this is the one place `Framing.Ndjson` meets bytes that arrived over a connection.
+    fn a_local_ollama_streams_for_real(): void {
+        if !live_ollama("the live streamed Ollama check") {
+            return
+        }
+        agent = Agent.from(config(ollama_model()).with_max_tokens(64).streamed(), Ollama.from_env())
+        match agent.run_sync("Reply with exactly one word: pong") {
+            Ok(answer) => {
+                assert(answer.len() > 0, "a live streamed model answered with nothing at all")
+                io.outln("live Ollama (streamed) said: ${answer}")
+            },
+            Err(e) => {
+                assert(false, "the live streamed Ollama run failed — is `${ollama_model()}` pulled? ${e}")
+            },
+        }
+    }
+}
