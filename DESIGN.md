@@ -2,7 +2,7 @@
 
 An agent harness for Noeta: model calls, tool calling, MCP, structured responses, guardrails, rolling context, streaming (AG-UI over SSE), and OpenTelemetry — in the shape the rest of the `para` suite already has.
 
-Status: **phases 1, 2, 3, 4, 6 and 8 are built and merged** — the codec seam, all five providers, the run loop with tool calling, GenAI telemetry, streaming, the MCP client over stdio and streamable HTTP, and the `@prompt` tier with automatic cache breakpoints. Phases 5 (structured output + guardrails) and 7 (AG-UI) are queued. Every toolchain prerequisite this document named has landed (§17); the questions are settled or corrected in place.
+Status: **phases 1, 2, 3, 4, 6, 7 and 8 are built and merged** — the codec seam, all five providers, the run loop with tool calling, GenAI telemetry, streaming, the MCP client over stdio and streamable HTTP, AG-UI over SSE, and the `@prompt` tier with automatic cache breakpoints. Phase 5 (structured output + guardrails) is queued. Every toolchain prerequisite this document named has landed (§17); the questions are settled or corrected in place.
 
 ---
 
@@ -587,6 +587,24 @@ Five divergences, each with its reason:
 
 `run_sync` stays synchronous over the now-async loop by driving it with `std.task.map_bounded` on a one-element list. That the only available spelling for "run this future to completion here" is a concurrency combinator is a std gap; the alternative was a second, synchronous copy of the run loop, which is precisely where a divergence between the two paths would have lived.
 
+### 11.2 What phase 7 built, and where it diverges
+
+Built as specified: `agui.noe` under `namespace para.ai.agui`, `respond(agent, req)` written over `std.http.server.sse`, the `RunAgentInput` decoder, and both AG-UI facts handled explicitly and asserted from both ends. `examples/agui` is the `agui-server` this document sketches, and it was checked against a real socket as well as its own suite — `noeta run` plus a `curl -N` POST returns the nine frames of a tool-calling run byte for byte.
+
+**The premise held: the encoding really is a pure mapping.** `encode(event, thread_id): Frame` is total, variant-local, and stateless — one event in, one frame out, sixteen `match` arms each calling a four-line builder, no accumulator, no lookahead, no failure mode. §11's claim was load-bearing rather than decorative, and the one place it came under pressure resolved without a new variant (see the thinking note below). Nothing was added to `Event`.
+
+Five divergences and findings, each with its reason:
+
+- **`ThinkingDelta` encodes as `REASONING_MESSAGE_CHUNK`, and this is the row that nearly broke the mapping.** AG-UI's streaming reasoning message is bracketed — `REASONING_START`, `REASONING_MESSAGE_START`, content, `REASONING_MESSAGE_END`, `REASONING_END` — while §11's `ThinkingDelta` has no start or end at all, deliberately (phase 3: "a thinking block has no start or end in the event vocabulary"). A bracketing encoder would have needed the block state `para.ai`'s `Open` already carries, which is exactly the "translation layer" §11 exists to avoid. The `*_CHUNK` form is the protocol's own answer: it is self-delimiting, so the bracket is the client's to synthesize and the mapping stays one-to-one. Worth knowing rather than worth fixing — but if AG-UI ever drops the chunk forms, `Event` needs `ThinkingStart`/`ThinkingEnd` rather than the encoder needing a state machine.
+- **`RunFinished` needs a thread id it does not carry.** AG-UI's `RUN_FINISHED` requires `threadId` and `runId`; `Event.RunFinished(run_id, usage)` has only the second, so `encode` takes the thread id as a parameter. It is the single non-local input to the whole table. Adding `thread_id` to the variant would make the mapping completely local, at the cost of a field every non-AG-UI consumer would ignore; the parameter was judged the smaller price, and it is stated at `encode` rather than left to be discovered.
+- **`TOOL_CALL_RESULT` cannot express `is_error`, so it rides in `rawEvent`.** The protocol's event has no error field — a failing tool and a succeeding one are otherwise identical on the wire, which the AG-UI project's own Claude Agent SDK integration calls out in a comment before working around it by rewriting `content` into `{"error": true, "content": …}`. That corrupts the payload the model actually saw, so this encodes the flag into `rawEvent` (the documented producer escape hatch) and only when it is true. Same integration is the precedent for deriving `messageId` as `"${call_id}-result"`.
+- **`stream(conv, out)` gained `thread_id` and `run_id`, both defaulted.** §11 puts the thread id in `RunAgentInput` and phase 3 left `Event.RunStarted.thread_id` empty with a comment naming phase 7. Threading it needed two defaulted parameters on `stream` and on `drive`, which is the whole of the `ai.noe` change. `run_id` came along because AG-UI's client generates it and correlates the stream against it — so the loop mints a uuid only when it is not given one, and the client's id also becomes the run span's `para.ai.run.id`.
+- **A malformed body is a `400`, not a stream.** §11 does not say. AG-UI requires every stream to open with `RUN_STARTED`, which carries both identifiers, and a body that did not decode has neither — inventing two so a broken request could have a well-formed stream would lie to the client about which run it is reading. Everything that fails *after* the decode is a `RUN_ERROR` frame, which is the same line `para/api` draws between a transport failure and an answer.
+
+Two things this phase deliberately carries without consuming. `RunAgentInput.context` and its client-declared `tools` are decoded onto `RunInput` and handed over rather than injected: integrations disagree about where context belongs (agent state, a `copilotkit` key, the system prompt), and a *frontend* tool needs the run to stop and resume from the client's answer, which is a protocol turnaround rather than an encoding. `respond_to(agent, input)` is the door for a caller who wants either. Multimodal user content is the one input shape that is **refused** rather than carried: a non-text fragment fails the decode by name, because answering about an image the model never received is worse than saying no, and carrying one needs a base64 *decoder* (`provider.base64` only encodes) that is a feature rather than an encoding.
+
+`stream_sync(agent, input, out)` is the synchronous door, and it exists for the same reason `run_sync` does: it drives the *same* session `respond_to` hands to `server.sse` through `map_bounded`, so the suite asserts the served stream rather than a paraphrase of it — and synchronously, which matters because a released toolchain never drives an `async fn` in a `@test` block.
+
 ---
 
 ## 12. Telemetry
@@ -730,7 +748,7 @@ para-ai/
   providers/google.noe
   examples/
     chat-cli/              streaming to a terminal, one tool
-    agui-server/           aether + AG-UI SSE, hermetic @test over the event stream
+    agui-server/           AG-UI SSE, hermetic @test over the event stream (built as examples/agui)
     mcp-memory/            memory as an MCP server, Recall guard
     structured/            extract::<T>, Validate, bounded repair
     local-ollama/          keyless end-to-end run against a local Ollama; what CI actually executes
@@ -881,5 +899,5 @@ Each phase is independently useful and independently shippable.
 4. **`OpenAiCompat` + Google, then OpenRouter and Ollama on top.** Should be pure codec work by now; if it is not, the seam in phase 1 was drawn wrong and this is where we find out. OpenRouter and Ollama arriving as *configurations* rather than files is the pass condition for phase 1's design — and Ollama unlocks keyless integration tests in CI for everything after this point. **Built, and the pass condition held**; the divergences are in §2.1.1.
 5. **Structured responses + guardrails.** `extract::<T>`, `Validate` at the door, bounded repair, the `Guard` trait and standard guards.
 6. **MCP.** stdio first (no native code), then streamable HTTP. Memory example lands here. **Built**, with the divergences in §7.1.
-7. **AG-UI.** The SSE responder, the aether integration, the event-sequence test harness.
+7. **AG-UI.** The SSE responder, the aether integration, the event-sequence test harness. **Built**, with the divergences in §11.2.
 8. **`@prompt` tier + cache breakpoints.** Last, because it is the one piece nothing else depends on — and the one most worth getting right rather than early. **Built**, with the divergences in §14.1.

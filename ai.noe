@@ -514,17 +514,23 @@ pub struct AgentConfig {
 // One thing that happened during a run, as it happened.
 //
 // **Every variant is a value type**, so a `Sender<Event>` works across tasks *and* isolates and the
-// whole thing composes with parallel serving. The shape is chosen so that AG-UI encoding (phase 7)
-// is a pure mapping rather than a translation layer — which is also why the enum is complete here
-// rather than growing a variant at a time: adding one later would break every exhaustive `match` a
-// consumer had written against it.
+// whole thing composes with parallel serving. The shape is chosen so that AG-UI encoding is a pure
+// mapping rather than a translation layer — which is also why the enum is complete here rather than
+// growing a variant at a time: adding one later would break every exhaustive `match` a consumer had
+// written against it.
 //
-// **What the run loop emits today** is `RunStarted`, the text / thinking / tool-call deltas with
-// their block starts and ends, one `ToolCallResult` per dispatched call, and exactly one terminal
+// **And it held.** `para.ai.agui.encode` is total, variant-local, and stateless: one event in, one
+// frame out, no accumulator and no lookahead. The one place it came under pressure is
+// `ThinkingDelta`, which AG-UI would normally bracket with four events of its own; the protocol's
+// self-delimiting chunk form absorbs that, so nothing here had to change. DESIGN §11.2 records it,
+// because if that form ever goes away this enum needs `ThinkingStart`/`ThinkingEnd` rather than the
+// encoder needing state.
+//
+// **What the run loop emits** is `RunStarted`, the text / thinking / tool-call deltas with their
+// block starts and ends, one `ToolCallResult` per dispatched call, and exactly one terminal
 // `RunFinished` or `RunError`. `StateSnapshot`, `StateDelta`, `StepStarted`, `StepFinished`, and
-// `Custom` are for consumers to produce and for phase 7 to encode; nothing in the loop emits one.
-// That is the seam named rather than filled — inventing a step vocabulary before AG-UI is in hand
-// would be guessing at the thing phase 7 exists to decide.
+// `Custom` are for consumers to produce — AG-UI encodes every one of them, and the loop has no
+// opinion about what a step or a piece of state is.
 @derive(Equatable, Display)
 pub enum Event {
     RunStarted(run_id: string, thread_id: string)
