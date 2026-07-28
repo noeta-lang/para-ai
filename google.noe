@@ -208,6 +208,15 @@ fn merged_turn(previous: dyn, role: string, blocks: List<dyn>): Map<string, dyn>
 // its cause. Adjacent turns of the same wire role are merged into one, for the reason Anthropic's
 // codec merges them: `Role.Tool` encodes as `user`, so a user question followed by a tool result
 // would otherwise be two consecutive `user` entries.
+//
+// **`Message.cache_breakpoint` is deliberately not read here.** Gemini's implicit context cache
+// matches the longest byte-identical prefix of a request automatically, with no marker — so the
+// correct handling of phase 8's hint is to ignore it, and "ignore" has to mean *byte-identical*: a
+// key invented to carry it would change the prefix and defeat the cache it was meant to serve.
+// (Gemini's *explicit* `cachedContent` is a different feature with its own lifecycle and its own
+// create/delete endpoints, so it belongs to a caller through `extra`, not to a marker on a turn.)
+// The saving is still reported: `usageMetadata.cachedContentTokenCount` reads into
+// `Usage.cached_input_tokens`.
 fn encode_contents(msgs: List<Message>): Result<(List<dyn>, List<dyn>), AiError> {
     mut system: List<dyn> = []
     mut turns: List<dyn> = []
@@ -994,6 +1003,24 @@ fn captured_function_call_reply(): string {
             "the escape hatch wins over the codec's own block: ${wire.body}")
         assert(wire.body.contains("\"safetySettings\":[{\"category\":\"HARM_CATEGORY_HARASSMENT\",\"threshold\":\"BLOCK_NONE\"}]"),
             wire.body)
+    }
+
+    // Phase 8 places a cache breakpoint on a `@prompt`'s stable prefix. Gemini's implicit cache
+    // matches an exact prefix, so the correct handling is to ignore the hint — and "ignore" has to
+    // mean byte-identical, or the marker defeats the cache it was meant to serve.
+    fn a_cache_breakpoint_is_ignored_byte_for_byte(): void {
+        plain = ModelRequest {
+            model: "m",
+            messages: [Message.system("a long stable system prefix"), Message.user("hi")],
+        }
+        marked = ModelRequest {
+            model: "m",
+            messages: [Message.system("a long stable system prefix").cached(), Message.user("hi")],
+        }
+        assert(encode_or_fail(Google.new("k"), plain).body == encode_or_fail(Google.new("k"), marked).body,
+            "Gemini caches implicitly, so the breakpoint must not change a byte")
+        // And the saving the cache produced is still reported, because that part is the vendor's.
+        assert(decode_or_fail(Google.new("k"), captured_text_reply()).usage.cached_input_tokens == 1024)
     }
 
     // --- Decoding a real captured response body --------------------------------------------------

@@ -221,6 +221,11 @@ fn split_results(codec: Ollama, m: Message, names: Map<string, string>): Result<
     return Ok(out)
 }
 
+// **`Message.cache_breakpoint` is deliberately not read here.** Ollama has no explicit breakpoint:
+// the server keeps a KV cache for the prefix of the prompt it last served a model, matched byte for
+// byte and with no marker of any kind — the same contract OpenAI's and Google's implicit caches
+// offer. So the hint is ignored, and "ignored" has to mean *byte-identical*, because a key invented
+// to carry it would change the prefix and defeat the cache it was meant to serve. Asserted below.
 fn encode_messages(codec: Ollama, msgs: List<Message>): Result<List<dyn>, AiError> {
     mut out: List<dyn> = []
     mut names: Map<string, string> = {}
@@ -868,6 +873,22 @@ fn captured_tool_call_reply(): string {
                 assert("${e}".contains("ollama"), "${e}")
             },
         }
+    }
+
+    // Phase 8 places a cache breakpoint on a `@prompt`'s stable prefix. Ollama's KV cache is
+    // implicit and byte-matched, so the correct handling is to ignore the hint — and "ignore" has to
+    // mean byte-identical, or the marker defeats the cache it was meant to serve.
+    fn a_cache_breakpoint_is_ignored_byte_for_byte(): void {
+        plain = ModelRequest {
+            model: "m",
+            messages: [Message.system("a long stable system prefix"), Message.user("hi")],
+        }
+        marked = ModelRequest {
+            model: "m",
+            messages: [Message.system("a long stable system prefix").cached(), Message.user("hi")],
+        }
+        assert(encode_or_fail(Ollama.local(), plain).body == encode_or_fail(Ollama.local(), marked).body,
+            "Ollama caches implicitly, so the breakpoint must not change a byte")
     }
 
     fn a_host_without_a_scheme_is_completed(): void {

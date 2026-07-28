@@ -446,6 +446,15 @@ fn encode_plain(codec: OpenAiCompat, m: Message): Result<Map<string, dyn>, AiErr
     return Ok(msg)
 }
 
+// **`Message.cache_breakpoint` is deliberately not read here, and that is the handling rather than
+// a gap.** This family's prompt cache is *implicit*: the server matches the longest byte-identical
+// prefix of a request it has recently seen, automatically, with no marker of any kind. What such a
+// cache needs is exactly what phase 8's `prompt_turns` already produces — the stable text first and
+// byte-identical between runs — and inventing a marker key to carry the hint would change those
+// bytes and so *defeat* the cache it was meant to serve. The test below asserts the encoded body is
+// byte-identical with the flag set and unset, which is what makes "ignored" a claim rather than an
+// omission. The saving is still reported: `usage.prompt_tokens_details.cached_tokens` is read into
+// `Usage.cached_input_tokens` by `decode_usage`.
 fn encode_messages(codec: OpenAiCompat, msgs: List<Message>): Result<List<dyn>, AiError> {
     mut out: List<dyn> = []
     for m in msgs {
@@ -1409,6 +1418,27 @@ fn captured_ollama_compat_reply(): string {
                 assert("${e}".contains("provider"), "${e}")
             },
         }
+    }
+
+    // Phase 8 places a cache breakpoint on a `@prompt`'s stable prefix. This family caches
+    // **implicitly**, on an exact prefix match, so the correct handling of that hint is to ignore
+    // it — and "ignore" has to mean *byte-identical*, because a marker key invented to carry it
+    // would change the prefix and defeat the very cache it was meant to serve.
+    fn a_cache_breakpoint_is_ignored_byte_for_byte(): void {
+        plain = ModelRequest {
+            model: "m",
+            messages: [Message.system("a long stable system prefix"), Message.user("hi")],
+        }
+        marked = ModelRequest {
+            model: "m",
+            messages: [Message.system("a long stable system prefix").cached(), Message.user("hi")],
+        }
+        for codec in [OpenAi.new("k"), OpenRouter.new("k"), OllamaCompat.local()] {
+            assert(encode_or_fail(codec, plain).body == encode_or_fail(codec, marked).body,
+                "${codec.vendor} caches implicitly, so the breakpoint must not change a byte")
+        }
+        // And the saving the cache produced is still reported, because that part is the vendor's.
+        assert(decode_or_fail(OpenAi.new("k"), captured_text_reply()).usage.cached_input_tokens == 1024)
     }
 
     fn encode_passes_a_speakers_name_through(): void {
