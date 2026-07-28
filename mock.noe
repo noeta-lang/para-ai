@@ -1064,6 +1064,22 @@ impl Middleware for Mock {
             "cached tokens are not added on top: ${run.usage}")
     }
 
+    // Both halves of this travel the streamed path too. The two transports share one `request()`
+    // and one delta vocabulary rather than having two implementations — but "shares an
+    // implementation" is a claim, and a claim is worth an assertion.
+    async fn the_streamed_path_carries_the_breakpoint_and_the_cache_read(): void {
+        m = Mock.new().with_cache_reads(512).reply_text("ok")
+        cfg = AgentConfig.new("test-model").with_system_prompt(split_prompt("Acme")).streamed()
+        run = match m.agent(cfg).run(Conversation.of("hi")).await {
+            Ok(r) => r,
+            Err(e) => Run { messages: [Message.assistant("FAILED: ${e}")] },
+        }
+        assert(run.text() == "ok", "${run.messages}")
+        assert(m.calls()[0].contains("{\"cache_breakpoint\":true,\"parts\":[{\"text\":\"You work for \",\"type\":\"text\"}],\"role\":\"system\"}"),
+            "${m.calls()[0]}")
+        assert(run.usage.cached_input_tokens == 512, "the usage frame carries it: ${run.usage}")
+    }
+
     // A concurrency cap of one is the sequential path through the same dispatcher, and it has to
     // produce byte-identical results — order comes from `map_bounded`, not from timing.
     fn the_concurrency_cap_does_not_change_the_answer(): void {
