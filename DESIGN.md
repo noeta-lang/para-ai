@@ -798,6 +798,33 @@ A runtime `fields_of_type(name)` was the alternative ask; U-1 is strictly better
 
 **U-2 — `async` through `dyn Trait` (`lang`).** para/ai does not need it — the package is bound-only — but a declared `string` that holds a `Future` is a hole that should not stay open. The fix is to apply the same `async_return` wrap the bound path uses when resolving a method through a trait-object receiver (`crates/noeta-check/src/expr/member.rs` is where the bound path reads `m.sig.is_async`). A regression test asserting `via_dyn` either types as `Future<string>` or is rejected belongs with it.
 
+### 17.2 What core still owes phases 4–8
+
+Measured against `lang` `ea9998c1a` (2026-07-28), by probe rather than by reading. Ordered by how much is blocked.
+
+**U-5 — a standalone `impl T for X` is invisible to `dyn T` coercion across a module boundary.** The one *bug* left, and it touches every remaining phase.
+
+```noeta
+// pkg.lib
+pub trait Codec { fn decoder(): dyn Decoder }
+pub class MyDecoder { fn new(): MyDecoder { … } }
+impl Decoder for MyDecoder { … }          // standalone
+```
+
+From another module: `expected dyn Decoder, found MyDecoder`. Writing the impl **inline in the class body** works. So the whole package is currently constrained to the inline spelling — `Provider.decoder(): dyn StreamDecoder`, `dyn Guard`, `dyn ToolSource`, `dyn ContextStrategy` and the MCP client are all this shape, which is phases 4, 5, 6 and 7. It is worse than a style constraint because the failure appears **only from a consuming package**: the library's own suite is green while every consumer breaks.
+
+**U-6 — no runtime reflection over an enum's variants.** `variants_of` does not exist, and the consequence is sharper than a missing feature: an enum field reflects as `Type.Named("Sentiment", [])` and `field_specs_of("Sentiment")` returns **0 fields** — *indistinguishable from an empty struct*. A schema generator that recursed naively would emit `{"type":"object","properties":{}}` for an enum and be silently wrong, which is why §6 refuses an enum-typed parameter rather than half-deriving one. Blocks enum tool parameters (phase 2, refused today) and enum fields in structured output (phase 5). Nested **structs** are fine — recursion through `field_specs_of(name)` works to any depth.
+
+**U-7 — `json.try_parse(text): Result<dyn, JsonError>`, a recoverable *dynamic* parse.** Only the typed turbofish `try_parse::<T>` exists, and it cannot build a `Map<string, dyn>`; `json.parse` aborts. Every codec decodes a body that came off a wire, so `provider.parse_object` does it in two steps behind a field-less witness struct. Phase 4 adds three more codecs on that workaround, phase 6 needs it for every JSON-RPC reply, phase 7 for AG-UI's `RunAgentInput`.
+
+**U-8 — `std.base64`, and a per-byte read on `bytes`.** `provider.base64` currently encodes via `bytes.to_hex()` string arithmetic — correct against the RFC vectors, O(n) in the wrong way. Every codec inlines images and files (phase 4), and MCP resource contents are base64 (phase 6). The **decoder** is not merely slow but impossible: `b[0]` is `cannot index a value of type bytes`, so a `bytes`-typed tool parameter is refused outright.
+
+**U-9 — a named-argument form for `invoke`.** Phase 2 called this its most valuable follow-up. `invoke` takes a positional `List<dyn>` only, so a tool call that omits a defaulted parameter *and* supplies a later one is inexpressible and is refused by name. `construct(name, fields)` already has the named-map form, so this is parity rather than new ground.
+
+**Minor.** `ParamInfo`/`FieldSpec` cannot be written as struct literals — their `type` field collides with the keyword in literal position (reading `p.type` is fine), so a test cannot synthesize one and must reflect a real declaration.
+
+**Confirmed *not* needed.** Phase 8's `@prompt` works today: a pure-Noeta `@tier(prompt, text: "markdown", expr: string)` declaration runs, with statics and hole thunks as documented — which is the whole prompt-caching story. Phase 6's stdio transport works today: `os.spawn` + `write`/`read_line` round-trips JSON-RPC with no core change. Phase 7's SSE responder landed with U-3.
+
 ## 18. Build order
 
 Each phase is independently useful and independently shippable.
