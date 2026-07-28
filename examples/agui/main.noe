@@ -1,0 +1,281 @@
+// Serving an agent over AG-UI — the whole of phase 7 in one file.
+//
+// AG-UI is the protocol a chat front end speaks to an agent: the client posts a `RunAgentInput`
+// (the thread, the conversation so far, its state) and reads back a server-sent event stream of
+// what the agent is doing, token by token and tool call by tool call. This file is a real server
+// for it, in about thirty lines of actual code.
+//
+// Three things it exists to show:
+//
+//   * **The endpoint is one line.** `agui.respond(agent, req)` is the whole handler: it decodes the
+//     input, opens a `text/event-stream` response with `std.http.server.sse`, spawns the run, and
+//     encodes every event the run emits as an AG-UI frame. Nothing here builds a response, sets a
+//     header, or manages a connection.
+//   * **The event stream is testable without a server.** `agui.stream_sync` drives the *same*
+//     session `respond` hands to the serve loop, writing into an `agui.Tape` instead of a socket —
+//     so the `@test` block below asserts the exact frames a browser would have received, with no
+//     port, no key, and no waiting.
+//   * **A failure is part of the stream.** The run that goes wrong still opens with `RUN_STARTED`
+//     and closes with exactly one `RUN_ERROR`; a client is never left holding a connection that
+//     merely stopped. That is asserted here rather than assumed.
+//
+//     ANTHROPIC_API_KEY=sk-... noeta run  main.noe    # serve a real agent on :8080
+//     noeta run  main.noe                             # no key: serve the scripted one
+//     noeta test main.noe                             # the assertions
+//
+// With the server up, the protocol is plain HTTP:
+//
+//     curl -N -X POST localhost:8080/agent -H 'content-type: application/json' \
+//       -d '{"threadId":"t1","runId":"r1","state":{},"context":[],"tools":[],
+//            "forwardedProps":{},"messages":[{"id":"m1","role":"user","content":"weather in Malmö?"}]}'
+namespace noeta.agui
+
+use std.http.client
+use std.http.server
+use std.http.{Request, Response}
+use std.{env, io}
+use para.ai.{Agent, AgentConfig, AiError, Message, Part, Role}
+use para.ai.agui
+use para.ai.agui.{RunInput, Tape}
+use para.ai.mock.Mock
+use para.ai.providers.anthropic.Anthropic
+use para.ai.tools.{Arg, Local, Tool, Toolbox}
+
+// --- The agent ------------------------------------------------------------------------------------
+
+// An ordinary function. `#[Tool]` is the whole registration, and the signature is the schema.
+#[Tool(about: "Current weather for a city")]
+fn weather(#[Arg(help: "City name, e.g. 'Malmö'")] city: string): Result<string, string> {
+    if city == "" {
+        return Err("a city name is required")
+    }
+    return Ok("18°C and clear in ${city}")
+}
+
+fn config(): AgentConfig {
+    return AgentConfig.new("claude-opus-5")
+        .with_system("You are a Swedish weather assistant. Use the tool; answer in one sentence.")
+        .with_max_tokens(512)
+        .named("weather-agent")
+}
+
+// The scripted stand-in used when no API key is set — and by every test below. Two turns: the model
+// asks for the tool, then answers from what came back.
+fn offline(): Mock {
+    return Mock.new()
+        .reply_tool("call_1", "weather", "{\"city\": \"Malmö\"}")
+        .reply_text("Det är 18°C och klart i Malmö.")
+}
+
+// --- The endpoint ---------------------------------------------------------------------------------
+
+// The AG-UI endpoint.
+//
+// The runtime-selection `match` is DESIGN §2.1's pattern, pushed to the outermost point where the
+// arms still agree: `Agent<Anthropic>` and `Agent<Mock>` are different types, but `agui.respond`
+// returns a `Response` from either, so the arms diverge at construction and re-converge here.
+//
+// A `Result` from `.tools(...)` is a *construction* failure — a tool whose schema will not derive,
+// or a name that collides across sources — and it can only happen before any client is listening,
+// so it answers as a `500` rather than as a run that never started.
+fn agent_endpoint(req: Request): Response {
+    live = env.get("AI_PROVIDER") ?? (if env.get("ANTHROPIC_API_KEY") == none then "mock" else "anthropic")
+    return match live {
+        "mock" => respond_with_mock(req),
+        _ => respond_with_anthropic(req),
+    }
+}
+
+fn respond_with_mock(req: Request): Response {
+    return match offline().agent(config()).tools(Local.new()) {
+        Ok(a) => agui.respond(a, req),
+        Err(e) => misconfigured(e),
+    }
+}
+
+fn respond_with_anthropic(req: Request): Response {
+    return match Agent.from(config(), Anthropic.from_env() ?? Anthropic.new("")).tools(Local.new()) {
+        Ok(a) => agui.respond(a, req),
+        Err(e) => misconfigured(e),
+    }
+}
+
+fn misconfigured(e: AiError): Response {
+    return server.response(500, "this agent could not be built: ${e}")
+}
+
+// One `(Request) -> Response` for the whole server, whether the answer is a document or a stream
+// held open for a minute — which is exactly what `server.sse` is shaped for.
+fn fetch(req: Request): Response {
+    // `.lower()` because a method is a case-insensitive token on the wire and the two doors
+    // disagree in practice: a serve loop hands over `POST`, `client.prepare("post", …)` keeps what
+    // it was given, and a router that compared either verbatim would answer one of them `404`.
+    if req.path() == "/agent" && req.method().lower() == "post" {
+        return agent_endpoint(req)
+    }
+    if req.path() == "/" {
+        return server.response(200, usage(), {"content-type": "text/plain; charset=utf-8"})
+    }
+    return server.response(404, "not found")
+}
+
+fn usage(): string {
+    return "POST /agent with an AG-UI RunAgentInput; the answer is a text/event-stream of AG-UI events.\n"
+}
+
+fn port(): int {
+    return (env.get("PORT") ?? "8080").to_int() ?? 8080
+}
+
+// `noeta test` never runs top-level statements, so these two lines are the entry point only.
+io.outln("AG-UI agent on http://localhost:${port()}/agent")
+server.serve(port(), fetch)
+
+@test {
+    // **The stream a browser would have read**, asserted frame for frame with no socket in it.
+    // `stream_sync` drives the same session `respond` hands to the serve loop, into a `Tape`
+    // instead of an `SseSink`.
+    //
+    // Read it as the story of one turn: the run opens, the model asks for `weather`, the *real*
+    // `weather` function above runs and its answer goes back as a tool result, the model's reply
+    // streams as a text block, and the run closes. That is the whole AG-UI vocabulary a chat front
+    // end needs.
+    fn a_served_run_streams_the_events_a_front_end_renders(): void {
+        tape = Tape.new()
+        n = agui.stream_sync(agent_or_fail(offline()), decoded("weather in Malmö?"), tape)
+        assert(kinds(tape) == [
+            "RUN_STARTED",
+            "TOOL_CALL_START",
+            "TOOL_CALL_ARGS",
+            "TOOL_CALL_END",
+            "TOOL_CALL_RESULT",
+            "TEXT_MESSAGE_START",
+            "TEXT_MESSAGE_CONTENT",
+            "TEXT_MESSAGE_END",
+            "RUN_FINISHED",
+        ], "${kinds(tape)}")
+        assert(n == 9, "${n}")
+    }
+
+    // The tool result in the stream is what the real function returned, not what the script said —
+    // the script never mentions 18°C.
+    fn the_tool_result_in_the_stream_came_from_the_real_function(): void {
+        tape = Tape.new()
+        one = agui.stream_sync(agent_or_fail(offline()), decoded("weather in Malmö?"), tape)
+        result = tape.payloads()[4]
+        assert(result.contains("\"toolCallId\":\"call_1\""), result)
+        assert(result.contains("18°C and clear in Malmö"), result)
+    }
+
+    // The client's own thread and run ids come back in the frames it correlates on — which is the
+    // whole reason `RunAgentInput` carries them.
+    fn the_clients_ids_bracket_the_stream(): void {
+        tape = Tape.new()
+        n = agui.stream_sync(agent_or_fail(offline()), decoded("weather in Malmö?"), tape)
+        opened = tape.payloads()[0]
+        closed = tape.payloads()[n - 1]
+        assert(opened == "{\"runId\":\"r1\",\"threadId\":\"t1\",\"type\":\"RUN_STARTED\"}", opened)
+        assert(closed.contains("\"threadId\":\"t1\"") && closed.contains("\"runId\":\"r1\""), closed)
+    }
+
+    // **A failure is a frame.** The vendor refuses, and the client still gets a well-formed stream:
+    // it opens, it says why it stopped, and it ends — rather than the connection simply dying.
+    fn a_failing_run_still_ends_the_stream_properly(): void {
+        tape = Tape.new()
+        n = agui.stream_sync(agent_or_fail(Mock.new().fail(400, "invalid_request_error", "that model is not available")), decoded("go"), tape)
+        assert(kinds(tape) == ["RUN_STARTED", "RUN_ERROR"], "${kinds(tape)}")
+        assert(tape.payloads()[1].contains("\"code\":\"invalid_request_error\""), tape.payloads()[1])
+        // And it really is an event stream on the wire, not a JSON body.
+        assert(tape.wire().contains("data: {\"code\":\"invalid_request_error\""), tape.wire())
+        assert(tape.wire().ends_with("\n\n"), tape.wire())
+    }
+
+    // The input really is AG-UI's document, decoded — the conversation the client sent becomes the
+    // conversation the run starts from.
+    fn the_request_body_decodes_to_the_conversation_the_client_sent(): void {
+        input = decoded("weather in Malmö?")
+        assert(input.thread_id == "t1" && input.run_id == "r1")
+        assert(input.state == "{\"city\":\"Malmö\"}", input.state)
+        assert(input.conversation().messages == [
+            Message { role: Role.User, parts: [Part.Text(text: "weather in Malmö?")] },
+        ], "${input.messages}")
+    }
+
+    // The routing half. A body that is not a `RunAgentInput` never became a run, so it is a `400`
+    // naming the reason rather than an event stream that would have to invent a run to describe.
+    fn a_malformed_body_is_refused_before_any_stream_opens(): void {
+        resp = fetch(post("/agent", "{\"threadId\":"))
+        assert(resp.status() == 400, "${resp.status()}")
+        assert(resp.body().contains("ag-ui RunAgentInput"), resp.body())
+    }
+
+    fn the_server_answers_its_other_routes(): void {
+        assert(fetch(post("/nope", "")).status() == 404)
+        assert(fetch(get("/")).body().contains("RunAgentInput"))
+    }
+
+    // **A dependency's test fixtures must not reach this program's model.**
+    //
+    // `agui.noe` declares two `#[Tool]` fixtures for its own suite, and `attributes_of::<Tool>()` is
+    // whole-program — dependency packages included. They live inside a `@test` block, which is
+    // stripped before lowering on every build that is not that module's own `noeta test`, so they
+    // cannot be linked in here at all. `examples/tools` asserts the same for `tools.noe` and
+    // `mock.noe`; this is the assertion for the module phase 7 added, and the thing worth catching
+    // is the *next* fixture somebody adds to the library.
+    fn no_dependency_tool_reaches_this_programs_model(): void {
+        match Toolbox.of(Local.new()) {
+            Ok(box) => {
+                assert(box.names() == ["weather"],
+                    "a consumer's toolbox is its own tools and nothing else: ${box.names()}")
+            },
+            Err(e) => {
+                assert(false, "${e}")
+            },
+        }
+    }
+}
+
+// --- The suite's helpers ----------------------------------------------------------------------------
+//
+// At module level rather than inside the `@test` block: every `fn` in a top-level `@test` block is a
+// test root, so a helper that takes an argument would be called with none and fail.
+
+// A `RunAgentInput` exactly as an AG-UI client sends one, decoded.
+fn decoded(question: string): RunInput {
+    body = "{\"threadId\":\"t1\",\"runId\":\"r1\",\"state\":{\"city\":\"Malmö\"},\"context\":[],\"tools\":[],\"forwardedProps\":{},\"messages\":[{\"id\":\"m1\",\"role\":\"user\",\"content\":\"${question}\"}]}"
+    return match agui.decode_input(body) {
+        Ok(v) => v,
+        Err(e) => RunInput { thread_id: "DECODE FAILED: ${e}" },
+    }
+}
+
+fn agent_or_fail(m: Mock): Agent<Mock> {
+    return match m.agent(config()).tools(Local.new()) {
+        Ok(a) => a,
+        Err(e) => m.agent(AgentConfig.new("TOOLS FAILED: ${e}")),
+    }
+}
+
+// Every frame's AG-UI `type`, in order — the shape of a stream, without its payloads.
+fn kinds(tape: Tape): List<string> {
+    mut out: List<string> = []
+    for p in tape.payloads() {
+        out = out ~ [kind_of(p)]
+    }
+    return out
+}
+
+// A frame's kind. `RUN_FINISHED` nests a second `"type"` in its `outcome`, so this reads the *last*
+// one rather than the first: `json.stringify` sorts keys, and `type` sorts after `result`.
+fn kind_of(payload: string): string {
+    parts = payload.split("\"type\":\"")
+    return parts[parts.len() - 1].split("\"")[0]
+}
+
+fn post(path: string, body: string): Request {
+    return client.new().prepare("post", "http://127.0.0.1${path}", body, {"content-type": "application/json"})
+}
+
+fn get(path: string): Request {
+    return client.new().prepare("get", "http://127.0.0.1${path}", "", {})
+}

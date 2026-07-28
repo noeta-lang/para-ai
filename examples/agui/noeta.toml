@@ -1,0 +1,19 @@
+[package]
+name = "noeta/agui"
+version = "0.1.0"
+
+# Both packages share the `para` scope, so they bind under one import root — the array form the
+# manifest reference calls a scope dependency. `para/api` is named explicitly even though this
+# example never writes `use para.api`: para/ai composes over it, and a transitive dependency has to
+# be part of the same root for `para.ai.*` and `para.api.*` to coexist.
+[dependencies]
+para = [
+    { path = "../..", package = "para/ai" },
+    { path = "../../../para-api", package = "para/api" },
+]
+
+# `para/ai` is pure Noeta, but `para/api` ships a native extension crate. A native grant is per
+# package and never self-authorized — not even by the dependency that pulls it in — so a consumer of
+# para/ai names `para/api` here.
+[trust]
+native = ["para/api"]

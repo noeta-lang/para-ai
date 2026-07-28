@@ -518,17 +518,23 @@ pub struct AgentConfig {
 // One thing that happened during a run, as it happened.
 //
 // **Every variant is a value type**, so a `Sender<Event>` works across tasks *and* isolates and the
-// whole thing composes with parallel serving. The shape is chosen so that AG-UI encoding (phase 7)
-// is a pure mapping rather than a translation layer — which is also why the enum is complete here
-// rather than growing a variant at a time: adding one later would break every exhaustive `match` a
-// consumer had written against it.
+// whole thing composes with parallel serving. The shape is chosen so that AG-UI encoding is a pure
+// mapping rather than a translation layer — which is also why the enum is complete here rather than
+// growing a variant at a time: adding one later would break every exhaustive `match` a consumer had
+// written against it.
 //
-// **What the run loop emits today** is `RunStarted`, the text / thinking / tool-call deltas with
-// their block starts and ends, one `ToolCallResult` per dispatched call, and exactly one terminal
+// **And it held.** `para.ai.agui.encode` is total, variant-local, and stateless: one event in, one
+// frame out, no accumulator and no lookahead. The one place it came under pressure is
+// `ThinkingDelta`, which AG-UI would normally bracket with four events of its own; the protocol's
+// self-delimiting chunk form absorbs that, so nothing here had to change. DESIGN §11.2 records it,
+// because if that form ever goes away this enum needs `ThinkingStart`/`ThinkingEnd` rather than the
+// encoder needing state.
+//
+// **What the run loop emits** is `RunStarted`, the text / thinking / tool-call deltas with their
+// block starts and ends, one `ToolCallResult` per dispatched call, and exactly one terminal
 // `RunFinished` or `RunError`. `StateSnapshot`, `StateDelta`, `StepStarted`, `StepFinished`, and
-// `Custom` are for consumers to produce and for phase 7 to encode; nothing in the loop emits one.
-// That is the seam named rather than filled — inventing a step vocabulary before AG-UI is in hand
-// would be guessing at the thing phase 7 exists to decide.
+// `Custom` are for consumers to produce — AG-UI encodes every one of them, and the loop has no
+// opinion about what a step or a piece of state is.
 @derive(Equatable, Display)
 pub enum Event {
     RunStarted(run_id: string, thread_id: string)
@@ -1288,8 +1294,14 @@ pub struct Agent<P: Provider> {
     //         spawn render(rx)
     //         run = agent.stream(conv, tx).await?
     //     }
-    async fn stream(conv: Conversation, out: Sender<Event>): Result<Run, AiError> {
-        return self.drive(conv, Channel { tx: out }, true).await
+    //
+    // `thread_id` and `run_id` are the two identifiers a *protocol* supplies rather than the loop:
+    // AG-UI's `RunAgentInput` carries both, and a client correlates the stream it is reading with
+    // the `runId` it sent. Both default to `""`, which means "the loop decides" — an empty thread
+    // id stays empty, and an empty run id becomes a fresh uuid, exactly as before. See
+    // `para.ai.agui.respond`, which is the caller that passes them.
+    async fn stream(conv: Conversation, out: Sender<Event>, thread_id: string = "", run_id: string = ""): Result<Run, AiError> {
+        return self.drive(conv, Channel { tx: out }, true, thread_id, run_id).await
     }
 
     // Run a conversation, handing every event to a sink of your own.
@@ -1332,18 +1344,23 @@ pub struct Agent<P: Provider> {
     // A run emits **exactly one** terminal event, `RunFinished` or `RunError`, on every path out —
     // including the failing ones. AG-UI requires it and a renderer needs it: a stream that merely
     // stops is indistinguishable from one still thinking.
-    async fn drive(conv: Conversation, sink: dyn EventSink, streamed: bool): Result<Run, AiError> {
-        run_id = "${uuid()}"
+    //
+    // `thread_id` and `run_id` come from the protocol the run is being served over, when there is
+    // one — `para.ai.agui.respond` reads both off AG-UI's `RunAgentInput` and passes them here, so
+    // the stream a client reads carries the identifiers that client sent. Both default to `""`,
+    // which is what every other door passes: an empty thread id stays empty rather than being
+    // invented, and an empty run id becomes a fresh uuid. The run id is also the span's
+    // `para.ai.run.id`, so a client-supplied one correlates a trace with the caller's own record.
+    async fn drive(conv: Conversation, sink: dyn EventSink, streamed: bool, thread_id: string = "", run_id: string = ""): Result<Run, AiError> {
+        id = if run_id == "" then "${uuid()}" else run_id
         root = tracing.span("invoke_agent ${self.config.name}")
         root.set_attribute("gen_ai.operation.name", "invoke_agent")
         root.set_attribute("gen_ai.agent.name", self.config.name)
         root.set_attribute("gen_ai.provider.name", self.provider.name())
         root.set_attribute("gen_ai.request.model", self.config.model)
-        root.set_attribute("para.ai.run.id", run_id)
+        root.set_attribute("para.ai.run.id", id)
 
-        // The thread id is empty until phase 7: AG-UI's `RunAgentInput` is what carries one, and
-        // inventing a value here would put a made-up identifier in every consumer's event stream.
-        sink.emit(Event.RunStarted(run_id: run_id, thread_id: "")).await
+        sink.emit(Event.RunStarted(run_id: id, thread_id: thread_id)).await
         outcome: Result<Run, AiError> = self.turns(conv, sink, streamed).await
         match outcome {
             Ok(run) => {
@@ -1356,7 +1373,7 @@ pub struct Agent<P: Provider> {
                 root.set_attribute("gen_ai.response.finish_reasons", run.stop.semconv())
                 root.set_attribute("para.ai.run.turns", run.turns)
                 root.end()
-                sink.emit(Event.RunFinished(run_id: run_id, usage: run.usage)).await
+                sink.emit(Event.RunFinished(run_id: id, usage: run.usage)).await
             },
             Err(e) => {
                 root.record_error("${e}")
