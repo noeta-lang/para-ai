@@ -1,0 +1,1784 @@
+// `para.ai.providers.openai` — the OpenAI-compatible Chat Completions codec, and the three
+// configurations of it this package ships.
+//
+//     use para.ai.providers.openai.{OpenAi, OpenRouter, OllamaCompat}
+//
+//     agent = Agent.from(AgentConfig.new("gpt-5"), OpenAi.from_env()?)
+//
+// **There is one codec in this file and three constructors.** `POST /chat/completions` is a wire
+// format several vendors speak, so `OpenAiCompat` is *parameterized* — base URL, vendor name, auth
+// scheme, extra headers, extra body keys, and the three capability flags where the endpoints
+// genuinely disagree — and `OpenAi`, `OpenRouter`, and `OllamaCompat` are field values rather than
+// code. That is DESIGN §2.1's central claim, and it is checkable: `a_configuration_is_fields_not_code`
+// below asserts that each of the three is an `OpenAiCompat` differing from the base only in the
+// deltas §2.1's table names. A sixth compatible provider — Groq, Together, vLLM, LM Studio, an
+// internal gateway — is `OpenAiCompat.at(url, key)`, not a pull request.
+//
+// Four things about this wire format are easy to get wrong, and all four are handled here:
+//
+//   * **A tool call's `arguments` is a JSON *string*, not an object.** The opposite of Anthropic,
+//     where the same value is embedded as real JSON. Sending an object here makes the model see a
+//     malformed call; sending a string to Anthropic makes it see one parameter that is a blob of
+//     text. Some compatible servers answer with an object anyway, so the decode side reads both.
+//   * **One neutral `Role.Tool` turn is *several* wire messages.** A `tool` message carries exactly
+//     one result, addressed by `tool_call_id`, so a turn holding two parallel results becomes two
+//     entries — where Anthropic carries both in one `user` turn.
+//   * **`system` is a message role here**, not a hoisted top-level field.
+//   * **`data: [DONE]` is not JSON.** It terminates the event stream and has to be recognized
+//     before the body is handed to a parser.
+namespace para.ai.providers.openai
+
+use std.http.{Frame}
+use std.{env, json}
+use para.ai.{AiError, Message, Part, Role}
+use para.ai.provider
+use para.ai.provider.{Delta, ModelReply, ModelRequest, Provider, StopReason, StreamDecoder, Usage, Wire}
+use para.ai.tools.{ToolSpec}
+
+// How a request proves who is asking.
+//
+// Two members, because that is how many the family actually has: a bearer token, or nothing at all.
+// A local Ollama or vLLM has no credential to send, and sending `Authorization: Bearer ` with an
+// empty key is not the same request as sending no header — some servers reject it.
+@derive(Equatable, Display)
+pub enum Auth {
+    Bearer
+    Anonymous
+}
+
+// The OpenAI Chat Completions wire format, as a parameterized codec.
+//
+// Every field is a *configuration* of one codec, not a branch in it. The three capability flags at
+// the end are the only places where the endpoints disagree about what can be *said* rather than
+// where it is said:
+//
+//   * `max_tokens_key` — OpenAI deprecated `max_tokens` in favor of `max_completion_tokens` and its
+//     reasoning models reject the old spelling; OpenRouter and Ollama normalize `max_tokens`.
+//   * `documents` — the `file` content part (a base64 PDF) is OpenAI's and OpenRouter's; Ollama's
+//     `/v1` layer has no equivalent, so a `Part.File` sent there is refused rather than dropped.
+//   * `reasoning_back` — whether the vendor accepts a reasoning block *on input*. OpenRouter and
+//     Ollama do and document round-tripping it; OpenAI's Chat Completions does not, and its own
+//     replies never carry one, so a `Part.Thinking` reaching an OpenAI request is a caller's
+//     mistake worth naming rather than a block to quietly drop.
+@derive(Equatable, Display)
+pub struct OpenAiCompat {
+    pub key: string = ""
+    // The API root, *including* the version segment — `/chat/completions` is appended to it. A
+    // gateway, a proxy, or a record/replay fixture server is a constructor argument, not a fork.
+    pub base_url: string = "https://api.openai.com/v1"
+    // `gen_ai.provider.name` on every span and metric this codec's calls produce, so it must be
+    // low-cardinality and stable. It is also what an `AiError.Encode` names, which is why a
+    // misconfigured gateway does not report itself as "openai".
+    pub vendor: string = "openai"
+    pub auth: Auth = Auth.Bearer
+    // Merged into every request's headers, after the codec's own. OpenRouter's `HTTP-Referer` and
+    // `X-Title` live here.
+    pub headers: Map<string, string> = {}
+    // Raw JSON fragments merged into every request body — the hook DESIGN §2.1 asks for. This is
+    // where OpenRouter's `provider` routing preferences and `models` fallback array live, and it is
+    // the same unchecked-in-content, checked-in-syntax contract `ModelRequest.extra` has. A
+    // per-request `extra` is merged *after* this, so a caller can always override a standing key.
+    pub extra: Map<string, string> = {}
+    pub max_tokens_key: string = "max_completion_tokens"
+    pub documents: bool = true
+    pub reasoning_back: bool = false
+
+    fn new(key: string): OpenAiCompat {
+        return OpenAiCompat { key: key }
+    }
+
+    // The door for a sixth OpenAI-compatible provider. Everything else about this codec already
+    // works; what varies is where to send it and what to call it.
+    fn at(base_url: string, key: string, vendor: string = "openai_compat"): OpenAiCompat {
+        return OpenAiCompat { key: key, base_url: base_url, vendor: vendor }
+    }
+
+    fn with_header(name: string, value: string): OpenAiCompat {
+        return OpenAiCompat { ...self, headers: self.headers.set(name, value) }
+    }
+
+    // A standing body key, as a raw JSON fragment. Unchecked in content and checked in syntax: a
+    // fragment that is not JSON at all is caught at `encode`, naming the key, rather than becoming
+    // a vendor-side 400 with no context.
+    fn with_body(key: string, json_fragment: string): OpenAiCompat {
+        return OpenAiCompat { ...self, extra: self.extra.set(key, json_fragment) }
+    }
+}
+
+// --- The three configurations ---------------------------------------------------------------------
+//
+// Constructors, not codecs. Each of these is a set of field values for `OpenAiCompat` above; none of
+// them declares a `Provider` impl, an `encode`, or a decoder, because there is nothing about them
+// the one codec does not already express.
+
+// OpenAI itself — the family base, and the only configuration that is entirely defaults.
+pub struct OpenAi {
+    fn new(key: string): OpenAiCompat {
+        return OpenAiCompat.new(key)
+    }
+
+    // Point at Azure OpenAI, a corporate gateway, or a fixture server. The path
+    // (`/chat/completions`) is unchanged — this replaces the origin and the version segment.
+    fn at(base_url: string, key: string): OpenAiCompat {
+        return OpenAiCompat { key: key, base_url: base_url }
+    }
+
+    // Read the key from `OPENAI_API_KEY`. `none` when it is unset or empty — para/ai never reads a
+    // config file and never writes one, so the environment is the whole story.
+    fn from_env(): ?OpenAiCompat {
+        key = env.get("OPENAI_API_KEY") ?? ""
+        if key == "" {
+            return none
+        }
+        return some(OpenAi.new(key))
+    }
+}
+
+// OpenRouter — one key in front of every vendor, which is why DESIGN §9 and §10 reach for it when
+// they want a cheap model alongside the main one.
+//
+// Its whole delta from the base is field values: a different origin, `max_tokens` rather than
+// `max_completion_tokens`, and reasoning accepted back on input. The two remaining items in DESIGN
+// §2.1's table are body and header keys, and they are `models`/`routing`/`app` below rather than
+// codec code. **Reasoning-token accounting is not a delta at all** — OpenRouter reports it in
+// `usage.completion_tokens_details.reasoning_tokens`, which is OpenAI's own field, so the base
+// already reads it.
+pub struct OpenRouter {
+    fn new(key: string): OpenAiCompat {
+        return OpenAiCompat {
+            key: key,
+            base_url: "https://openrouter.ai/api/v1",
+            vendor: "openrouter",
+            max_tokens_key: "max_tokens",
+            reasoning_back: true,
+        }
+    }
+
+    fn from_env(): ?OpenAiCompat {
+        key = env.get("OPENROUTER_API_KEY") ?? ""
+        if key == "" {
+            return none
+        }
+        return some(OpenRouter.new(key))
+    }
+
+    // `HTTP-Referer` and `X-Title` are how OpenRouter attributes a request to an app and lists it
+    // on their leaderboards. Optional, and inert everywhere else in this codec.
+    fn app(key: string, referer: string, title: string): OpenAiCompat {
+        return OpenRouter.new(key).with_header("HTTP-Referer", referer).with_header("X-Title", title)
+    }
+
+    // The `models` fallback array: when the first model is unavailable, rate-limited, or refuses,
+    // OpenRouter routes to the next one in the list rather than failing the call.
+    fn fallbacks(codec: OpenAiCompat, models: List<string>): OpenAiCompat {
+        names: List<dyn> = models.map(fn(m) => m)
+        return codec.with_body("models", json.stringify(names))
+    }
+
+    // Provider routing preferences, as a raw JSON object —
+    // `{"order":["Anthropic"],"allow_fallbacks":false}`. Raw rather than a typed mirror because the
+    // routing surface is OpenRouter's to grow, and a struct here would be stale by their next
+    // release while claiming to be complete.
+    fn routing(codec: OpenAiCompat, prefs: string): OpenAiCompat {
+        return codec.with_body("provider", prefs)
+    }
+}
+
+// Ollama through its **OpenAI-compatible** `/v1` endpoint.
+//
+// The same server also speaks its own richer protocol, which is `para.ai.providers.ollama.Ollama` —
+// two doors onto one process, and the native one expresses more (thinking, `keep_alive`, the
+// `options` sampling block, and NDJSON streaming). This one exists because it costs nothing: it is
+// four field values, and it means a program written against OpenAI runs against a local model by
+// changing one constructor call.
+pub struct OllamaCompat {
+    fn local(): OpenAiCompat {
+        return OllamaCompat.at("http://localhost:11434")
+    }
+
+    // `host` is an origin — `http://localhost:11434` — and `/v1` is appended to it.
+    fn at(host: string): OpenAiCompat {
+        return OpenAiCompat {
+            key: "",
+            base_url: normalize_host(host) ~ "/v1",
+            vendor: "ollama",
+            auth: Auth.Anonymous,
+            max_tokens_key: "max_tokens",
+            documents: false,
+            reasoning_back: true,
+        }
+    }
+
+    // `OLLAMA_HOST` is the variable the vendor's own CLI reads, and it is conventionally written
+    // without a scheme (`localhost:11434`), so it is completed rather than rejected.
+    fn from_env(): OpenAiCompat {
+        return OllamaCompat.at(env.get("OLLAMA_HOST") ?? "http://localhost:11434")
+    }
+}
+
+pub fn normalize_host(host: string): string {
+    if host.starts_with("http://") || host.starts_with("https://") {
+        return host
+    }
+    return "http://" ~ host
+}
+
+// --- Encoding -------------------------------------------------------------------------------------
+
+fn refuse(vendor: string, message: string): AiError {
+    return AiError.Encode(provider: vendor, message: message)
+}
+
+// A part's name, for an error message that says which one was refused.
+fn part_name(p: Part): string {
+    return match p {
+        Part.Text(text) => "Text",
+        Part.Image(mime, data) => "Image",
+        Part.File(mime, name, data) => "File",
+        Part.ToolCall(id, name, args) => "ToolCall",
+        Part.ToolResult(id, content, is_error) => "ToolResult",
+        Part.Thinking(text, signature) => "Thinking",
+    }
+}
+
+// Inline media rides a `data:` URI here, where Anthropic uses a `source` object with a separate
+// `media_type`. Same bytes, same base64, different envelope.
+fn data_uri(mime: string, data: bytes): string {
+    return "data:" ~ mime ~ ";base64," ~ provider.base64(data)
+}
+
+fn text_part(text: string): Map<string, dyn> {
+    return {"type": "text", "text": text}
+}
+
+fn image_part(mime: string, data: bytes): Map<string, dyn> {
+    url: Map<string, dyn> = {"url": data_uri(mime, data)}
+    return {"type": "image_url", "image_url": url}
+}
+
+fn file_part(name: string, mime: string, data: bytes): Map<string, dyn> {
+    f: Map<string, dyn> = {"filename": name, "file_data": data_uri(mime, data)}
+    return {"type": "file", "file": f}
+}
+
+fn encode_image(vendor: string, mime: string, data: bytes): Result<Map<string, dyn>, AiError> {
+    if !mime.starts_with("image/") {
+        return Err(refuse(vendor, "an Image part needs an image/* media type, got `${mime}`"))
+    }
+    return Ok(image_part(mime, data))
+}
+
+// The `file` content part takes PDFs; anything else has to become text before it can be sent, and
+// guessing that conversion here would be silent data loss. A configuration whose endpoint has no
+// `file` part at all says so instead, naming itself.
+fn encode_file(codec: OpenAiCompat, mime: string, name: string, data: bytes): Result<Map<string, dyn>, AiError> {
+    if !codec.documents {
+        return Err(refuse(codec.vendor, "cannot send `${name}` — the ${codec.vendor} OpenAI-compatible endpoint has no `file` content part; extract the text first, or use the native codec"))
+    }
+    if mime != "application/pdf" {
+        return Err(refuse(codec.vendor, "cannot send `${name}` — a `file` content part carries application/pdf, got `${mime}`"))
+    }
+    return Ok(file_part(name, mime, data))
+}
+
+fn is_text(p: Part): bool {
+    return match p {
+        Part.Text(text) => true,
+        _ => false,
+    }
+}
+
+fn all_text(parts: List<Part>): bool {
+    for p in parts {
+        if !is_text(p) {
+            return false
+        }
+    }
+    return true
+}
+
+fn joined_text(parts: List<Part>): string {
+    mut out = ""
+    for p in parts {
+        out = out ~ match p {
+            Part.Text(text) => text,
+            _ => "",
+        }
+    }
+    return out
+}
+
+fn encode_user_part(codec: OpenAiCompat, p: Part): Result<Map<string, dyn>, AiError> {
+    return match p {
+        Part.Text(text) => Ok(text_part(text)),
+        Part.Image(mime, data) => encode_image(codec.vendor, mime, data),
+        Part.File(mime, name, data) => encode_file(codec, mime, name, data),
+        _ => Err(refuse(codec.vendor, "a ${part_name(p)} part cannot ride a user turn — an assistant's tool calls and a tool's results are their own messages here")),
+    }
+}
+
+// A message's `content`: a **plain string** when every part is text, the typed-part array otherwise.
+//
+// Not a stylistic choice. The array form is the newer one and every multimodal turn needs it, but a
+// plain string is what the whole compatible ecosystem accepts without exception — older vLLM builds
+// and several gateways reject `[{"type":"text",…}]` on a system turn. Emitting the narrow form when
+// it suffices keeps this codec working against the servers that motivated it.
+fn content_of(codec: OpenAiCompat, parts: List<Part>): Result<dyn, AiError> {
+    if all_text(parts) {
+        plain: dyn = joined_text(parts)
+        return Ok(plain)
+    }
+    mut out: List<dyn> = []
+    for p in parts {
+        out = out ~ [encode_user_part(codec, p)?]
+    }
+    rich: dyn = out
+    return Ok(rich)
+}
+
+// `args` is raw JSON text and the vendor wants it back as a **JSON string**, so it is embedded
+// verbatim rather than re-serialized: what the model produced is what goes back. It is still parsed
+// first, so a malformed blob is caught here rather than becoming an opaque vendor 400.
+fn encode_tool_call(vendor: string, id: string, name: string, args: string): Result<Map<string, dyn>, AiError> {
+    match provider.parse_value(args, "tool call `${name}` arguments") {
+        Ok(_) => {},
+        Err(e) => {
+            return Err(refuse(vendor, "${e}"))
+        },
+    }
+    f: Map<string, dyn> = {"name": name, "arguments": args}
+    return Ok({"id": id, "type": "function", "function": f})
+}
+
+// An assistant turn: text, an optional reasoning block, and any tool calls — all in **one** message,
+// where the neutral model has them as separate parts.
+fn encode_assistant(codec: OpenAiCompat, m: Message): Result<Map<string, dyn>, AiError> {
+    mut text = ""
+    mut reasoning = ""
+    mut calls: List<dyn> = []
+    for p in m.parts {
+        match p {
+            Part.Text(t) => {
+                text = text ~ t
+            },
+            Part.Thinking(t, signature) => {
+                reasoning = reasoning ~ t
+            },
+            Part.ToolCall(cid, cname, args) => {
+                calls = calls ~ [encode_tool_call(codec.vendor, cid, cname, args)?]
+            },
+            _ => {
+                return Err(refuse(codec.vendor, "a ${part_name(p)} part cannot ride an assistant turn — an OpenAI-compatible assistant message carries text, reasoning, and tool calls"))
+            },
+        }
+    }
+    // `content` is always present, including as `""` next to tool calls. Several compatible servers
+    // require the key even when it says nothing, and an empty string is what every SDK sends.
+    mut msg: Map<string, dyn> = {"role": "assistant", "content": text}
+    if reasoning != "" {
+        if !codec.reasoning_back {
+            return Err(refuse(codec.vendor, "cannot send a Thinking part back — ${codec.vendor}'s Chat Completions API does not accept a reasoning block on input, and its own replies never produce one. Drop the part from the history, or use a provider that round-trips reasoning"))
+        }
+        msg = msg.set("reasoning", reasoning)
+    }
+    if calls.len() > 0 {
+        msg = msg.set("tool_calls", calls)
+    }
+    return Ok(msg)
+}
+
+// The one lossy mapping in this codec, and it is deliberate: **there is no `is_error` flag on a
+// `tool` message.** Anthropic has one; the compatible family does not. Dropping the flag would send
+// a failure back reading exactly like a success, and a model that cannot tell them apart retries the
+// same broken call until the turn budget runs out — so a failing result is prefixed instead. Stated
+// here rather than done quietly, because it is the only place this codec puts words in a tool's
+// mouth.
+fn tool_result_text(content: string, is_error: bool): string {
+    return if is_error then "Error: " ~ content else content
+}
+
+// One neutral `Role.Tool` turn as *several* wire messages — one per result, each addressed by the
+// `tool_call_id` it answers. This is the shape difference from Anthropic that a codec has to get
+// right: a turn carrying two parallel tool results is two entries here and one `user` turn there.
+fn encode_tool_turn(codec: OpenAiCompat, m: Message): Result<List<dyn>, AiError> {
+    mut out: List<dyn> = []
+    for p in m.parts {
+        match p {
+            Part.ToolResult(rid, content, is_error) => {
+                entry: Map<string, dyn> = {
+                    "role": "tool",
+                    "tool_call_id": rid,
+                    "content": tool_result_text(content, is_error),
+                }
+                out = out ~ [entry]
+            },
+            _ => {
+                return Err(refuse(codec.vendor, "a ${part_name(p)} part cannot ride a tool turn — a `tool` message carries exactly one result, addressed by `tool_call_id`"))
+            },
+        }
+    }
+    return Ok(out)
+}
+
+fn wire_role(r: Role): string {
+    return match r {
+        Role.System => "system",
+        Role.Assistant => "assistant",
+        Role.Tool => "tool",
+        _ => "user",
+    }
+}
+
+fn encode_plain(codec: OpenAiCompat, m: Message): Result<Map<string, dyn>, AiError> {
+    if m.role == Role.System && !all_text(m.parts) {
+        return Err(refuse(codec.vendor, "a system turn carries text only — attachments belong on the user turn that refers to them"))
+    }
+    content = content_of(codec, m.parts)?
+    mut msg: Map<string, dyn> = {"role": wire_role(m.role), "content": content}
+    // The optional speaker name some vendors accept on a `user` turn. A hint: a configuration whose
+    // server ignores it loses nothing, which is why it is passed through rather than gated.
+    match m.name {
+        some(n) => {
+            msg = msg.set("name", n)
+        },
+        none => {},
+    }
+    return Ok(msg)
+}
+
+fn encode_messages(codec: OpenAiCompat, msgs: List<Message>): Result<List<dyn>, AiError> {
+    mut out: List<dyn> = []
+    for m in msgs {
+        if m.role == Role.Tool {
+            out = out ~ encode_tool_turn(codec, m)?
+        } else if m.role == Role.Assistant {
+            out = out ~ [encode_assistant(codec, m)?]
+        } else {
+            out = out ~ [encode_plain(codec, m)?]
+        }
+    }
+    return Ok(out)
+}
+
+// `parameters` is raw JSON Schema text, so it is embedded as real JSON rather than as a quoted
+// string — the vendor would otherwise see one string-typed parameter named nothing.
+fn encode_tools(vendor: string, specs: List<ToolSpec>): Result<List<dyn>, AiError> {
+    mut out: List<dyn> = []
+    for t in specs {
+        mut schema: dyn = 0
+        match provider.parse_value(t.parameters, "tool `${t.name}` schema") {
+            Ok(s) => {
+                schema = s
+            },
+            Err(e) => {
+                return Err(refuse(vendor, "${e}"))
+            },
+        }
+        f: Map<string, dyn> = {
+            "name": t.name,
+            "description": t.description,
+            "parameters": schema,
+        }
+        entry: Map<string, dyn> = {"type": "function", "function": f}
+        out = out ~ [entry]
+    }
+    return Ok(out)
+}
+
+// --- Decoding -------------------------------------------------------------------------------------
+
+fn decode_stop(raw: string): StopReason {
+    return match raw {
+        "stop" => StopReason.EndTurn,
+        "" => StopReason.EndTurn,
+        "length" => StopReason.MaxTokens,
+        "tool_calls" => StopReason.ToolUse,
+        // The pre-2023 spelling, still emitted by some compatible servers. It means the same thing.
+        "function_call" => StopReason.ToolUse,
+        "content_filter" => StopReason.Refusal,
+        _ => StopReason.Other(raw: raw),
+    }
+}
+
+// `reasoning_tokens` is a *subset* of `completion_tokens`, exactly as `cached_tokens` is a subset of
+// `prompt_tokens` — both are breakdowns of a number the vendor already charged for, not additions to
+// it. So `Usage.total()` counting neither of them twice is right.
+fn decode_usage(u: Map<string, dyn>): Usage {
+    return Usage {
+        input_tokens: provider.int_at(u, "prompt_tokens"),
+        output_tokens: provider.int_at(u, "completion_tokens"),
+        cached_input_tokens: provider.int_at(provider.obj_at(u, "prompt_tokens_details"), "cached_tokens"),
+        reasoning_tokens: provider.int_at(provider.obj_at(u, "completion_tokens_details"), "reasoning_tokens"),
+    }
+}
+
+fn any_usage(u: Usage): bool {
+    return u.input_tokens + u.output_tokens + u.cached_input_tokens + u.reasoning_tokens > 0
+}
+
+// A tool call's arguments as the raw JSON text a `Part.ToolCall` carries.
+//
+// OpenAI's own protocol makes this a **string** holding JSON; several compatible servers (Ollama's
+// `/v1` among them) answer with the object itself. Reading both is three lines and the alternative
+// is a decoder that works against the spec and not against the servers.
+fn args_text(f: Map<string, dyn>): string {
+    raw = f.get("arguments") ?? ""
+    return match raw.as<string>() {
+        some(s) => s,
+        none => json.stringify(raw),
+    }
+}
+
+// Reasoning text under either of the two names the family uses: OpenRouter and Ollama send
+// `reasoning`, DeepSeek's own API and vLLM send `reasoning_content`.
+fn reasoning_of(o: Map<string, dyn>): string {
+    r = provider.str_at(o, "reasoning")
+    return if r == "" then provider.str_at(o, "reasoning_content") else r
+}
+
+// The neutral delta ids this codec hands out, shared by both transports so one `fold` serves them.
+// A choice's text and its reasoning are two blocks of one candidate, so they need two ids; tool
+// calls carry the vendor's own `call_…`, which is what a later `tool_call_id` must address.
+fn text_id(): string {
+    return "0"
+}
+
+fn thinking_id(): string {
+    return "0:reasoning"
+}
+
+// The SSE terminator, which is **not** a JSON document and has to be recognized before parsing.
+fn done_marker(): string {
+    return "[DONE]"
+}
+
+// A tool call's id, or a synthesized one. Ollama's `/v1` layer and a few gateways omit `id`
+// entirely; the index is then the only handle, and a stable synthesized one keeps the tool loop
+// working rather than addressing every result to `""`.
+fn call_id(given: string, index: int): string {
+    return if given == "" then "call_${index}" else given
+}
+
+fn decode_message(msg: Map<string, dyn>): List<Delta> {
+    mut out: List<Delta> = []
+    reasoning = reasoning_of(msg)
+    if reasoning != "" {
+        out = out ~ [Delta.ThinkingDelta(id: thinking_id(), text: reasoning)]
+    }
+    // A refusal is the model declining, and it arrives in its own field with `content` null. It is
+    // the assistant's answer, so it becomes text — and the stop reason below makes it a `Refused`.
+    refusal = provider.str_at(msg, "refusal")
+    text = if refusal != "" then refusal else provider.str_at(msg, "content")
+    if text != "" {
+        out = out ~ [Delta.TextDelta(id: text_id(), text: text)]
+    }
+    for (i, c) in provider.list_at(msg, "tool_calls").enumerate() {
+        call = c.as<Map<string, dyn>>() ?? {}
+        f = provider.obj_at(call, "function")
+        cid = call_id(provider.str_at(call, "id"), i)
+        out = out ~ [
+            Delta.ToolCallStart(id: cid, name: provider.str_at(f, "name")),
+            Delta.ToolCallArgs(id: cid, fragment: args_text(f)),
+        ]
+    }
+    return out
+}
+
+// The matchable identity of a vendor error.
+//
+// OpenAI's body carries a broad `type` (`invalid_request_error`) *and* a specific `code`
+// (`rate_limit_exceeded`); the specific one is what a caller wants to match, so it wins. OpenRouter
+// sends a **numeric** `code` — the HTTP status again — which reads as absent through the string
+// reader, so `type` gets its turn before the number is rendered as a last resort.
+fn error_code(inner: Map<string, dyn>): string {
+    code = provider.str_at(inner, "code")
+    if code != "" {
+        return code
+    }
+    kind = provider.str_at(inner, "type")
+    if kind != "" {
+        return kind
+    }
+    n = provider.int_at(inner, "code")
+    return if n == 0 then "" else "${n}"
+}
+
+// `{"error":{"message":…,"type":…,"code":…}}` as a matchable `AiError.Provider` — and `{"error":
+// "a bare sentence"}`, which is what Ollama and a few gateways send, as the same thing with no code.
+fn typed_error(status: int, doc: Map<string, dyn>): AiError {
+    raw = doc.get("error") ?? ""
+    match raw.as<string>() {
+        some(s) => {
+            return AiError.Provider(status: status, code: "", message: s)
+        },
+        none => {},
+    }
+    inner = provider.obj_at(doc, "error")
+    return AiError.Provider(
+        status: status,
+        code: error_code(inner),
+        message: provider.str_at(inner, "message"),
+    )
+}
+
+// A neutral `ModelReply` holds one candidate, so a reply carrying several is refused rather than
+// silently reduced to its first. It only happens when a caller asked for `n > 1` through `extra`,
+// and answering two thirds of that question is worse than declining it.
+fn one_choice(vendor: string, choices: List<dyn>): Result<Map<string, dyn>, AiError> {
+    if choices.len() == 0 {
+        return Err(AiError.Decode(
+            path: "choices",
+            message: "the ${vendor} reply carried no choices — nothing was generated",
+        ))
+    }
+    if choices.len() > 1 {
+        return Err(AiError.Decode(
+            path: "choices",
+            message: "the ${vendor} reply carried ${choices.len()} candidates and a neutral `ModelReply` holds one — request `n: 1`",
+        ))
+    }
+    return Ok(choices[0].as<Map<string, dyn>>() ?? {})
+}
+
+// --- The streaming protocol -------------------------------------------------------------------
+//
+// An OpenAI-compatible reply streams as `text/event-stream`, one unnamed event per chunk:
+//
+//     data: {"id":…,"object":"chat.completion.chunk","model":…,
+//            "choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+//     data: {…,"choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}
+//     …
+//     data: {…,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+//     data: {…,"choices":[],"usage":{…}}                  only with `stream_options.include_usage`
+//     data: [DONE]
+//
+// Three properties of that shape decide the decoder's design:
+//
+//   * **Tool calls are indexed and the id arrives once.** The opening chunk carries
+//     `tool_calls[0].id` and `.function.name`; every chunk after it carries only `index` and a
+//     fragment of `arguments`. Which call an argument fragment belongs to is therefore only knowable
+//     from state, exactly as Anthropic's block index is.
+//   * **`[DONE]` is not JSON.** Handing it to a parser is a decode failure on a perfectly healthy
+//     stream.
+//   * **Completion is `finish_reason`, not `[DONE]`.** `finish_reason` is the vendor saying the
+//     generation is whole; `[DONE]` is the framing's terminator. A stream cut between the two
+//     carries a complete answer, and one cut before `finish_reason` does not — so `finish()` asks
+//     for the former. The usage chunk rides between them, so such a stream reports a complete reply
+//     with no token counts, which is a smaller lie than either alternative.
+
+pub class OpenAiStream {
+    // `gen_ai.provider.name`, carried so that a decode failure says which endpoint produced it.
+    mut vendor: string
+    // Tool-call index (as a string) to the neutral delta id its fragments carry. The whole of this
+    // protocol's state.
+    mut ids: Map<string, string>
+    mut usage: Usage
+    mut model: string
+    mut opened: bool
+    mut stopped: bool
+
+    fn of(vendor: string): OpenAiStream {
+        return OpenAiStream {
+            vendor: vendor,
+            ids: {},
+            usage: Usage {},
+            model: "",
+            opened: false,
+            stopped: false,
+        }
+    }
+
+    fn on_tool_call(call: Map<string, dyn>): List<Delta> {
+        at = "${provider.int_at(call, "index")}"
+        f = provider.obj_at(call, "function")
+        given = provider.str_at(call, "id")
+        mut cid = self.ids.get(at) ?? ""
+        if given != "" {
+            cid = given
+        }
+        if cid == "" {
+            cid = "call_" ~ at
+        }
+        self.ids = self.ids.set(at, cid)
+        mut out: List<Delta> = []
+        // The name rides the opening chunk only, so this fires once per call and the fold gets one
+        // `ToolCallStart` for it.
+        name = provider.str_at(f, "name")
+        if name != "" {
+            out = out ~ [Delta.ToolCallStart(id: cid, name: name)]
+        }
+        // The opening chunk's `arguments` is the empty string. It carries nothing, and passing it on
+        // would put a zero-length `ToolCallArgsDelta` in the event stream.
+        args = args_text(f)
+        if args != "" {
+            out = out ~ [Delta.ToolCallArgs(id: cid, fragment: args)]
+        }
+        return out
+    }
+
+    fn on_choice(choice: Map<string, dyn>): Result<List<Delta>, AiError> {
+        if provider.int_at(choice, "index") != 0 {
+            return Err(AiError.Decode(
+                path: "choices[].index",
+                message: "the ${self.vendor} stream carried candidate ${provider.int_at(choice, "index")} and a neutral reply holds one — request `n: 1`",
+            ))
+        }
+        d = provider.obj_at(choice, "delta")
+        mut out: List<Delta> = []
+        reasoning = reasoning_of(d)
+        if reasoning != "" {
+            out = out ~ [Delta.ThinkingDelta(id: thinking_id(), text: reasoning)]
+        }
+        refusal = provider.str_at(d, "refusal")
+        text = if refusal != "" then refusal else provider.str_at(d, "content")
+        if text != "" {
+            out = out ~ [Delta.TextDelta(id: text_id(), text: text)]
+        }
+        for c in provider.list_at(d, "tool_calls") {
+            out = out ~ self.on_tool_call(c.as<Map<string, dyn>>() ?? {})
+        }
+        finish = provider.str_at(choice, "finish_reason")
+        if finish != "" {
+            self.stopped = true
+            out = out ~ [Delta.Stop(reason: if refusal != "" then StopReason.Refusal else decode_stop(finish))]
+        }
+        return Ok(out)
+    }
+
+    // **Inline, not a standalone `impl StreamDecoder for OpenAiStream` block, and that is
+    // load-bearing.** Written standalone, the impl is invisible to `dyn` coercion whenever this
+    // module is not the entry, so `OpenAiCompat.decoder()` fails to check from a consuming package
+    // while this file's own suite passes. See AGENTS.md.
+    impl StreamDecoder {
+        fn push(frame: Frame): Result<List<Delta>, AiError> {
+            // A keepalive comment dispatches no data — OpenRouter sends `: OPENROUTER PROCESSING`
+            // every few seconds — and the terminator is not a document.
+            if frame.data == "" || frame.data == done_marker() {
+                return Ok([])
+            }
+            doc = provider.parse_object(frame.data, "${self.vendor} stream chunk")?
+            // A vendor error inside an otherwise-successful 200 stream. There is no HTTP status to
+            // report and `0` says exactly that; `code` stays matchable, which is the point.
+            if doc.has("error") {
+                return Err(typed_error(0, doc))
+            }
+            self.opened = true
+            mut out: List<Delta> = []
+            served = provider.str_at(doc, "model")
+            if served != "" && self.model == "" {
+                self.model = served
+                out = out ~ [Delta.ModelDelta(model: served)]
+            }
+            for c in provider.list_at(doc, "choices") {
+                out = out ~ self.on_choice(c.as<Map<string, dyn>>() ?? {})?
+            }
+            // The final chunk of an `include_usage` stream has an empty `choices` and the totals.
+            fresh = decode_usage(provider.obj_at(doc, "usage"))
+            if any_usage(fresh) {
+                self.usage = provider.merge_usage(self.usage, fresh)
+                out = out ~ [Delta.UsageDelta(usage: self.usage)]
+            }
+            return Ok(out)
+        }
+
+        fn finish(): Result<Usage, AiError> {
+            if !self.opened {
+                return Err(AiError.Decode(
+                    path: "",
+                    message: "the ${self.vendor} event stream carried no chunks — nothing was streamed. A non-2xx answer streams its error body like any other body, so a rate limit or a rejected request can arrive here as an empty stream",
+                ))
+            }
+            if !self.stopped {
+                return Err(AiError.Decode(
+                    path: "",
+                    message: "the ${self.vendor} event stream ended before any chunk carried a `finish_reason` — the reply is truncated, and reporting it as a complete answer would be worse than failing",
+                ))
+            }
+            return Ok(self.usage)
+        }
+    }
+}
+
+impl Provider for OpenAiCompat {
+    fn name(): string {
+        return self.vendor
+    }
+
+    fn encode(req: ModelRequest): Result<Wire, AiError> {
+        mut body: Map<string, dyn> = {
+            "model": req.model,
+            "messages": encode_messages(self, req.messages)?,
+        }
+        match req.max_tokens {
+            some(n) => {
+                body = body.set(self.max_tokens_key, n)
+            },
+            none => {},
+        }
+        match req.temperature {
+            some(t) => {
+                body = body.set("temperature", t)
+            },
+            none => {},
+        }
+        if req.stop.len() > 0 {
+            stop: List<dyn> = req.stop.map(fn(s) => s)
+            body = body.set("stop", stop)
+        }
+        // No tools, no key. An empty `tools` array is not the same request as an absent one, and a
+        // vendor is entitled to treat it differently.
+        if req.tools.len() > 0 {
+            body = body.set("tools", encode_tools(self.vendor, req.tools)?)
+        }
+        if req.stream {
+            body = body.set("stream", true)
+            // Without this the stream reports no tokens at all, and a run whose usage is silently
+            // zero is one whose cost nobody can see.
+            opts: Map<string, dyn> = {"include_usage": true}
+            body = body.set("stream_options", opts)
+        }
+        // The codec's standing keys first, then the request's, so a per-call `extra` can always
+        // override a configuration's. Both are unchecked in content and checked in syntax.
+        for k in self.extra.keys() {
+            body = body.set(k, provider.parse_value(self.extra[k], "${self.vendor} body key `${k}`")?)
+        }
+        for k in req.extra.keys() {
+            body = body.set(k, provider.parse_value(req.extra[k], "extra key `${k}`")?)
+        }
+
+        mut headers = {"content-type": "application/json"}
+        if self.key != "" {
+            match self.auth {
+                Auth.Bearer => {
+                    headers = headers.set("authorization", "Bearer " ~ self.key)
+                },
+                Auth.Anonymous => {},
+            }
+        }
+        for k in self.headers.keys() {
+            headers = headers.set(k, self.headers[k])
+        }
+        wire = Wire {
+            url: self.base_url ~ "/chat/completions",
+            method: "post",
+            headers: headers,
+            body: json.stringify(body),
+        }
+        // The body key and the framing are set together and never apart: a request that says
+        // `"stream": true` but leaves the wire buffered would wait forever for a body that never
+        // arrives whole.
+        return Ok(if req.stream then wire.as_sse() else wire)
+    }
+
+    fn decode_deltas(body: string): Result<List<Delta>, AiError> {
+        doc = provider.parse_object(body, "${self.vendor} reply")?
+        // Some gateways answer 200 with an error document. It is still an error.
+        if doc.has("error") {
+            return Err(typed_error(0, doc))
+        }
+        choice = one_choice(self.vendor, provider.list_at(doc, "choices"))?
+        msg = provider.obj_at(choice, "message")
+        mut out: List<Delta> = [Delta.ModelDelta(model: provider.str_at(doc, "model"))]
+        out = out ~ decode_message(msg)
+        refusal = provider.str_at(msg, "refusal")
+        stop = if refusal != "" then StopReason.Refusal else decode_stop(provider.str_at(choice, "finish_reason"))
+        return Ok(out ~ [
+            Delta.Stop(reason: stop),
+            Delta.UsageDelta(usage: decode_usage(provider.obj_at(doc, "usage"))),
+        ])
+    }
+
+    fn decode_reply(body: string): Result<ModelReply, AiError> {
+        return Ok(provider.fold(self.decode_deltas(body)?, ""))
+    }
+
+    fn decoder(): dyn StreamDecoder {
+        return OpenAiStream.of(self.vendor)
+    }
+
+    fn decode_error(status: int, body: string): AiError {
+        return match provider.parse_object(body, "${self.vendor} error") {
+            Ok(doc) => typed_error(status, doc),
+            // An HTML error page from a proxy, or an empty 502: the raw text is the only evidence of
+            // what actually answered, so it is reported verbatim rather than swallowed.
+            Err(_) => AiError.Provider(status: status, code: "", message: body),
+        }
+    }
+
+    // **`none`, and that is a real answer.** No vendor in this family ships a tokenizer a pure codec
+    // could run — OpenAI's is a Python/Rust library and a byte-pair table, Ollama's lives inside the
+    // served model. Returning a fabricated number here would be trusted absolutely and be wrong by a
+    // few percent, which surfaces as a vendor-side context error in the middle of a run.
+    fn estimate_tokens(msgs: List<Message>): ?int {
+        return none
+    }
+}
+
+// --- Test helpers ---------------------------------------------------------------------------------
+//
+// Unwrap-or-fail for the two codec doors. A `match` arm cannot both fail an assertion and produce a
+// value, so the unwrapping lives here instead of being repeated (and half-written) per test.
+
+fn encode_or_fail(codec: OpenAiCompat, req: ModelRequest): Wire {
+    match codec.encode(req) {
+        Ok(w) => {
+            return w
+        },
+        Err(e) => {
+            assert(false, "encode failed: ${e}")
+        },
+    }
+    return Wire { url: "" }
+}
+
+fn decode_or_fail(codec: OpenAiCompat, body: string): ModelReply {
+    match codec.decode_reply(body) {
+        Ok(r) => {
+            return r
+        },
+        Err(e) => {
+            assert(false, "decode failed: ${e}")
+        },
+    }
+    return ModelReply { parts: [] }
+}
+
+// Cut a verbatim transcript into the frames `std.http`'s SSE reader hands back: `data:` lines join
+// with a newline, a blank line dispatches what has accumulated, and a `:` comment dispatches
+// nothing. Test-only — the run loop never sees wire text, it sees frames std already cut.
+fn sse_frames(lines: List<string>): List<Frame> {
+    mut out: List<Frame> = []
+    mut event = ""
+    mut data = ""
+    mut open = false
+    for line in lines {
+        if line == "" {
+            if open {
+                out = out ~ [Frame { event: event, data: data, id: "", retry: none }]
+            }
+            event = ""
+            data = ""
+            open = false
+        } else if line.starts_with(":") {
+            // A comment. std dispatches nothing for one, and neither does this.
+        } else if line.starts_with("event: ") {
+            event = line.slice(7, line.len())
+            open = true
+        } else if line.starts_with("data: ") {
+            piece = line.slice(6, line.len())
+            data = if data == "" then piece else data ~ "\n" ~ piece
+            open = true
+        }
+    }
+    if open {
+        out = out ~ [Frame { event: event, data: data, id: "", retry: none }]
+    }
+    return out
+}
+
+// Replay a transcript through a fresh decoder, one frame at a time, exactly as the run loop does.
+fn stream_or_fail(decoder: dyn StreamDecoder, lines: List<string>): List<Delta> {
+    mut out: List<Delta> = []
+    for f in sse_frames(lines) {
+        match decoder.push(f) {
+            Ok(more) => {
+                out = out ~ more
+            },
+            Err(e) => {
+                assert(false, "push failed on `${f.data}`: ${e}")
+            },
+        }
+    }
+    return out
+}
+
+// A verbatim `text/event-stream` transcript of a streamed `POST /v1/chat/completions` — the chunk
+// shape OpenAI publishes in its API reference, line for line, including the `system_fingerprint` and
+// `logprobs` fields a decoder has to ignore, the opening `"content":""` that carries nothing, the
+// `include_usage` chunk with an **empty** `choices` array, and the `data: [DONE]` terminator that is
+// not a JSON document. Held as raw wire lines rather than as pre-cut `Frame`s so that what the
+// decoder is proved against is *the vendor's bytes*, diffable against the vendor's own
+// documentation, rather than a frame list written to match this decoder.
+fn captured_text_stream(): List<string> {
+    return [
+        "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1694268190,\"model\":\"gpt-4o-mini\",\"system_fingerprint\":\"fp_44709d6fcb\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"logprobs\":null,\"finish_reason\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1694268190,\"model\":\"gpt-4o-mini\",\"system_fingerprint\":\"fp_44709d6fcb\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"logprobs\":null,\"finish_reason\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1694268190,\"model\":\"gpt-4o-mini\",\"system_fingerprint\":\"fp_44709d6fcb\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"!\"},\"logprobs\":null,\"finish_reason\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1694268190,\"model\":\"gpt-4o-mini\",\"system_fingerprint\":\"fp_44709d6fcb\",\"choices\":[{\"index\":0,\"delta\":{},\"logprobs\":null,\"finish_reason\":\"stop\"}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1694268190,\"model\":\"gpt-4o-mini\",\"system_fingerprint\":\"fp_44709d6fcb\",\"choices\":[],\"usage\":{\"prompt_tokens\":19,\"completion_tokens\":10,\"total_tokens\":29,\"prompt_tokens_details\":{\"cached_tokens\":0},\"completion_tokens_details\":{\"reasoning_tokens\":0}}}",
+        "",
+        "data: [DONE]",
+    ]
+}
+
+// The published tool-call transcript, and the interesting one: the opening chunk carries the id, the
+// type, the name, and an **empty** `arguments`; every chunk after it carries only `index` and a
+// fragment of JSON that is not valid on its own. `"content":null` appears throughout, which a total
+// string reader has to survive.
+fn captured_tool_call_stream(): List<string> {
+    return [
+        "data: {\"id\":\"chatcmpl-abc\",\"object\":\"chat.completion.chunk\",\"created\":1699896916,\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"call_abc123\",\"type\":\"function\",\"function\":{\"name\":\"get_current_weather\",\"arguments\":\"\"}}]},\"logprobs\":null,\"finish_reason\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-abc\",\"object\":\"chat.completion.chunk\",\"created\":1699896916,\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"\"}}]},\"logprobs\":null,\"finish_reason\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-abc\",\"object\":\"chat.completion.chunk\",\"created\":1699896916,\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"location\"}}]},\"logprobs\":null,\"finish_reason\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-abc\",\"object\":\"chat.completion.chunk\",\"created\":1699896916,\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\":\\\"\"}}]},\"logprobs\":null,\"finish_reason\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-abc\",\"object\":\"chat.completion.chunk\",\"created\":1699896916,\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"San\"}}]},\"logprobs\":null,\"finish_reason\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-abc\",\"object\":\"chat.completion.chunk\",\"created\":1699896916,\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\" Francisco\"}}]},\"logprobs\":null,\"finish_reason\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-abc\",\"object\":\"chat.completion.chunk\",\"created\":1699896916,\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"}\"}}]},\"logprobs\":null,\"finish_reason\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-abc\",\"object\":\"chat.completion.chunk\",\"created\":1699896916,\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{},\"logprobs\":null,\"finish_reason\":\"tool_calls\"}]}",
+        "",
+        "data: [DONE]",
+    ]
+}
+
+// An OpenRouter transcript for a reasoning model. Three things here are OpenRouter's and not
+// OpenAI's, and the point of keeping it verbatim is that none of them needed codec code: the
+// `: OPENROUTER PROCESSING` keepalive comments (which std dispatches as nothing), the `reasoning`
+// field alongside `content` on the same delta, and `usage.completion_tokens_details.reasoning_tokens`
+// — which is OpenAI's own field, read by the same `decode_usage`.
+fn captured_openrouter_reasoning_stream(): List<string> {
+    return [
+        ": OPENROUTER PROCESSING",
+        "",
+        "data: {\"id\":\"gen-1740000000-abc\",\"provider\":\"Fireworks\",\"model\":\"deepseek/deepseek-r1\",\"object\":\"chat.completion.chunk\",\"created\":1740000000,\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning\":\"The user asks for\"},\"finish_reason\":null}]}",
+        "",
+        ": OPENROUTER PROCESSING",
+        "",
+        "data: {\"id\":\"gen-1740000000-abc\",\"provider\":\"Fireworks\",\"model\":\"deepseek/deepseek-r1\",\"object\":\"chat.completion.chunk\",\"created\":1740000000,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"reasoning\":\" the capital of Sweden.\"},\"finish_reason\":null}]}",
+        "",
+        "data: {\"id\":\"gen-1740000000-abc\",\"provider\":\"Fireworks\",\"model\":\"deepseek/deepseek-r1\",\"object\":\"chat.completion.chunk\",\"created\":1740000000,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Stockholm.\",\"reasoning\":null},\"finish_reason\":null}]}",
+        "",
+        "data: {\"id\":\"gen-1740000000-abc\",\"provider\":\"Fireworks\",\"model\":\"deepseek/deepseek-r1\",\"object\":\"chat.completion.chunk\",\"created\":1740000000,\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":41,\"total_tokens\":53,\"completion_tokens_details\":{\"reasoning_tokens\":33}}}",
+        "",
+        "data: [DONE]",
+    ]
+}
+
+// A captured `POST /v1/chat/completions` response body — the shape OpenAI documents, keys and all,
+// including the `refusal: null` and `logprobs: null` that a total reader has to shrug off and the
+// two usage breakdown objects.
+fn captured_text_reply(): string {
+    return "{\"id\":\"chatcmpl-B9MHDbslfkBeAs8l4bebGdFOJ6PeG\",\"object\":\"chat.completion\",\"created\":1741570283,\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Hej! Hur mår du?\",\"refusal\":null,\"annotations\":[]},\"logprobs\":null,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2095,\"completion_tokens\":503,\"total_tokens\":2598,\"prompt_tokens_details\":{\"cached_tokens\":1024,\"audio_tokens\":0},\"completion_tokens_details\":{\"reasoning_tokens\":128,\"audio_tokens\":0,\"accepted_prediction_tokens\":0,\"rejected_prediction_tokens\":0}},\"service_tier\":\"default\",\"system_fingerprint\":\"fp_fc9f1d7035\"}"
+}
+
+// The buffered tool-call shape: `content` is null, `arguments` is a **string** holding JSON, and the
+// finish reason is `tool_calls`.
+fn captured_tool_call_reply(): string {
+    return "{\"id\":\"chatcmpl-abc\",\"object\":\"chat.completion\",\"created\":1699896916,\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_abc123\",\"type\":\"function\",\"function\":{\"name\":\"get_current_weather\",\"arguments\":\"{\\\"location\\\": \\\"Malmö, SE\\\", \\\"unit\\\": \\\"celsius\\\"}\"}}],\"refusal\":null},\"logprobs\":null,\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":82,\"completion_tokens\":17,\"total_tokens\":99}}"
+}
+
+// Ollama's own `/v1/chat/completions` answer. Two differences from OpenAI's that are the vendor's
+// and not this codec's: the usage object has **no** breakdown sub-objects at all, and the served
+// model is the local tag.
+fn captured_ollama_compat_reply(): string {
+    return "{\"id\":\"chatcmpl-476\",\"object\":\"chat.completion\",\"created\":1737000000,\"model\":\"llama3.2\",\"system_fingerprint\":\"fp_ollama\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"The sky is blue because of Rayleigh scattering.\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":33,\"completion_tokens\":11,\"total_tokens\":44}}"
+}
+
+@test {
+    // --- The design's central claim -----------------------------------------------------------
+    //
+    // DESIGN §2.1 says OpenRouter and Ollama are *configurations* of the OpenAI-compatible codec
+    // rather than new files of JSON-shuffling. That is a checkable claim and this is the check:
+    // each of the three is an `OpenAiCompat` — the same type, so the same `encode`, the same
+    // decoder, the same error decode — differing only in the fields §2.1's table names.
+    fn a_configuration_is_fields_not_code(): void {
+        base = OpenAi.new("sk-test")
+        assert(base == OpenAiCompat { key: "sk-test" }, "OpenAI is the family base, entirely defaults: ${base}")
+
+        // OpenRouter: a different origin, `max_tokens` rather than `max_completion_tokens`, and
+        // reasoning accepted back. Nothing else, and no code at all.
+        router = OpenRouter.new("sk-or")
+        assert(router == OpenAiCompat {
+            key: "sk-or",
+            base_url: "https://openrouter.ai/api/v1",
+            vendor: "openrouter",
+            max_tokens_key: "max_tokens",
+            reasoning_back: true,
+        }, "${router}")
+
+        // Ollama's `/v1`: no credential, no documents, and the same two normalizations.
+        local = OllamaCompat.local()
+        assert(local == OpenAiCompat {
+            key: "",
+            base_url: "http://localhost:11434/v1",
+            vendor: "ollama",
+            auth: Auth.Anonymous,
+            max_tokens_key: "max_tokens",
+            documents: false,
+            reasoning_back: true,
+        }, "${local}")
+
+        // And a sixth provider is a constructor call, which is the payoff of the whole arrangement.
+        groq = OpenAiCompat.at("https://api.groq.com/openai/v1", "gsk-x", "groq")
+        assert(groq.vendor == "groq")
+        assert(encode_or_fail(groq, ModelRequest { model: "m", messages: [Message.user("hi")] }).url
+            == "https://api.groq.com/openai/v1/chat/completions")
+    }
+
+    // The two remaining items in §2.1's OpenRouter row are a body key and a header each — the
+    // parameterized hooks, used rather than extended.
+    fn openrouters_routing_and_fallbacks_are_body_keys(): void {
+        codec = OpenRouter.routing(
+            OpenRouter.fallbacks(OpenRouter.app("sk-or", "https://example.test", "Example"),
+                ["anthropic/claude-opus-4", "openai/gpt-4o"]),
+            "{\"allow_fallbacks\":false,\"order\":[\"Anthropic\"]}")
+        wire = encode_or_fail(codec, ModelRequest { model: "openrouter/auto", messages: [Message.user("hi")] })
+        assert(wire.headers["HTTP-Referer"] == "https://example.test")
+        assert(wire.headers["X-Title"] == "Example")
+        assert(wire.body.contains("\"models\":[\"anthropic/claude-opus-4\",\"openai/gpt-4o\"]"), wire.body)
+        assert(wire.body.contains("\"provider\":{\"allow_fallbacks\":false,\"order\":[\"Anthropic\"]}"), wire.body)
+        assert(wire.url == "https://openrouter.ai/api/v1/chat/completions")
+    }
+
+    // --- Encoding -------------------------------------------------------------------------------
+
+    // A known request, asserted against the exact bytes it produces. `json.stringify` emits map keys
+    // in sorted order, so this is stable — and an exact-string assertion is the only kind that
+    // catches a key silently changing name or moving nesting level.
+    fn encode_produces_exactly_this_json(): void {
+        req = ModelRequest {
+            model: "gpt-4o",
+            messages: [
+                Message.system("Answer in Swedish."),
+                Message.user("Say hello."),
+            ],
+            max_tokens: some(64),
+            temperature: some(0.0),
+            stop: ["\n\n"],
+        }
+        wire = encode_or_fail(OpenAi.new("sk-test"), req)
+        assert(wire.url == "https://api.openai.com/v1/chat/completions")
+        assert(wire.method == "post")
+        assert(wire.body == "{\"max_completion_tokens\":64,\"messages\":[{\"content\":\"Answer in Swedish.\",\"role\":\"system\"},{\"content\":\"Say hello.\",\"role\":\"user\"}],\"model\":\"gpt-4o\",\"stop\":[\"\\n\\n\"],\"temperature\":0.0}",
+            "exact request body, got: ${wire.body}")
+    }
+
+    // Unlike Anthropic, `system` is a message role here — the turn stays in `messages` and is not
+    // hoisted anywhere.
+    fn encode_keeps_system_as_a_message_role(): void {
+        wire = encode_or_fail(OpenAi.new("k"), ModelRequest {
+            model: "m",
+            messages: [Message.system("first"), Message.user("a"), Message.system("second")],
+        })
+        assert(wire.body.contains("{\"content\":\"first\",\"role\":\"system\"}"), wire.body)
+        assert(wire.body.contains("{\"content\":\"second\",\"role\":\"system\"}"), wire.body)
+    }
+
+    fn encode_sends_a_bearer_token_and_nothing_when_there_is_none(): void {
+        req = ModelRequest { model: "m", messages: [Message.user("hi")] }
+        keyed = encode_or_fail(OpenAi.new("sk-abc"), req)
+        assert(keyed.headers["authorization"] == "Bearer sk-abc")
+        assert(keyed.headers["content-type"] == "application/json")
+
+        // An anonymous configuration sends no `Authorization` at all. `Bearer ` with an empty key is
+        // not the same request, and some servers reject it.
+        local = encode_or_fail(OllamaCompat.local(), req)
+        assert(!local.headers.has("authorization"), "${local.headers}")
+        assert(local.url == "http://localhost:11434/v1/chat/completions")
+    }
+
+    // The vendor deprecated `max_tokens` for `max_completion_tokens` and its reasoning models reject
+    // the old spelling; every other member of the family normalizes the old one. One field.
+    fn each_configuration_names_its_own_max_tokens_key(): void {
+        req = ModelRequest { model: "m", messages: [Message.user("hi")], max_tokens: some(128) }
+        assert(encode_or_fail(OpenAi.new("k"), req).body.contains("\"max_completion_tokens\":128"))
+        assert(encode_or_fail(OpenRouter.new("k"), req).body.contains("\"max_tokens\":128"))
+        assert(encode_or_fail(OllamaCompat.local(), req).body.contains("\"max_tokens\":128"))
+    }
+
+    // The neutral model has one `Role.Tool` turn carrying both results; the wire has one `tool`
+    // message per result, each addressed by the call it answers. Getting this wrong is a 400 whose
+    // text says nothing about tools.
+    fn one_tool_turn_becomes_one_wire_message_per_result(): void {
+        wire = encode_or_fail(OpenAi.new("k"), ModelRequest {
+            model: "m",
+            messages: [
+                Message.user("weather in both?"),
+                Message {
+                    role: Role.Assistant,
+                    parts: [
+                        Part.ToolCall(id: "call_1", name: "weather", args: "{\"city\":\"Malmo\"}"),
+                        Part.ToolCall(id: "call_2", name: "weather", args: "{\"city\":\"Lund\"}"),
+                    ],
+                },
+                Message {
+                    role: Role.Tool,
+                    parts: [
+                        Part.ToolResult(id: "call_1", content: "18C", is_error: false),
+                        Part.ToolResult(id: "call_2", content: "17C", is_error: false),
+                    ],
+                },
+            ],
+        })
+        assert(wire.body.contains("{\"content\":\"18C\",\"role\":\"tool\",\"tool_call_id\":\"call_1\"}"), wire.body)
+        assert(wire.body.contains("{\"content\":\"17C\",\"role\":\"tool\",\"tool_call_id\":\"call_2\"}"), wire.body)
+        // Both calls ride one assistant message, and `arguments` is a JSON *string*.
+        assert(wire.body.contains("\"tool_calls\":[{\"function\":{\"arguments\":\"{\\\"city\\\":\\\"Malmo\\\"}\",\"name\":\"weather\"},\"id\":\"call_1\",\"type\":\"function\"}"),
+            wire.body)
+    }
+
+    // The family's one lossy mapping, made visible: there is no `is_error` flag, so a failing result
+    // is prefixed rather than sent back reading exactly like a success.
+    fn a_failing_tool_result_says_so_in_its_text(): void {
+        wire = encode_or_fail(OpenAi.new("k"), ModelRequest {
+            model: "m",
+            messages: [Message.tool("call_1", "no road distance on file", true)],
+        })
+        assert(wire.body.contains("\"content\":\"Error: no road distance on file\""), wire.body)
+    }
+
+    fn encode_sends_the_tools_as_function_declarations(): void {
+        wire = encode_or_fail(OpenAi.new("k"), ModelRequest {
+            model: "m",
+            messages: [Message.user("weather?")],
+            tools: [ToolSpec {
+                name: "weather",
+                description: "Current weather for a city",
+                parameters: "{\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"}",
+            }],
+        })
+        assert(wire.body.contains("\"tools\":[{\"function\":{\"description\":\"Current weather for a city\",\"name\":\"weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"}},\"type\":\"function\"}]"),
+            wire.body)
+    }
+
+    fn encode_omits_the_tools_key_when_there_are_none(): void {
+        assert(!encode_or_fail(OpenAi.new("k"), ModelRequest {
+            model: "m",
+            messages: [Message.user("hi")],
+        }).body.contains("\"tools\""))
+    }
+
+    fn encode_rejects_a_tool_whose_schema_is_not_json(): void {
+        match OpenAi.new("k").encode(ModelRequest {
+            model: "m",
+            messages: [Message.user("hi")],
+            tools: [ToolSpec { name: "broken", description: "", parameters: "{oops" }],
+        }) {
+            Ok(_) => {
+                assert(false, "a malformed schema must not encode")
+            },
+            Err(e) => {
+                assert("${e}".contains("broken"), "${e}")
+                assert("${e}".contains("openai"), "${e}")
+            },
+        }
+    }
+
+    // A turn of text alone is a plain `content` string — the form every compatible server accepts.
+    // A turn with an attachment is the typed-part array, which is the only form that can carry one.
+    fn content_is_a_string_until_a_part_needs_the_array(): void {
+        plain = encode_or_fail(OpenAi.new("k"), ModelRequest {
+            model: "m",
+            messages: [Message.user("hi")],
+        })
+        assert(plain.body.contains("{\"content\":\"hi\",\"role\":\"user\"}"), plain.body)
+
+        rich = encode_or_fail(OpenAi.new("k"), ModelRequest {
+            model: "m",
+            messages: [Message {
+                role: Role.User,
+                parts: [Part.Text(text: "what is this?"), Part.Image(mime: "image/png", data: "foobar".to_bytes())],
+            }],
+        })
+        assert(rich.body.contains("{\"image_url\":{\"url\":\"data:image/png;base64,Zm9vYmFy\"},\"type\":\"image_url\"}"),
+            rich.body)
+        assert(rich.body.contains("{\"text\":\"what is this?\",\"type\":\"text\"}"), rich.body)
+    }
+
+    fn encode_sends_a_pdf_as_a_file_part(): void {
+        wire = encode_or_fail(OpenAi.new("k"), ModelRequest {
+            model: "m",
+            messages: [Message {
+                role: Role.User,
+                parts: [Part.File(mime: "application/pdf", name: "draft.pdf", data: "foo".to_bytes())],
+            }],
+        })
+        assert(wire.body.contains("{\"file\":{\"file_data\":\"data:application/pdf;base64,Zm9v\",\"filename\":\"draft.pdf\"},\"type\":\"file\"}"),
+            wire.body)
+    }
+
+    // Loud, at encode, naming the part and the configuration — the same rule Anthropic's codec
+    // follows, and here it fires per *configuration*, because the endpoints genuinely differ.
+    fn each_configuration_refuses_what_its_own_endpoint_cannot_express(): void {
+        pdf = ModelRequest {
+            model: "m",
+            messages: [Message {
+                role: Role.User,
+                parts: [Part.File(mime: "application/pdf", name: "draft.pdf", data: "x".to_bytes())],
+            }],
+        }
+        // Ollama's `/v1` has no `file` content part at all, and says which door does.
+        match OllamaCompat.local().encode(pdf) {
+            Ok(_) => {
+                assert(false, "a PDF must not silently encode against ollama's /v1")
+            },
+            Err(e) => {
+                assert("${e}".contains("draft.pdf"), "${e}")
+                assert("${e}".contains("native codec"), "and what would work: ${e}")
+            },
+        }
+
+        // A non-PDF is refused everywhere, naming what the part is for.
+        video = ModelRequest {
+            model: "m",
+            messages: [Message {
+                role: Role.User,
+                parts: [Part.File(mime: "video/mp4", name: "clip.mp4", data: "x".to_bytes())],
+            }],
+        }
+        match OpenAi.new("k").encode(video) {
+            Ok(_) => {
+                assert(false, "a video must not silently encode")
+            },
+            Err(e) => {
+                assert("${e}".contains("clip.mp4"), "${e}")
+                assert("${e}".contains("application/pdf"), "${e}")
+            },
+        }
+    }
+
+    // OpenAI's Chat Completions does not take a reasoning block back and its own replies never
+    // produce one, so a `Part.Thinking` reaching it is a caller's mistake worth naming. OpenRouter
+    // and Ollama do take it, and the same codec sends it — one field apart.
+    fn reasoning_goes_back_only_where_the_vendor_accepts_it(): void {
+        history = ModelRequest {
+            model: "m",
+            messages: [Message {
+                role: Role.Assistant,
+                parts: [Part.Thinking(text: "let me see", signature: ""), Part.Text(text: "Stockholm.")],
+            }],
+        }
+        match OpenAi.new("k").encode(history) {
+            Ok(_) => {
+                assert(false, "OpenAI does not accept a reasoning block on input")
+            },
+            Err(e) => {
+                assert("${e}".contains("reasoning"), "${e}")
+            },
+        }
+        wire = encode_or_fail(OpenRouter.new("k"), history)
+        assert(wire.body.contains("\"reasoning\":\"let me see\""), wire.body)
+        assert(wire.body.contains("\"content\":\"Stockholm.\""), wire.body)
+    }
+
+    fn encode_rejects_a_tool_call_whose_arguments_are_not_json(): void {
+        match OpenAi.new("k").encode(ModelRequest {
+            model: "m",
+            messages: [Message {
+                role: Role.Assistant,
+                parts: [Part.ToolCall(id: "call_1", name: "weather", args: "{city: Malmo")],
+            }],
+        }) {
+            Ok(_) => {
+                assert(false, "malformed arguments must not encode")
+            },
+            Err(e) => {
+                assert("${e}".contains("weather"), "${e}")
+            },
+        }
+    }
+
+    // A codec's standing body keys and a request's `extra` are the same hook at two scopes, and the
+    // per-call one wins — otherwise a configuration could pin a value a caller cannot override.
+    fn a_requests_extra_overrides_the_codecs_own(): void {
+        codec = OpenAi.new("k").with_body("seed", "1").with_body("top_p", "0.5")
+        wire = encode_or_fail(codec, ModelRequest {
+            model: "m",
+            messages: [Message.user("hi")],
+            extra: {"seed": "99"},
+        })
+        assert(wire.body.contains("\"seed\":99"), wire.body)
+        assert(wire.body.contains("\"top_p\":0.5"), wire.body)
+
+        // Unchecked in content, checked in syntax — at whichever scope it was set.
+        match OpenAi.new("k").with_body("provider", "{oops").encode(ModelRequest { model: "m", messages: [] }) {
+            Ok(_) => {
+                assert(false, "a malformed standing fragment must be caught at encode")
+            },
+            Err(e) => {
+                assert("${e}".contains("provider"), "${e}")
+            },
+        }
+    }
+
+    fn encode_passes_a_speakers_name_through(): void {
+        wire = encode_or_fail(OpenAi.new("k"), ModelRequest {
+            model: "m",
+            messages: [Message { role: Role.User, parts: [Part.Text(text: "hi")], name: some("ada") }],
+        })
+        assert(wire.body.contains("\"name\":\"ada\""), wire.body)
+    }
+
+    // --- Decoding a real captured response body --------------------------------------------------
+
+    fn decode_reads_a_captured_text_reply(): void {
+        reply = decode_or_fail(OpenAi.new("k"), captured_text_reply())
+        assert(reply.parts == [Part.Text(text: "Hej! Hur mår du?")])
+        assert(reply.stop == StopReason.EndTurn)
+        assert(reply.model == "gpt-4o-2024-08-06")
+        assert(reply.usage.input_tokens == 2095)
+        assert(reply.usage.output_tokens == 503)
+        assert(reply.usage.cached_input_tokens == 1024, "a cache hit is a breakdown of the prompt tokens")
+        assert(reply.usage.reasoning_tokens == 128, "and reasoning is a breakdown of the completion tokens")
+        assert(reply.usage.total() == 2598, "neither breakdown is counted twice")
+    }
+
+    // The vendor's own call id, and `arguments` arriving as a **string** that has to come back out
+    // as the raw JSON text a `Part.ToolCall` carries — not as a quoted string within a string.
+    fn decode_reads_a_captured_tool_call_reply(): void {
+        reply = decode_or_fail(OpenAi.new("k"), captured_tool_call_reply())
+        assert(reply.stop == StopReason.ToolUse)
+        assert(reply.parts == [Part.ToolCall(
+            id: "call_abc123",
+            name: "get_current_weather",
+            args: "{\"location\": \"Malmö, SE\", \"unit\": \"celsius\"}",
+        )], "${reply.parts}")
+    }
+
+    // Ollama's `/v1` answer has no usage breakdown objects at all, which must read as zeros rather
+    // than take the run down. Same codec, same decode.
+    fn decode_reads_a_captured_ollama_compat_reply(): void {
+        reply = decode_or_fail(OllamaCompat.local(), captured_ollama_compat_reply())
+        assert(reply.parts == [Part.Text(text: "The sky is blue because of Rayleigh scattering.")])
+        assert(reply.model == "llama3.2")
+        assert(reply.usage == Usage { input_tokens: 33, output_tokens: 11 }, "${reply.usage}")
+    }
+
+    // A reply → request round trip: what the model said, sent straight back as history, has to be
+    // re-encodable. This is the property that catches a decode which loses the tool id or turns the
+    // arguments string into a nested quoted blob.
+    fn a_decoded_reply_re_encodes_as_history(): void {
+        codec = OpenAi.new("k")
+        reply = decode_or_fail(codec, captured_tool_call_reply())
+        wire = encode_or_fail(codec, ModelRequest {
+            model: "gpt-4o-mini",
+            messages: [
+                Message.user("weather in Malmö?"),
+                Message { role: Role.Assistant, parts: reply.parts },
+                Message.tool("call_abc123", "18°C, clear", false),
+            ],
+        })
+        assert(wire.body.contains("\"id\":\"call_abc123\""), "the id survives: ${wire.body}")
+        assert(wire.body.contains("\"tool_call_id\":\"call_abc123\""), wire.body)
+        assert(wire.body.contains("\"arguments\":\"{\\\"location\\\": \\\"Malmö, SE\\\", \\\"unit\\\": \\\"celsius\\\"}\""),
+            "the arguments go back as a JSON string, not as a nested blob: ${wire.body}")
+    }
+
+    fn decode_maps_every_finish_reason(): void {
+        assert(decode_stop("stop") == StopReason.EndTurn)
+        assert(decode_stop("") == StopReason.EndTurn, "an absent finish reason is a normal end")
+        assert(decode_stop("length") == StopReason.MaxTokens)
+        assert(decode_stop("tool_calls") == StopReason.ToolUse)
+        assert(decode_stop("function_call") == StopReason.ToolUse, "the legacy spelling means the same thing")
+        assert(decode_stop("content_filter") == StopReason.Refusal)
+        assert(decode_stop("guardrail_intervened") == StopReason.Other(raw: "guardrail_intervened"))
+    }
+
+    // A refusal is the model declining, and it arrives in its own field with `content` null. It is
+    // not a decode failure: the reply is well-formed and says no.
+    fn a_refusal_is_the_answer_and_the_stop_reason(): void {
+        body = "{\"id\":\"chatcmpl-x\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":null,\"refusal\":\"I'm sorry, I can't help with that.\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":11,\"total_tokens\":20}}"
+        reply = decode_or_fail(OpenAi.new("k"), body)
+        assert(reply.stop == StopReason.Refusal, "${reply.stop}")
+        assert(reply.parts == [Part.Text(text: "I'm sorry, I can't help with that.")])
+    }
+
+    // A neutral reply holds one candidate, so answering two thirds of an `n: 3` request is worse
+    // than declining it.
+    fn decode_refuses_a_reply_with_more_than_one_candidate(): void {
+        body = "{\"model\":\"m\",\"choices\":[{\"index\":0,\"message\":{\"content\":\"a\"},\"finish_reason\":\"stop\"},{\"index\":1,\"message\":{\"content\":\"b\"},\"finish_reason\":\"stop\"}]}"
+        match OpenAi.new("k").decode_reply(body) {
+            Ok(_) => {
+                assert(false, "two candidates must not silently become one")
+            },
+            Err(e) => {
+                assert("${e}".contains("choices"), "${e}")
+                assert("${e}".contains("n: 1"), "${e}")
+            },
+        }
+        match OpenAi.new("k").decode_reply("{\"model\":\"m\",\"choices\":[]}") {
+            Ok(_) => {
+                assert(false, "no candidates is not an answer")
+            },
+            Err(e) => {
+                assert("${e}".contains("no choices"), "${e}")
+            },
+        }
+    }
+
+    fn decode_reports_a_malformed_body_rather_than_aborting(): void {
+        match OpenAi.new("k").decode_reply("<html>502 Bad Gateway</html>") {
+            Ok(_) => {
+                assert(false, "HTML is not a reply")
+            },
+            Err(e) => {
+                assert("${e}".contains("openai reply"), "${e}")
+            },
+        }
+    }
+
+    // --- Error bodies ------------------------------------------------------------------------------
+
+    // OpenAI's body carries a broad `type` and a specific `code`; the specific one is what a caller
+    // matches on, so it wins.
+    fn decode_error_prefers_the_specific_code(): void {
+        body = "{\"error\":{\"message\":\"Rate limit reached for gpt-4o in organization org-x on tokens per min (TPM): Limit 30000\",\"type\":\"tokens\",\"param\":null,\"code\":\"rate_limit_exceeded\"}}"
+        e = OpenAi.new("k").decode_error(429, body)
+        assert(match e {
+            AiError.Provider(status, code, message) => status == 429 && code == "rate_limit_exceeded"
+                && message.contains("Rate limit reached"),
+            _ => false,
+        }, "${e}")
+    }
+
+    // OpenRouter sends a **numeric** `code` — the HTTP status again — which reads as absent through
+    // a string reader. The message is still the useful part, and the number is rendered rather than
+    // lost.
+    fn decode_error_survives_openrouters_numeric_code(): void {
+        e = OpenRouter.new("k").decode_error(402, "{\"error\":{\"code\":402,\"message\":\"Insufficient credits\"}}")
+        assert(match e {
+            AiError.Provider(status, code, message) => status == 402 && code == "402"
+                && message == "Insufficient credits",
+            _ => false,
+        }, "${e}")
+    }
+
+    // Ollama and several gateways answer with a bare sentence under `error` rather than an object.
+    // It decodes to the same typed error with no code, instead of to an empty message.
+    fn decode_error_reads_a_bare_string_error(): void {
+        e = OllamaCompat.local().decode_error(404, "{\"error\":\"model 'llama9' not found, try pulling it first\"}")
+        assert(match e {
+            AiError.Provider(status, code, message) => status == 404 && code == ""
+                && message.contains("try pulling it first"),
+            _ => false,
+        }, "${e}")
+    }
+
+    fn decode_error_keeps_an_undecodable_body_verbatim(): void {
+        e = OpenAi.new("k").decode_error(502, "<html>Bad Gateway</html>")
+        assert(match e {
+            AiError.Provider(status, code, message) => status == 502 && code == ""
+                && message == "<html>Bad Gateway</html>",
+            _ => false,
+        }, "${e}")
+    }
+
+    // O-5, demonstrated: nothing in this family ships a tokenizer a pure codec could run, so it says
+    // so rather than guessing.
+    fn estimate_tokens_is_none_because_there_is_no_local_tokenizer(): void {
+        assert(OpenAi.new("k").estimate_tokens([Message.user("hello")]) == none)
+        assert(OllamaCompat.local().estimate_tokens([Message.user("hello")]) == none)
+    }
+
+    // --- Streaming ---------------------------------------------------------------------------------
+
+    fn encode_asks_for_a_stream_only_when_the_request_does(): void {
+        buffered = encode_or_fail(OpenAi.new("k"), ModelRequest { model: "m", messages: [Message.user("hi")] })
+        assert(!buffered.body.contains("\"stream\""), buffered.body)
+        assert(!buffered.streamed(), "and the wire says so")
+
+        streamed = encode_or_fail(OpenAi.new("k"), ModelRequest {
+            model: "m",
+            messages: [Message.user("hi")],
+            stream: true,
+        })
+        assert(streamed.body.contains("\"stream\":true"), streamed.body)
+        // Without this the stream reports no tokens at all.
+        assert(streamed.body.contains("\"stream_options\":{\"include_usage\":true}"), streamed.body)
+        assert(streamed.streamed())
+        assert(!streamed.ndjson(), "the compatible endpoints speak server-sent events")
+    }
+
+    // The captured text transcript, frame by frame. Every delta, in order — a "did it finish"
+    // assertion would pass on a decoder that emitted the opening empty `content`, repeated the model
+    // name on every chunk, or choked on `[DONE]`.
+    fn a_captured_text_stream_decodes_frame_by_frame(): void {
+        decoder: dyn StreamDecoder = OpenAiStream.of("openai")
+        deltas = stream_or_fail(decoder, captured_text_stream())
+        assert(deltas == [
+            Delta.ModelDelta(model: "gpt-4o-mini"),
+            Delta.TextDelta(id: "0", text: "Hello"),
+            Delta.TextDelta(id: "0", text: "!"),
+            Delta.Stop(reason: StopReason.EndTurn),
+            Delta.UsageDelta(usage: Usage { input_tokens: 19, output_tokens: 10 }),
+        ], "${deltas}")
+        assert(decoder.finish() == Ok(Usage { input_tokens: 19, output_tokens: 10 }))
+
+        reply = provider.fold(deltas, "")
+        assert(reply.parts == [Part.Text(text: "Hello!")])
+        assert(reply.model == "gpt-4o-mini", "the served model rode in on the first chunk")
+        assert(reply.stop == StopReason.EndTurn)
+    }
+
+    // The captured tool-call transcript. The id and the name arrive once, in the opening chunk;
+    // every fragment after it names only `index` — which is exactly why the decoder is stateful, and
+    // why five of these fragments are not valid JSON on their own.
+    fn a_captured_tool_call_stream_decodes_frame_by_frame(): void {
+        decoder: dyn StreamDecoder = OpenAiStream.of("openai")
+        deltas = stream_or_fail(decoder, captured_tool_call_stream())
+        assert(deltas == [
+            Delta.ModelDelta(model: "gpt-4o-mini"),
+            Delta.ToolCallStart(id: "call_abc123", name: "get_current_weather"),
+            Delta.ToolCallArgs(id: "call_abc123", fragment: "{\""),
+            Delta.ToolCallArgs(id: "call_abc123", fragment: "location"),
+            Delta.ToolCallArgs(id: "call_abc123", fragment: "\":\""),
+            Delta.ToolCallArgs(id: "call_abc123", fragment: "San"),
+            Delta.ToolCallArgs(id: "call_abc123", fragment: " Francisco"),
+            Delta.ToolCallArgs(id: "call_abc123", fragment: "\"}"),
+            Delta.Stop(reason: StopReason.ToolUse),
+        ], "${deltas}")
+
+        reply = provider.fold(deltas, "")
+        assert(reply.stop == StopReason.ToolUse)
+        assert(reply.parts == [Part.ToolCall(
+            id: "call_abc123",
+            name: "get_current_weather",
+            args: "{\"location\":\"San Francisco\"}",
+        )], "${reply.parts}")
+    }
+
+    // The captured OpenRouter transcript. Nothing in this test needed OpenRouter-specific code: the
+    // keepalive comments dispatch nothing, `reasoning` is read by the same delta decode, and the
+    // reasoning token count is OpenAI's own field.
+    fn a_captured_openrouter_reasoning_stream_decodes_frame_by_frame(): void {
+        decoder: dyn StreamDecoder = OpenAiStream.of("openrouter")
+        deltas = stream_or_fail(decoder, captured_openrouter_reasoning_stream())
+        assert(deltas == [
+            Delta.ModelDelta(model: "deepseek/deepseek-r1"),
+            Delta.ThinkingDelta(id: "0:reasoning", text: "The user asks for"),
+            Delta.ThinkingDelta(id: "0:reasoning", text: " the capital of Sweden."),
+            Delta.TextDelta(id: "0", text: "Stockholm."),
+            Delta.Stop(reason: StopReason.EndTurn),
+            Delta.UsageDelta(usage: Usage { input_tokens: 12, output_tokens: 41, reasoning_tokens: 33 }),
+        ], "${deltas}")
+        assert(decoder.finish() == Ok(Usage { input_tokens: 12, output_tokens: 41, reasoning_tokens: 33 }))
+
+        // Reasoning and prose are two blocks of one candidate, so they need two ids — and the fold
+        // turns them into two parts in arrival order.
+        reply = provider.fold(deltas, "")
+        assert(reply.parts == [
+            Part.Thinking(text: "The user asks for the capital of Sweden.", signature: ""),
+            Part.Text(text: "Stockholm."),
+        ], "${reply.parts}")
+    }
+
+    // **A truncated stream must not look like a complete answer.** The frames that did arrive decode
+    // perfectly well, and only the missing `finish_reason` says the reply is half of one.
+    fn a_truncated_stream_is_refused_rather_than_answered(): void {
+        full = captured_text_stream()
+        // Drop the `finish_reason` chunk, the usage chunk, and `[DONE]`.
+        cut = full.slice(0, full.len() - 6)
+        decoder: dyn StreamDecoder = OpenAiStream.of("openai")
+        deltas = stream_or_fail(decoder, cut)
+        assert(deltas.len() > 0, "the frames that arrived still decode")
+        match decoder.finish() {
+            Ok(u) => {
+                assert(false, "a stream with no `finish_reason` is not a finished reply: ${u}")
+            },
+            Err(e) => {
+                assert("${e}".contains("finish_reason"), "${e}")
+                assert("${e}".contains("truncated"), "${e}")
+            },
+        }
+    }
+
+    // `[DONE]` is the framing's terminator, not the vendor's "this answer is whole" — so a stream
+    // cut between `finish_reason` and `[DONE]` carries a complete reply and is accepted. It loses
+    // the usage chunk, which is a smaller lie than refusing a complete answer or accepting a
+    // truncated one.
+    fn a_stream_cut_after_the_finish_reason_is_still_a_complete_answer(): void {
+        full = captured_text_stream()
+        cut = full.slice(0, full.len() - 4)
+        decoder: dyn StreamDecoder = OpenAiStream.of("openai")
+        deltas = stream_or_fail(decoder, cut)
+        assert(decoder.finish() == Ok(Usage {}), "complete, with no token counts")
+        assert(provider.fold(deltas, "").parts == [Part.Text(text: "Hello!")])
+    }
+
+    fn a_stream_that_never_started_says_what_probably_happened(): void {
+        probe: dyn StreamDecoder = OpenAiStream.of("openai")
+        match probe.finish() {
+            Ok(u) => {
+                assert(false, "an empty stream is not a reply: ${u}")
+            },
+            Err(e) => {
+                assert("${e}".contains("no chunks"), "${e}")
+                assert("${e}".contains("error body"), "the message names the reason it cannot tell: ${e}")
+            },
+        }
+    }
+
+    // A vendor error inside an already-successful 200 stream: the transport reports nothing wrong
+    // and the only evidence is in the frames. `code` stays matchable; the status is `0` because
+    // there genuinely is none.
+    fn an_error_document_mid_stream_is_the_vendors_typed_error(): void {
+        probe: dyn StreamDecoder = OpenAiStream.of("openrouter")
+        frame = Frame {
+            event: "",
+            data: "{\"error\":{\"code\":429,\"message\":\"Provider returned error\",\"metadata\":{\"provider_name\":\"Fireworks\"}}}",
+            id: "",
+            retry: none,
+        }
+        match probe.push(frame) {
+            Ok(_) => {
+                assert(false, "an error document must not decode as content")
+            },
+            Err(e) => {
+                assert(match e {
+                    AiError.Provider(status, code, message) => status == 0 && code == "429"
+                        && message == "Provider returned error",
+                    _ => false,
+                }, "${e}")
+            },
+        }
+    }
+
+    // `[DONE]` is not a JSON document. Handing it to a parser would fail a perfectly healthy stream.
+    fn the_done_terminator_is_not_parsed(): void {
+        probe: dyn StreamDecoder = OpenAiStream.of("openai")
+        assert(probe.push(Frame { event: "", data: "[DONE]", id: "", retry: none }) == Ok([]))
+        assert(probe.push(Frame { event: "", data: "", id: "", retry: none }) == Ok([]))
+    }
+
+    // The whole point of `decode_deltas`: the buffered door speaks the same vocabulary the streaming
+    // door does, so everything downstream of it is one implementation.
+    fn the_buffered_door_produces_deltas_too(): void {
+        match OpenAi.new("k").decode_deltas(captured_text_reply()) {
+            Ok(deltas) => {
+                assert(deltas == [
+                    Delta.ModelDelta(model: "gpt-4o-2024-08-06"),
+                    Delta.TextDelta(id: "0", text: "Hej! Hur mår du?"),
+                    Delta.Stop(reason: StopReason.EndTurn),
+                    Delta.UsageDelta(usage: Usage {
+                        input_tokens: 2095,
+                        output_tokens: 503,
+                        cached_input_tokens: 1024,
+                        reasoning_tokens: 128,
+                    }),
+                ], "${deltas}")
+            },
+            Err(e) => {
+                assert(false, "${e}")
+            },
+        }
+    }
+
+    // A local Ollama's `OLLAMA_HOST` is conventionally written without a scheme, which is completed
+    // rather than rejected.
+    fn a_host_without_a_scheme_is_completed(): void {
+        assert(normalize_host("localhost:11434") == "http://localhost:11434")
+        assert(normalize_host("http://box.local:11434") == "http://box.local:11434")
+        assert(normalize_host("https://ollama.internal") == "https://ollama.internal")
+        assert(OllamaCompat.at("box.local:11434").base_url == "http://box.local:11434/v1")
+    }
+}
