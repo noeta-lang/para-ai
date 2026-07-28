@@ -27,6 +27,7 @@ DESIGN.md §16 sketches `providers/anthropic.noe`. The files are at the repo roo
 Pure Noeta — no cargo anywhere in this repo. But note:
 
 - **The first `noeta check` composes a toolchain** (several minutes), because `para/api` ships a native extension crate that has to be compiled in. Later runs reuse the cached binary. If a command seems to hang on `composing the toolchain with native dependencies [para/api]`, it is building; let it finish.
+- **Do not compose two toolchains at once.** Compositions share `~/.cache/noeta/compose`, and the final link is a release LTO build; two of them racing can fail with a bare `rustc` exit 101 and no diagnostic, which reads exactly like a real compile error. Observed once here — the identical command passed on rerun with nothing else changed. If a composition fails with no error text, check whether another agent is composing before believing it. CI is unaffected: `ci.yml` runs the package and every example serially in one job.
 - `noeta check <file>.noe` and `noeta test <file>.noe` at the repo root run the package's own suite — the codec fixture tables, the delta fold, the base64 vectors, and the end-to-end run-loop tests over `Mock`.
 - `noeta check` / `noeta test` in each `examples/*` directory run that example's suite.
 - **Every test is hermetic.** `Mock` is both the codec and the transport, so no test opens a socket and none needs an API key. A suite that needs a key is a failed suite.
