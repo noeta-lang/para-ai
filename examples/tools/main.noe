@@ -256,7 +256,10 @@ io.outln(schema_of_the_weather_tool())
     // last-one-wins: a silently shadowed tool is the kind of bug that shows up as a wrong answer
     // three weeks later.
     fn a_shadowed_tool_is_refused_at_construction(): void {
-        match Toolbox.of(Local.new())?.with(Local.new()) {
+        // `base_toolbox()` rather than `?`: this returns `void`, so a `?` would early-return on a
+        // *construction* failure and the test would pass having asserted nothing (E0012 now
+        // rejects it).
+        match base_toolbox().with(Local.new()) {
             Ok(_) => {
                 assert(false, "the same source twice is a collision")
             },
@@ -293,4 +296,18 @@ fn agent_or_fail(m: Mock): Agent<Mock> {
         },
     }
     return m.agent(config())
+}
+
+// A base toolbox, or a failed assertion — the `?`-free form a `void` test needs, since a `?` there
+// would early-return on a construction failure and leave the test asserting nothing.
+fn base_toolbox(): Toolbox {
+    match Toolbox.of(Local.new()) {
+        Ok(b) => {
+            return b
+        },
+        Err(e) => {
+            assert(false, "building the base toolbox failed: ${e}")
+        },
+    }
+    return Toolbox.new()
 }

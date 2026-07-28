@@ -1394,7 +1394,10 @@ fn types_probe(
 
     // Not last-one-wins. The message names both sources, because those are what a reader needs.
     fn a_name_collision_names_both_sources(): void {
-        match Toolbox.of(Local.new())?.with(Local.new()) {
+        // `toolbox_or_fail()` rather than `?`: this function returns `void`, so a `?` would
+        // early-return on a *construction* failure and the test would pass having asserted
+        // nothing. The toolchain now rejects that (E0012); it was a real hole before it did.
+        match toolbox_or_fail().with(Local.new()) {
             Ok(_) => {
                 assert(false, "the same source twice is a collision")
             },
