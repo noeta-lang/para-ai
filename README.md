@@ -119,13 +119,9 @@ echo agent.run_sync("What's the weather in Malmö?")?
 
 The whole pipeline is four reflection primitives and no codegen:
 
-1. `attributes_of::<Tool>()` finds every `#[Tool]` in the program and its target name. Reflection is closed-world, so this crosses the package boundary: the query runs in para/ai, your tools live in your program, and it still sees them.
+1. `attributes_of::<Tool>()` finds every `#[Tool]` in the program and its target name. Reflection is closed-world and whole-program, so this crosses the package boundary: the query runs in para/ai, your tools live in your program, and it still sees them. Split them across as many modules as you like — a sibling module the entry file never imports is found too, and so is a dependency package's.
 
-   **One constraint worth knowing before you split your tools across files:** the program the query sees is the *linked* one, and linking is import-driven — a declaration in a sibling module that the entry file neither imports nor reaches is not merged in, so its `#[Tool]` is invisible. Keep your tools in the entry module, or `pub` them and `use` them by name from it:
-
-   ```noeta
-   use app.tools.{weather, distance_km}    // enough to link them; the query does the rest
-   ```
+   **The other direction is the one to keep in mind: whole-program means your dependencies too.** A `#[Tool]` declared at module level inside a *library* is discovered from your program and offered to your model, with nothing in your code naming it. So if you write a library, keep its `#[Tool]` fixtures inside a `@test` block (this package does; see `tools.noe`), and ship real tools through a `ToolSource` your caller constructs rather than through a `#[Tool]` that `Local` picks up uninvited. `roles_of::<Semantic>()` is how you audit what actually got in — see below.
 
 2. `params_of(target)` gives each parameter's name, declared `Type`, whether it is `optional` (it declared a default), and its own `#[Arg]` metadata. That is the JSON Schema.
 3. The model's argument blob is decoded and each value coerced to the declared parameter type.
@@ -154,14 +150,13 @@ That one line turns "which functions in this program can a language model reach?
 
 ```noeta
 for r in roles_of::<Semantic>() {
-    match r.role {
-        Semantic.TrustBoundary => { echo r.target },   // noeta.tools.weather, …
-        _ => {},
+    if r.role == Semantic.TrustBoundary {
+        echo r.target                                  // noeta.tools.weather, …
     }
 }
 ```
 
-For a program where a model can call code, that is not a nicety; it is the review surface, and no other language's agent SDK can answer it without a bespoke linter. (Match the role rather than comparing it with `==`: the prelude `Semantic` enum has no expression form today — see [AGENTS.md](AGENTS.md).)
+For a program where a model can call code, that is not a nicety; it is the review surface, and no other language's agent SDK can answer it without a bespoke linter. Run it over your own program and read the list: whole-program reflection means a dependency's module-level `#[Tool]` is on it too, and this is where you would see it.
 
 ### A failing tool is a turn, not an outage
 

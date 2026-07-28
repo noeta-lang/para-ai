@@ -304,6 +304,13 @@ pub struct Tool { about: string = ""  name: string = "" }
 
 That one line makes "which functions in this program can a language model reach?" a query — `roles_of::<Semantic>()` in-language, and the architectural graph that `noeta mcp` and the VS Code extension already serve. For a program where a model can call code, that is not a nicety; it is the review surface. No other language's agent SDK can answer it without a bespoke linter.
 
+**The corollary: a library may not declare a `#[Tool]` at module level.** Reflection reaching the whole program is what makes step 1 work across the package boundary — the query runs in para/ai and finds tools declared in the application. It reaches the other way too. A `#[Tool]` in *library* code is discovered from every application that depends on that library, and `Local` offers it to that application's model, with nothing in the application mentioning it. That is a trust-boundary crossing performed by a dependency, which is exactly what the role exists to make visible, so this is a rule rather than a style preference:
+
+- A library's own `#[Tool]` **fixtures** belong in a `@test` block, which is stripped before lowering on every build that is not that module's own `noeta test`. A parameterized fixture additionally needs `#[std.test.Skip]`, because every `fn` in a top-level `@test` block is a test root; skipping affects the *runner* only, leaving the function discoverable by `attributes_of` and dispatchable by `invoke`.
+- A library that means to *ship* tools — a package of ready-made ones — hands them over through a `ToolSource` the application constructs, never through `#[Tool]` on module-level declarations that `Local` picks up whether or not the application asked for them.
+
+`examples/tools` asserts the property from the consuming side: its toolbox and its trust-boundary index each contain exactly its own two tools, and nothing from para/ai.
+
 ### `ToolSource`
 
 Local `#[Tool]` functions and MCP servers are the same thing to the agent:

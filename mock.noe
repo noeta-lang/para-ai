@@ -747,6 +747,43 @@ impl Middleware for Mock {
 }
 
 @test {
+    // --- The tools these tests drive -------------------------------------------------------------
+    //
+    // Declared **inside the dev tier**, which is what keeps them out of every consuming
+    // application. `attributes_of::<Tool>()` is whole-program, so a `#[Tool]` at module level in
+    // library code is discovered from a consumer's build and offered to that consumer's model —
+    // and `Tool` is `@role(Semantic.TrustBoundary)` exactly because a tool is model-reachable. A
+    // `@test` block is stripped before lowering on any build that is not `noeta test`, so these two
+    // exist only while this file's own suite runs. `tools.noe` says the same thing at more length.
+    //
+    // `#[std.test.Skip]` is what lets a fixture take parameters: every `fn` in a top-level `@test`
+    // block is a test root, and the runner would otherwise call `mock_shout()` with no argument and
+    // fail it. Skipped means "never run as a test" and nothing else — still compiled, still found by
+    // `attributes_of`, still dispatchable through `invoke`.
+    //
+    // Still named `mock_*` rather than reusing `tools.noe`'s `shout`/`add`: a tier block is
+    // activated for the **entry file only**, so `noeta test mock.noe` never sees `tools.noe`'s
+    // fixtures and the distinct names are no longer load-bearing — but they do keep a failure
+    // message in this file unambiguous about which module's fixture it came from.
+
+    #[std.test.Skip("a tool fixture for this module's suite, not a test")]
+    #[Tool(about: "Echo a string back, uppercased")]
+    fn mock_shout(#[Arg(help: "The text to shout")] text: string): string {
+        return text.upper()
+    }
+
+    #[std.test.Skip("a tool fixture for this module's suite, not a test")]
+    #[Tool(about: "Add two integers")]
+    fn mock_add(
+        #[Arg(help: "The left operand")] a: int,
+        #[Arg(help: "The right operand")] b: int = 1,
+    ): Result<int, string> {
+        if a > 1000000 {
+            return Err("`a` is unreasonably large")
+        }
+        return Ok(a + b)
+    }
+
     fn a_scripted_text_answer_comes_back_through_the_whole_run_loop(): void {
         m = Mock.new().reply_text("18°C and clear in Malmö.")
         agent = m.agent(AgentConfig.new("test-model"))
@@ -1437,26 +1474,4 @@ async fn drain_events(rx: Receiver<Event>): List<Event> {
         }
     }
     return out
-}
-
-// --- The tools these tests drive ------------------------------------------------------------------
-//
-// Declared **here** rather than borrowed from `para.ai.tools`, because `attributes_of::<T>()` sees
-// only the entry module's annotations (AGENTS.md). Named `mock_*` so that when that is fixed
-// upstream they simply join the other module's rather than colliding with them.
-
-#[Tool(about: "Echo a string back, uppercased")]
-fn mock_shout(#[Arg(help: "The text to shout")] text: string): string {
-    return text.upper()
-}
-
-#[Tool(about: "Add two integers")]
-fn mock_add(
-    #[Arg(help: "The left operand")] a: int,
-    #[Arg(help: "The right operand")] b: int = 1,
-): Result<int, string> {
-    if a > 1000000 {
-        return Err("`a` is unreasonably large")
-    }
-    return Ok(a + b)
 }

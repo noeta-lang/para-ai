@@ -194,24 +194,45 @@ io.outln(schema_of_the_weather_tool())
     // The line that makes tool calling reviewable. `#[Tool]` carries
     // `@role(Semantic.TrustBoundary)`, so the set of model-reachable functions is a query — the
     // same index `noeta mcp` serves to an editor or an agent.
-    //
-    // The role is matched rather than compared with `==`, because the prelude `Semantic` enum has
-    // no expression form today: `Semantic.TrustBoundary` type-checks and then aborts at runtime.
     fn every_tool_is_a_declared_trust_boundary(): void {
-        mut reachable: List<string> = []
-        for r in roles_of::<Semantic>() {
-            match r.role {
-                Semantic.TrustBoundary => {
-                    reachable = reachable ~ [r.target]
-                },
-                _ => {},
-            }
-        }
+        reachable = trust_boundaries()
         assert(reachable.contains("noeta.tools.weather"), "${reachable}")
         assert(reachable.contains("noeta.tools.distance_km"), "${reachable}")
         // And nothing else in this program is one — `config`, `ask`, and `offline` are not
         // reachable by a model, and the index says so.
         assert(!reachable.contains("noeta.tools.ask"), "${reachable}")
+    }
+
+    // **A dependency's test fixtures must not reach this program's model.**
+    //
+    // `attributes_of::<Tool>()` is whole-program and closed-world, and "whole program" includes
+    // every dependency package — which is what makes `#[Tool]` work across the package boundary at
+    // all. The same reach is a hazard pointing the other way: a `#[Tool]` declared at module level
+    // anywhere inside `para/ai` would be discovered here and offered to *this* application's model,
+    // with no line of this file mentioning it. That is a trust-boundary crossing, which is exactly
+    // what `@role(Semantic.TrustBoundary)` on `Tool` exists to make visible.
+    //
+    // It was real and it was measured: this toolbox once read
+    // `["mock_shout", "mock_add", "shout", "add", "shapes", "weather", "distance_km"]` — the first
+    // five being `para.ai.tools`' and `para.ai.mock`' own fixtures. Those live inside `@test` blocks
+    // now, and a dev tier is stripped before lowering on every build that is not that module's own
+    // `noeta test`, so they cannot be linked into a consumer at all.
+    //
+    // Asserted as an exact set, from both directions — the vocabulary the model is handed, and the
+    // trust-boundary index the reviewer reads — because the thing worth catching is the *next*
+    // fixture someone adds to the library, not these five.
+    fn no_dependency_tool_reaches_this_programs_model(): void {
+        match Toolbox.of(Local.new()) {
+            Ok(box) => {
+                assert(box.names() == ["weather", "distance_km"],
+                    "a consumer's toolbox is its own tools and nothing else: ${box.names()}")
+            },
+            Err(e) => {
+                assert(false, "${e}")
+            },
+        }
+        assert(trust_boundaries() == ["noeta.tools.weather", "noeta.tools.distance_km"],
+            "and the trust-boundary index agrees: ${trust_boundaries()}")
     }
 
     // The toolbox is the whole vocabulary, and it is `AgentConfig`-independent — build it once, hand
@@ -245,6 +266,20 @@ io.outln(schema_of_the_weather_tool())
             },
         }
     }
+}
+
+// Every function in this program a language model can reach, by name — `roles_of::<Semantic>()`
+// narrowed to the one role `#[Tool]` confers. `Semantic.TrustBoundary` is written as a value and
+// compared with `==`; the prelude enums used to have no expression form and this had to be a
+// `match` pattern.
+fn trust_boundaries(): List<string> {
+    mut reachable: List<string> = []
+    for r in roles_of::<Semantic>() {
+        if r.role == Semantic.TrustBoundary {
+            reachable = reachable ~ [r.target]
+        }
+    }
+    return reachable
 }
 
 // Unwrap-or-fail, out here because a `match` arm cannot both fail an assertion and produce a value.
