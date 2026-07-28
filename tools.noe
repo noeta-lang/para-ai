@@ -1066,8 +1066,11 @@ fn refuses_nested(xs: List<bytes>): void {
 
 
 // One parameter of each supported declared type, so a coercion test can take its `Type` from a real
-// signature. The same reason the refusals above are real declarations: a `Type` value cannot be
-// written in expression position today, and reading one off `params_of` is the stricter test anyway.
+// signature. The same reason the refusals above are real declarations, and it is not the language's:
+// a `Type` value *can* be written in expression position now (`Type.Unit` used to type-check and
+// then abort with E0005; it no longer does), and reading one off `params_of` is still the stricter
+// test, because it asserts what the checker says the signature means rather than what this module
+// believes it means.
 fn types_probe(
     i: int,
     f: float,
@@ -1262,6 +1265,28 @@ fn types_probe(
         enum_message = refusal("refuses_enum")
         assert(enum_message.contains("variants are not reflectable"), enum_message)
         assert(enum_message.contains("variants_of"), "it names the primitive that is missing: ${enum_message}")
+    }
+
+    // The two arms of `json_schema` no *declared* signature can reach: `void` is not a parameter
+    // type a program can write, and an `f64` only appears in container position where `float` is
+    // what a plain parameter declares. They were untested for a language reason rather than a
+    // design one — the prelude `Type` enum had no expression form, so `Type.Unit` type-checked and
+    // then aborted with E0005 at run time, and the only `Type` values available were the ones
+    // `params_of` handed back off a real declaration. Constructing one works now, so the total
+    // function is finally testable as a total function.
+    fn the_arms_no_declaration_can_reach_still_refuse(): void {
+        assert(match json_schema(Type.Unit) {
+            Ok(s) => false,
+            Err(e) => e.contains("`void` is not a value a model can send"),
+        }, "${json_schema(Type.Unit)}")
+        assert(match json_schema(Type.F64) {
+            Ok(s) => false,
+            Err(e) => e.contains("f64"),
+        }, "${json_schema(Type.F64)}")
+        // And a constructed `Type` is the same value `type_of` reports, so reading one off a
+        // declaration and building one are interchangeable.
+        assert(type_of(5) == Type.Int, "${type_of(5)}")
+        assert(probe_type("li") == Type.List(Type.Int), "${probe_type("li")}")
     }
 
     // --- Coercion ----------------------------------------------------------------------------------

@@ -44,7 +44,7 @@ use para.ai.tools.{ToolSpec}
 // which is only ever called on a body that *is* streamed, so it has no "don't stream" member — and
 // a codec needs exactly one more case than that to say which of the two transports its `Wire`
 // wants. `Wire.streamed()` and `Wire.ndjson()` are how the run loop reads the difference back
-// without either module having to name both enums (they share a spelling; see AGENTS.md).
+// without either module having to name both enums, which share a spelling.
 @derive(Equatable, Display)
 pub enum Framing {
     Whole
@@ -75,18 +75,20 @@ pub struct Wire {
     }
 
     // Whether the stream is newline-delimited JSON rather than server-sent events. Two booleans
-    // rather than a `Framing` → `std.http.Framing` mapping because the two enums share a name, and
-    // a module that named both would have to qualify one of them — which the VM cannot currently
-    // compile (AGENTS.md). The run loop turns this back into `std.http.Framing` at the one place it
-    // calls `client.stream`.
+    // rather than a `Framing` → `std.http.Framing` mapping because the two enums share a name, so a
+    // module that named both would have to qualify one of them. That used to be impossible — a
+    // module-qualified extern enum variant was an unlocated VM internal error — and it now compiles;
+    // the booleans stay because CI pins a released toolchain that predates the fix, and because
+    // "does this go down the streaming path?" is a better thing for the run loop to ask than an enum
+    // comparison. The run loop turns this back into `std.http.Framing` at the one place it calls
+    // `client.stream`.
     fn ndjson(): bool {
         return self.framing == Framing.Ndjson
     }
 
     // The same request, read as a stream. Two constructors rather than a settable field, so that a
     // codec whose module already names `std.http.Framing` — which every codec that touches frames
-    // does — never has to name this enum too. They share a spelling, and a module that named both
-    // would have to qualify one, which the VM cannot currently compile (AGENTS.md).
+    // does — never has to name this enum too.
     fn as_sse(): Wire {
         return Wire { ...self, framing: Framing.Sse }
     }
