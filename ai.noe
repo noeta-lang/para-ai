@@ -20,11 +20,16 @@
 namespace para.ai
 
 use std.http.client
-use std.http.{HttpError, Request}
+use std.http.{Frame, Framing, FrameStream, HttpError, Request}
+use std.task.{map_bounded, sleep}
+// `uuid` by name, not `use std.id`: a whole-module import binds its last segment as a local, and
+// `id` is what half the `Part` patterns in this file bind — the collision is not a check error but
+// a runtime "cannot assign to `id`" from inside a `match` arm (AGENTS.md).
+use std.id.{uuid}
 use std.{env, metrics, time, tracing}
 use para.api.Api
 use para.api.middleware.Retry
-use para.ai.provider.{ModelRequest, ModelReply, Provider, StopReason, Usage, Wire}
+use para.ai.provider.{Delta, ModelRequest, ModelReply, Provider, StopReason, StreamDecoder, Usage, Wire, fold}
 use para.ai.tools
 use para.ai.tools.{Toolbox, ToolSource}
 
@@ -280,6 +285,24 @@ pub struct AgentConfig {
     // Names the run's root span (`invoke_agent {name}`) and its `gen_ai.agent.name` attribute. Keep
     // it low-cardinality — it is a span attribute, not an identifier.
     pub name: string = "agent"
+    // Whether `run` and `run_sync` stream the model call. `stream` streams regardless.
+    //
+    // **False by default, and that is a decision rather than an omission.** Streaming and buffering
+    // share one run loop, one delta vocabulary, one accumulator, and one event emitter — but not
+    // one transport, because a `FrameStream` cannot flow through the `para/api` onion (DESIGN O-4).
+    // The buffered path is therefore the one `Retry`, `Cache`, `Record`, `Mock`, and `Logging`
+    // cover, and defaulting to streaming would quietly take those away from every caller who never
+    // asked for it. Turning it on is one builder call and the README states the trade.
+    pub stream: bool = false
+    // How many times a *streamed* call is retried before giving up.
+    //
+    // The streaming path owns its retry: `para/api`'s `Retry` middleware sits on the buffered path
+    // only, because retrying means asking for the body again and a stream you have begun reading
+    // cannot be asked twice. Two attempts after the first is the same shape `Retry` defaults to.
+    pub stream_retries: int = 2
+    // The first backoff between streamed attempts, in milliseconds; each further attempt doubles
+    // it. Small, because a streamed call that failed at all failed at the head, which is fast.
+    pub stream_backoff_ms: int = 500
     // Vendor-specific request-body keys, as raw JSON fragments, merged verbatim by the codec.
     // Documented as unchecked: this is the escape hatch for a knob the neutral model has not
     // grown yet, and a malformed fragment surfaces at `encode`.
@@ -319,6 +342,236 @@ pub struct AgentConfig {
 
     fn with_extra(key: string, json_fragment: string): AgentConfig {
         return AgentConfig { ...self, extra: self.extra.set(key, json_fragment) }
+    }
+
+    // Stream every model call, including the ones `run` and `run_sync` make. See `stream` above for
+    // what this costs: the `para/api` layers do not cover the streaming path.
+    fn streamed(): AgentConfig {
+        return AgentConfig { ...self, stream: true }
+    }
+
+    // Buffer every model call — the default, spelled out for a caller switching back.
+    fn buffered(): AgentConfig {
+        return AgentConfig { ...self, stream: false }
+    }
+
+    fn with_stream_retries(n: int): AgentConfig {
+        return AgentConfig { ...self, stream_retries: n }
+    }
+
+    fn with_stream_backoff(ms: int): AgentConfig {
+        return AgentConfig { ...self, stream_backoff_ms: ms }
+    }
+}
+
+// --- Events ---------------------------------------------------------------------------------------
+
+// One thing that happened during a run, as it happened.
+//
+// **Every variant is a value type**, so a `Sender<Event>` works across tasks *and* isolates and the
+// whole thing composes with parallel serving. The shape is chosen so that AG-UI encoding (phase 7)
+// is a pure mapping rather than a translation layer — which is also why the enum is complete here
+// rather than growing a variant at a time: adding one later would break every exhaustive `match` a
+// consumer had written against it.
+//
+// **What the run loop emits today** is `RunStarted`, the text / thinking / tool-call deltas with
+// their block starts and ends, one `ToolCallResult` per dispatched call, and exactly one terminal
+// `RunFinished` or `RunError`. `StateSnapshot`, `StateDelta`, `StepStarted`, `StepFinished`, and
+// `Custom` are for consumers to produce and for phase 7 to encode; nothing in the loop emits one.
+// That is the seam named rather than filled — inventing a step vocabulary before AG-UI is in hand
+// would be guessing at the thing phase 7 exists to decide.
+@derive(Equatable, Display)
+pub enum Event {
+    RunStarted(run_id: string, thread_id: string)
+    TextStart(id: string)
+    TextDelta(id: string, delta: string)
+    TextEnd(id: string)
+    ThinkingDelta(id: string, delta: string)
+    ToolCallStart(id: string, name: string)
+    ToolCallArgsDelta(id: string, delta: string)
+    ToolCallEnd(id: string)
+    ToolCallResult(id: string, content: string, is_error: bool)
+    StateSnapshot(json: string)
+    StateDelta(patch: string)
+    StepStarted(name: string)
+    StepFinished(name: string)
+    RunFinished(run_id: string, usage: Usage)
+    RunError(message: string, code: string)
+    Custom(name: string, json: string)
+}
+
+// The block the event stream currently has open, so that a `TextStart` is matched by exactly one
+// `TextEnd` and a `ToolCallStart` by exactly one `ToolCallEnd`. `kind` is `""` when none is open.
+//
+// This mirrors `provider.fold`'s own block bookkeeping deliberately. The events and the accumulated
+// message have to agree about where one block stops and the next begins, and the way to guarantee
+// that is for both to open a new block on the same condition — a change of `(id, kind)`.
+@derive(Equatable, Display)
+pub struct Open {
+    pub kind: string = ""
+    pub id: string = ""
+}
+
+// The events that close whatever block is open, if any.
+pub fn closing(open: Open): List<Event> {
+    if open.kind == "text" {
+        return [Event.TextEnd(id: open.id)]
+    }
+    if open.kind == "tool" {
+        return [Event.ToolCallEnd(id: open.id)]
+    }
+    // A thinking block has no start or end in the event vocabulary — it gets a delta and nothing
+    // else — so there is nothing to close.
+    return []
+}
+
+// Move to block `(kind, id)`, closing whatever was open first. Returns the new state and the events
+// the transition produced.
+fn enter(open: Open, kind: string, id: string, opening: List<Event>): (Open, List<Event>) {
+    if open.kind == kind && open.id == id {
+        return (open, [])
+    }
+    return (Open { kind: kind, id: id }, closing(open) ~ opening)
+}
+
+fn text_step(open: Open, id: string, text: string): (Open, List<Event>) {
+    (next, opened) = enter(open, "text", id, [Event.TextStart(id: id)])
+    return (next, opened ~ [Event.TextDelta(id: id, delta: text)])
+}
+
+fn thinking_step(open: Open, id: string, text: string): (Open, List<Event>) {
+    (next, opened) = enter(open, "thinking", id, [])
+    return (next, opened ~ [Event.ThinkingDelta(id: id, delta: text)])
+}
+
+// A tool block is normally opened by a `ToolCallStart`. If arguments arrive for one that is not
+// open, the block is opened here with an empty name rather than the fragment being dropped — a
+// codec that streams fragments before naming the tool is odd, but losing arguments is worse.
+fn args_step(open: Open, id: string, fragment: string): (Open, List<Event>) {
+    (next, opened) = enter(open, "tool", id, [Event.ToolCallStart(id: id, name: "")])
+    return (next, opened ~ [Event.ToolCallArgsDelta(id: id, delta: fragment)])
+}
+
+// One delta, as the events it means and the block state that follows it.
+//
+// Pure and total, and the single place where "these increments look like *that* to a consumer" is
+// decided. It is also the reason a buffered run and a streamed run of the same reply produce the
+// same event sequence: there is one implementation, and the transport chooses only how many deltas
+// arrive at a time — never what they mean.
+//
+// `Stop`, `UsageDelta`, and `ModelDelta` produce no event. They are the run's *result*, and they
+// surface in the terminal `RunFinished` rather than as increments of a block.
+pub fn step(open: Open, d: Delta): (Open, List<Event>) {
+    return match d {
+        Delta.TextDelta(id, text) => text_step(open, id, text),
+        Delta.ThinkingDelta(id, text) => thinking_step(open, id, text),
+        Delta.ThinkingSignature(id, signature) => enter(open, "thinking", id, []),
+        Delta.ToolCallStart(id, name) => enter(open, "tool", id, [Event.ToolCallStart(id: id, name: name)]),
+        Delta.ToolCallArgs(id, fragment) => args_step(open, id, fragment),
+        Delta.Stop(reason) => (open, []),
+        Delta.UsageDelta(usage) => (open, []),
+        Delta.ModelDelta(model) => (open, []),
+    }
+}
+
+// A whole delta list as the events it means, blocks closed. The batch form of `step`, which is what
+// the buffered path uses — its deltas all exist at once, so its events do too.
+pub fn events_of(deltas: List<Delta>): List<Event> {
+    mut open = Open {}
+    mut out: List<Event> = []
+    for d in deltas {
+        (next, evs) = step(open, d)
+        open = next
+        out = out ~ evs
+    }
+    return out ~ closing(open)
+}
+
+// --- Where events go --------------------------------------------------------------------------------
+
+// The consumer of a run's events.
+//
+// `async` because the channel case is: `Sender.send` applies backpressure end to end, which is the
+// behavior you want — a slow renderer should slow the run down rather than grow memory. A sink that
+// cannot suspend simply never awaits.
+pub trait EventSink {
+    async fn emit(e: Event): void
+}
+
+// Drops everything.
+//
+// What `run` and `run_sync` use — and the reason they are the same run as `stream`. The loop
+// produces the identical events whichever door was called; only the consumer differs. That makes
+// "a buffered run and a streamed run agree" a claim a test can check rather than an aspiration.
+pub struct Silent {
+    impl EventSink {
+        async fn emit(e: Event): void {
+        }
+    }
+}
+
+// Sends every event down a channel, and lets the channel's backpressure reach the run.
+pub struct Channel {
+    pub tx: Sender<Event>
+
+    impl EventSink {
+        async fn emit(e: Event): void {
+            self.tx.send(e).await
+        }
+    }
+}
+
+// --- Where streamed frames come from ------------------------------------------------------------
+
+// A streamed response body, as the run loop reads it. The shape `Receiver`, `Socket`, and
+// `FrameStream` already share in std: await the next one, `none` when the body ends.
+pub trait Frames {
+    async fn next(): ?Frame
+
+    // Release the connection. Called on every path out of the read loop, including the failing
+    // ones — a stream abandoned mid-body otherwise holds a socket open until the process exits.
+    fn close(): void
+}
+
+// Where a streamed request's frames come from.
+//
+// **This seam exists because of DESIGN O-4.** `client.stream` returns a `FrameStream`, and that is
+// a type the `para/api` onion structurally cannot accept: `Retry` calls `next` again and a second
+// call means a second body, `Cache` and `Record` would have to store one, and `Mock` answers with a
+// whole buffered `Response`. So the streaming path cannot reach the transport the buffered path
+// reaches, and `Mock` cannot double as the streaming transport the way it does for the buffered
+// one. One trait with two implementations — the real client, and a scripted replay — is what keeps
+// a streaming test as hermetic as a buffered one.
+pub trait Streamer {
+    fn open(req: Request, framing: Framing): Result<dyn Frames, AiError>
+}
+
+// The real thing: `std.http.client.stream` sends the request, reads the response head, and hands
+// back a reader over the body.
+//
+// **It cannot see the response status**, and that is a real limitation rather than an oversight
+// here: `FrameStream` exposes `recv` and `close` and nothing else, so a 429 arrives as a body that
+// frames into nothing instead of as `AiError.Provider(429, "rate_limit_error", …)`. Each codec's
+// `StreamDecoder.finish` says so in its message; see the README.
+pub struct HttpStreamer {
+    impl Streamer {
+        fn open(req: Request, framing: Framing): Result<dyn Frames, AiError> {
+            return Ok(LiveFrames { stream: client.stream(req, framing)? })
+        }
+    }
+}
+
+struct LiveFrames {
+    stream: FrameStream
+
+    impl Frames {
+        async fn next(): ?Frame {
+            return self.stream.recv().await
+        }
+
+        fn close(): void {
+            self.stream.close()
+        }
     }
 }
 
@@ -366,6 +619,10 @@ pub struct Agent<P: Provider> {
     pub config: AgentConfig
     pub provider: P
     pub api: Api
+    // Where a *streamed* call's frames come from. A second transport slot rather than a second
+    // middleware, because a streaming body cannot go through `api` at all (DESIGN O-4) — see
+    // `Streamer`. Defaults to the real client; `frames` swaps in a scripted replay.
+    pub transport: dyn Streamer
     pub toolbox: Toolbox = Toolbox.new()
 
     // An agent over the default transport: a plain client wrapped in `Retry`, which honors a
@@ -379,7 +636,13 @@ pub struct Agent<P: Provider> {
     // An agent over a transport chain you composed yourself — the door for `Mock`, `Record`,
     // `Cache`, a custom auth layer, or a client with a different timeout.
     fn over(cfg: AgentConfig, p: P, api: Api): Agent<P> {
-        return Agent { config: cfg, provider: p, api: api }
+        return Agent { config: cfg, provider: p, api: api, transport: HttpStreamer {} }
+    }
+
+    // Read streamed frames from somewhere other than the network — the door `Mock` uses, and the
+    // one a recorded-transcript fixture would. The buffered half still goes through `api`.
+    fn frames(src: dyn Streamer): Agent<P> {
+        return Agent { ...self, transport: src }
     }
 
     // Give the agent a source of tools.
@@ -401,7 +664,10 @@ pub struct Agent<P: Provider> {
 
     // The neutral request for a conversation, with the config's system prompt prepended when the
     // conversation does not open with one of its own.
-    fn request(conv: Conversation): ModelRequest {
+    //
+    // `streamed` is an argument rather than a config read because the two doors disagree on
+    // purpose: `stream(conv, out)` streams whatever the config says, and `run_sync` never does.
+    fn request(conv: Conversation, streamed: bool = false): ModelRequest {
         mut msgs = conv.messages
         match self.config.system {
             some(text) => {
@@ -417,12 +683,13 @@ pub struct Agent<P: Provider> {
             temperature: self.config.temperature,
             stop: self.config.stop,
             extra: self.config.extra,
+            stream: streamed,
         }
     }
 
-    // One model call: encode, send through the chain, decode, and emit the `chat {model}` span and
-    // the two GenAI metrics around it. The only I/O in the package.
-    fn call(req: ModelRequest): Result<ModelReply, AiError> {
+    // One model call: encode, read the answer, emit its events, fold the deltas into a reply — with
+    // the `chat {model}` span and the two GenAI metrics around it. The only I/O in the package.
+    async fn call(req: ModelRequest, sink: dyn EventSink): Result<ModelReply, AiError> {
         wire = self.provider.encode(req)?
         vendor = self.provider.name()
 
@@ -448,7 +715,7 @@ pub struct Agent<P: Provider> {
         }
 
         started = time.monotonic()
-        outcome: Result<ModelReply, AiError> = self.perform(wire)
+        outcome: Result<ModelReply, AiError> = self.answer(wire, sink).await
         elapsed = (time.monotonic() - started).to_float() / 1000.0
 
         mut attrs = {
@@ -479,7 +746,21 @@ pub struct Agent<P: Provider> {
 
     // The transport half of `call`, kept apart so the span above wraps exactly the request and
     // nothing else.
-    fn perform(wire: Wire): Result<ModelReply, AiError> {
+    //
+    // **This `if` is the only place in the package that knows there are two transports.** Below it
+    // both branches produce a `List<Delta>`, and everything after that — the event emission, the
+    // accumulation into a `ModelReply`, the tool loop, the telemetry — is one implementation. A bug
+    // in "these increments make that message" therefore cannot exist in only one of them.
+    async fn answer(wire: Wire, sink: dyn EventSink): Result<ModelReply, AiError> {
+        if wire.streamed() {
+            return Ok(fold(self.streamed_deltas(wire, sink).await?, ""))
+        }
+        return Ok(fold(self.buffered_deltas(wire, sink).await?, ""))
+    }
+
+    // The buffered read: one request through the `para/api` chain, one whole body, one decode. The
+    // deltas all exist at once, so all the events do too.
+    async fn buffered_deltas(wire: Wire, sink: dyn EventSink): Result<List<Delta>, AiError> {
         req: Request = self.api.prepare(wire.method, wire.url, wire.body, wire.headers)
         // `?` here is the `impl From<HttpError>` conversion: a transport failure — and only a
         // transport failure — is an `Err` out of `send`. An HTTP error *status* arrives as `Ok`.
@@ -487,53 +768,173 @@ pub struct Agent<P: Provider> {
         if !resp.ok() {
             return Err(self.provider.decode_error(resp.status(), resp.body()))
         }
-        return self.provider.decode_reply(resp.body())
+        deltas = self.provider.decode_deltas(resp.body())?
+        for e in events_of(deltas) {
+            sink.emit(e).await
+        }
+        return Ok(deltas)
+    }
+
+    // The framed read: open the body, push each frame through the provider's own decoder, and emit
+    // as the deltas arrive rather than once they all have.
+    //
+    // The read loop never leaves early. A decode failure is remembered and ends the loop, so that
+    // `close()` runs and the open block is closed on the way out whatever happened — an event
+    // stream that stops with a `TextStart` unmatched is one a renderer cannot recover from.
+    async fn streamed_deltas(wire: Wire, sink: dyn EventSink): Result<List<Delta>, AiError> {
+        req: Request = self.api.prepare(wire.method, wire.url, wire.body, wire.headers)
+        frames = self.open_frames(req, wire.ndjson()).await?
+        decoder = self.provider.decoder()
+        mut all: List<Delta> = []
+        mut open = Open {}
+        mut failure: ?AiError = none
+        mut reading = true
+        while reading {
+            arrived = frames.next().await
+            match arrived {
+                some(f) => {
+                    match decoder.push(f) {
+                        Ok(more) => {
+                            all = all ~ more
+                            open = emit_steps(open, more, sink).await
+                        },
+                        Err(e) => {
+                            failure = some(e)
+                            reading = false
+                        },
+                    }
+                },
+                none => {
+                    reading = false
+                },
+            }
+        }
+        frames.close()
+        for e in closing(open) {
+            sink.emit(e).await
+        }
+        match failure {
+            some(e) => {
+                return Err(e)
+            },
+            none => {},
+        }
+        // `finish` is where a truncated stream is caught — the frames that *did* arrive decode
+        // perfectly well, and only the missing terminator says the reply is half of one. It is also
+        // where the call's token totals come from: a vendor that splits the input and output counts
+        // across two frames has no single frame to read them off.
+        usage = decoder.finish()?
+        return Ok(all ~ [Delta.UsageDelta(usage: usage)])
+    }
+
+    // Open a streamed body, retrying a transport failure or a retryable vendor status.
+    //
+    // **The streaming path owns its retry** (DESIGN O-4). `para/api`'s `Retry` cannot cover it:
+    // retrying means calling `next` again, a second call means a second body, and a stream you have
+    // begun reading cannot be asked twice. So the backoff is here, bounded by
+    // `AgentConfig.stream_retries`, and the README states which layers cover which path rather than
+    // implying blanket coverage.
+    async fn open_frames(req: Request, ndjson: bool): Result<dyn Frames, AiError> {
+        framing = if ndjson then Framing.Ndjson else Framing.Sse
+        budget = at_least(self.config.stream_retries, 0)
+        mut attempt = 0
+        mut wait = at_least(self.config.stream_backoff_ms, 1)
+        mut last = AiError.Cancelled
+        while attempt <= budget {
+            match self.transport.open(req, framing) {
+                Ok(opened) => {
+                    return Ok(opened)
+                },
+                Err(e) => {
+                    last = e
+                },
+            }
+            if !retryable(last) {
+                return Err(last)
+            }
+            attempt = attempt + 1
+            if attempt <= budget {
+                sleep(wait).await
+                wait = wait * 2
+            }
+        }
+        return Err(last)
+    }
+
+    // Run a conversation, emitting every event into `out` as it happens.
+    //
+    // **Streams whatever `AgentConfig.stream` says.** A caller who asked for events as they happen
+    // has said what they want, and delivering them all at the end because a flag was off would be a
+    // lie about what a `Sender<Event>` means. Open the channel and `spawn` this:
+    //
+    //     (tx, rx) = channel::<Event>(16)
+    //     concurrent {
+    //         spawn render(rx)
+    //         run = agent.stream(conv, tx).await?
+    //     }
+    async fn stream(conv: Conversation, out: Sender<Event>): Result<Run, AiError> {
+        return self.drive(conv, Channel { tx: out }, true).await
     }
 
     // Run a conversation to an answer.
     //
-    // `async` because phase 3's streaming makes it genuinely so — the body will become a fold over
-    // `stream`, and a caller written today should not have to change then. In phase 1 the work
-    // inside is synchronous, because `para/api`'s transport is: `Api.send` is a blocking call, and
-    // wrapping a sync send in a future would be a lie about where the suspension points are.
+    // The same run as `stream`, with the events dropped instead of sent — one loop, one delta
+    // vocabulary, one accumulator, one emitter, and the sink as the only difference. Whether the
+    // model call is streamed follows `AgentConfig.stream`, which is off by default because the
+    // buffered transport is the one the `para/api` layers cover (DESIGN O-4).
     async fn run(conv: Conversation): Result<Run, AiError> {
-        return self.drive(conv)
+        return self.drive(conv, Silent {}, self.config.stream).await
     }
 
     // The string-in / string-out door.
     //
     // Deliberate, and the same idea as para/aether's `app.handle(method, path, body)`: a plain
     // string entry point is what makes a framework testable in a `@test` block. It stays
-    // synchronous so it is callable from anywhere, including a plain `fn`.
+    // synchronous so it is callable from anywhere, including a plain `fn` — see `drive_sync` for
+    // how a synchronous door drives an asynchronous loop without a second copy of the loop.
     fn run_sync(text: string): Result<string, AiError> {
-        run = self.drive(Conversation.of(text))?
+        run = drive_sync(self, Conversation.of(text))?
         return Ok(run.text())
     }
 
     // The run loop.
     //
-    // This is where the guard stages (phase 5) and the context strategy (phase 5) attach, and where
-    // phase 3 replaces `call` with a fold over `stream`.
-    fn drive(conv: Conversation): Result<Run, AiError> {
+    // Its shape is DESIGN §5's, with two of the steps still to come: this is where the guard stages
+    // and the context strategy attach in phase 5.
+    //
+    // A run emits **exactly one** terminal event, `RunFinished` or `RunError`, on every path out —
+    // including the failing ones. AG-UI requires it and a renderer needs it: a stream that merely
+    // stops is indistinguishable from one still thinking.
+    async fn drive(conv: Conversation, sink: dyn EventSink, streamed: bool): Result<Run, AiError> {
+        run_id = "${uuid()}"
         root = tracing.span("invoke_agent ${self.config.name}")
         root.set_attribute("gen_ai.operation.name", "invoke_agent")
         root.set_attribute("gen_ai.agent.name", self.config.name)
         root.set_attribute("gen_ai.provider.name", self.provider.name())
         root.set_attribute("gen_ai.request.model", self.config.model)
+        root.set_attribute("para.ai.run.id", run_id)
 
-        outcome: Result<Run, AiError> = self.turns(conv)
+        // The thread id is empty until phase 7: AG-UI's `RunAgentInput` is what carries one, and
+        // inventing a value here would put a made-up identifier in every consumer's event stream.
+        sink.emit(Event.RunStarted(run_id: run_id, thread_id: "")).await
+        outcome: Result<Run, AiError> = self.turns(conv, sink, streamed).await
         match outcome {
             Ok(run) => {
                 root.set_attribute("gen_ai.usage.input_tokens", run.usage.input_tokens)
                 root.set_attribute("gen_ai.usage.output_tokens", run.usage.output_tokens)
                 root.set_attribute("gen_ai.response.finish_reasons", run.stop.semconv())
                 root.set_attribute("para.ai.run.turns", run.turns)
+                root.end()
+                sink.emit(Event.RunFinished(run_id: run_id, usage: run.usage)).await
             },
             Err(e) => {
                 root.record_error("${e}")
+                root.end()
+                // A failure is a frame, not a dropped connection. `code` is the error's class, the
+                // same low-cardinality string the metrics use, so a consumer can branch on it.
+                sink.emit(Event.RunError(message: "${e}", code: error_type(e))).await
             },
         }
-        root.end()
         return outcome
     }
 
@@ -559,12 +960,12 @@ pub struct Agent<P: Provider> {
     //     agent with no toolbox, or a model naming a tool in a reply that carries no call block,
     //     hands the requested calls back in `Run.messages` — which is exactly what phase 1 did, and
     //     the only behavior that cannot spin.
-    fn turns(conv: Conversation): Result<Run, AiError> {
+    async fn turns(conv: Conversation, sink: dyn EventSink, streamed: bool): Result<Run, AiError> {
         mut so_far = conv
         mut usage = Usage {}
         mut turn = 0
         while turn < self.config.max_turns {
-            reply = self.call(self.request(so_far))?
+            reply = self.call(self.request(so_far, streamed), sink).await?
             turn = turn + 1
             usage = usage + reply.usage
             if reply.stop == StopReason.Refusal {
@@ -581,10 +982,83 @@ pub struct Agent<P: Provider> {
                 })
             }
             results = tools.dispatch(self.toolbox, calls, self.config.tool_concurrency)
+            emit_results(results, sink).await
             so_far = so_far.with(Message { role: Role.Tool, parts: results })
         }
         return Err(AiError.MaxTurns(turns: self.config.max_turns))
     }
+}
+
+// --- Driving the loop -----------------------------------------------------------------------------
+
+// Push a chunk of deltas through the emitter, returning the block state that follows them.
+//
+// The streaming path calls this once per frame and the buffered path once per body, over the same
+// `step` — which is exactly why the two produce the same event sequence for the same deltas.
+async fn emit_steps(open: Open, deltas: List<Delta>, sink: dyn EventSink): Open {
+    mut cur = open
+    for d in deltas {
+        (next, evs) = step(cur, d)
+        cur = next
+        for e in evs {
+            sink.emit(e).await
+        }
+    }
+    return cur
+}
+
+// One `ToolCallResult` per dispatched call, in call order. A non-result part cannot appear here —
+// `dispatch` is total on that — but ignoring one rather than asserting keeps this a reporting step.
+async fn emit_results(results: List<Part>, sink: dyn EventSink): void {
+    for p in results {
+        match p {
+            Part.ToolResult(id, content, is_error) => {
+                sink.emit(Event.ToolCallResult(id: id, content: content, is_error: is_error)).await
+            },
+            _ => {},
+        }
+    }
+}
+
+// One run, packaged so `map_bounded` can drive it — the same shape `tools.dispatch` uses, and for
+// the same reason: the combinator takes a plain async function, so everything the call needs
+// travels in the item.
+struct RunJob<P: Provider> {
+    agent: Agent<P>
+    conv: Conversation
+}
+
+async fn run_job<P: Provider>(j: RunJob<P>): Result<Run, AiError> {
+    return j.agent.drive(j.conv, Silent {}, j.agent.config.stream).await
+}
+
+// Drive the run loop to completion from synchronous code.
+//
+// `run_sync` is the string-in / string-out door, and it has to stay callable from a plain `fn` —
+// while the loop itself is `async`, because streaming genuinely is. `std.task.map_bounded` bridges
+// the two: it drives a list of futures to completion and hands back their results, so for a
+// one-element list it is precisely "run this future here and give me the answer". Spelling that as
+// a concurrency combinator rather than as a `block_on` is a std gap, not a design choice — and the
+// alternative was a second, synchronous copy of the run loop, which is where the bugs would live.
+fn drive_sync<P: Provider>(agent: Agent<P>, conv: Conversation): Result<Run, AiError> {
+    return map_bounded([RunJob { agent: agent, conv: conv }], 1, run_job)[0]
+}
+
+// Which failures a streamed call tries again.
+//
+// Deliberately narrow: a transport failure, and the vendor statuses that mean "later", not "never".
+// A 400 retried is a 400 twice, and a 401 retried is a wasted second of someone's rate limit.
+fn retryable(e: AiError): bool {
+    return match e {
+        AiError.Transport(inner) => true,
+        AiError.Provider(status, code, message) => status == 429 || status == 500 || status == 502
+            || status == 503 || status == 504 || status == 529,
+        _ => false,
+    }
+}
+
+fn at_least(n: int, floor: int): int {
+    return if n < floor then floor else n
 }
 
 // The `ToolCall` parts of an assistant turn, in order.

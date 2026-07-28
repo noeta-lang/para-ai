@@ -27,17 +27,24 @@
 namespace para.ai.provider
 
 use std.json
+use std.http.{Frame}
 use para.ai.{Message, Part, AiError}
 use para.ai.tools.{ToolSpec}
 
 // --- The wire ------------------------------------------------------------------------------------
 
-// How a streaming response body is cut into frames. `Whole` is the non-streaming case — read the
-// body in one piece — and is the only framing phase 1 produces.
+// How a response body is read. `Whole` is the non-streaming case — read the body in one piece,
+// through the `para/api` chain — and is what a request that did not ask to be streamed produces.
 //
 // One enum rather than an SSE reader with newline-delimited JSON bolted on later, because Ollama's
 // native endpoint is NDJSON while OpenAI-compatible endpoints are SSE: both are "read the body
 // incrementally and cut it into frames", and only the cut differs.
+//
+// This is deliberately **not** `std.http.Framing`. std's enum is the argument to `client.stream`,
+// which is only ever called on a body that *is* streamed, so it has no "don't stream" member — and
+// a codec needs exactly one more case than that to say which of the two transports its `Wire`
+// wants. `Wire.streamed()` and `Wire.ndjson()` are how the run loop reads the difference back
+// without either module having to name both enums (they share a spelling; see AGENTS.md).
 @derive(Equatable, Display)
 pub enum Framing {
     Whole
@@ -58,6 +65,35 @@ pub struct Wire {
     pub headers: Map<string, string> = {}
     pub body: string = ""
     pub framing: Framing = Framing.Whole
+
+    // Whether this request's body has to be read incrementally. The run loop's one branch point:
+    // `false` goes through the `para/api` chain and `decode_deltas`, `true` through
+    // `client.stream` and a `StreamDecoder`. Everything after the deltas is the same code either
+    // way.
+    fn streamed(): bool {
+        return self.framing != Framing.Whole
+    }
+
+    // Whether the stream is newline-delimited JSON rather than server-sent events. Two booleans
+    // rather than a `Framing` → `std.http.Framing` mapping because the two enums share a name, and
+    // a module that named both would have to qualify one of them — which the VM cannot currently
+    // compile (AGENTS.md). The run loop turns this back into `std.http.Framing` at the one place it
+    // calls `client.stream`.
+    fn ndjson(): bool {
+        return self.framing == Framing.Ndjson
+    }
+
+    // The same request, read as a stream. Two constructors rather than a settable field, so that a
+    // codec whose module already names `std.http.Framing` — which every codec that touches frames
+    // does — never has to name this enum too. They share a spelling, and a module that named both
+    // would have to qualify one, which the VM cannot currently compile (AGENTS.md).
+    fn as_sse(): Wire {
+        return Wire { ...self, framing: Framing.Sse }
+    }
+
+    fn as_ndjson(): Wire {
+        return Wire { ...self, framing: Framing.Ndjson }
+    }
 }
 
 // --- The neutral request -------------------------------------------------------------------------
@@ -80,6 +116,11 @@ pub struct ModelRequest {
     pub temperature: ?float = none
     pub stop: List<string> = []
     pub extra: Map<string, string> = {}
+    // Ask the vendor to stream the answer. A codec that honors it sets the vendor's streaming knob
+    // (Anthropic: `"stream": true`) **and** a non-`Whole` `Wire.framing`; the run loop reads the
+    // framing, not this flag, so a codec with no streaming endpoint simply ignores it and still
+    // produces a correct request.
+    pub stream: bool = false
 }
 
 // --- The neutral reply ---------------------------------------------------------------------------
@@ -154,15 +195,21 @@ pub struct ModelReply {
 // A `Delta` is one neutral increment of an assistant turn. Every codec produces deltas and
 // `fold` turns them into a `ModelReply`, so the accumulate-into-parts logic exists **once**.
 //
-// Phase 1 has no streaming, but it still goes through this path: a non-streaming `decode_reply`
-// emits one delta per content block and folds them. That is deliberate — when phase 3 adds
-// `StreamDecoder`, streaming and non-streaming share the accumulator rather than growing a second
-// copy of it that can disagree.
+// **Both transports produce deltas, and nothing downstream of them knows which one ran.** A
+// buffered reply goes through `Provider.decode_deltas`, a streamed one through
+// `Provider.decoder()`, and from there the event stream (`para.ai.events_of`) and the accumulator
+// (`fold`) are the same code. That is the whole point: a bug in "these increments make that
+// message" cannot exist in only one of the two paths, because there is only one of it.
 //
 // `id` groups deltas belonging to one block. Every vendor emits a block's deltas contiguously
 // (Anthropic's indexed `content_block_start`/`_delta`/`_stop`, OpenAI's `choices[].delta`,
 // Google's partial `candidates`), so `fold` extends the trailing block when the id matches and
 // opens a new one otherwise.
+//
+// `ModelDelta` is what makes a delta list a **complete** description of a reply rather than most of
+// one. Anthropic names the served model in `message_start`, so the streaming path has to carry it
+// somewhere; putting it in the vocabulary rather than on the decoder means the buffered path can
+// emit it too and `StreamDecoder` stays the two methods DESIGN §2.1 specifies.
 @derive(Equatable, Display)
 pub enum Delta {
     TextDelta(id: string, text: string)
@@ -172,6 +219,7 @@ pub enum Delta {
     ToolCallArgs(id: string, fragment: string)
     Stop(reason: StopReason)
     UsageDelta(usage: Usage)
+    ModelDelta(model: string)
 }
 
 // One accumulating block. Private: it is the fold's working state, never a boundary type.
@@ -225,12 +273,14 @@ fn append_b(blocks: List<Block>, at: int, text: string): List<Block> {
 // Accumulate a delta stream into a `ModelReply`. Pure, total, and the single place where "these
 // increments make that message" is decided.
 //
-// A `Stop` or `UsageDelta` may arrive at any point; the last one of each wins, which is what every
-// vendor's protocol means by them.
+// A `Stop`, `UsageDelta`, or `ModelDelta` may arrive at any point; the last one of each wins, which
+// is what every vendor's protocol means by them. `model` is the **fallback** the reply carries when
+// the stream named no model of its own.
 pub fn fold(deltas: List<Delta>, model: string): ModelReply {
     mut blocks: List<Block> = []
     mut usage = Usage {}
     mut stop = StopReason.EndTurn
+    mut served = model
     for d in deltas {
         match d {
             Delta.TextDelta(text_id, text) => {
@@ -259,6 +309,9 @@ pub fn fold(deltas: List<Delta>, model: string): ModelReply {
             Delta.UsageDelta(u) => {
                 usage = u
             },
+            Delta.ModelDelta(name) => {
+                served = name
+            },
         }
     }
     mut parts: List<Part> = []
@@ -271,7 +324,37 @@ pub fn fold(deltas: List<Delta>, model: string): ModelReply {
             parts = parts ~ [Part.ToolCall(id: b.id, name: b.a, args: b.b)]
         }
     }
-    return ModelReply { parts: parts, usage: usage, stop: stop, model: model }
+    return ModelReply { parts: parts, usage: usage, stop: stop, model: served }
+}
+
+// --- Streaming ------------------------------------------------------------------------------------
+
+// A vendor's streaming protocol, turned into neutral deltas one frame at a time.
+//
+// **Stateful, and a fresh object per request.** Every vendor's streaming protocol is: Anthropic's
+// frames are indexed (`content_block_start` opens block 3, later `content_block_delta`s only say
+// "3"), OpenAI accumulates `choices[].delta`, Google sends partial `candidates`. A decoder lives
+// inside the run loop's task for exactly one call and never crosses a boundary, so it is a `class`
+// where everything else in this package is a value.
+//
+// Two methods, and `finish` is not a formality:
+//
+//   * **`push` may fail.** A frame the vendor's own protocol calls an error (`event: error` mid
+//     stream), or a content block nobody modeled, ends the call rather than being skipped — the
+//     same rule `decode_reply` follows for a whole body.
+//   * **`finish` is where truncation is caught.** A stream that stops early is a *complete-looking*
+//     partial answer, which is the worst failure this package can have; a decoder that saw no
+//     terminal frame says so here instead of handing back half a reply. It returns the call's total
+//     usage because the totals are the decoder's own running state — a vendor that splits input and
+//     output tokens across two frames has no single frame to read them off.
+pub trait StreamDecoder {
+    // One frame in, the neutral increments it means. An empty list is a normal answer: keepalives,
+    // pings, and block boundaries carry no content.
+    fn push(frame: Frame): Result<List<Delta>, AiError>
+
+    // The stream ended. `Ok(usage)` if it ended where the protocol says it should, `Err` if it
+    // stopped short.
+    fn finish(): Result<Usage, AiError>
 }
 
 // --- The trait ------------------------------------------------------------------------------------
@@ -289,7 +372,13 @@ pub fn fold(deltas: List<Delta>, model: string): ModelReply {
 //     failure, and the error body's shape is vendor-specific — so turning `429 {"error":{"type":
 //     "rate_limit_error",…}}` into `AiError.Provider(429, "rate_limit_error", …)` is codec work.
 //
-// `decoder(): dyn StreamDecoder` joins the trait in phase 3, when streaming lands.
+// A third joined in phase 3, and it is the one that keeps the two transports honest:
+//
+//   * **`decode_deltas` is the buffered decode, and `decode_reply` is a fold over it.** The
+//     streaming path has to produce deltas — that is what a `StreamDecoder` is — so if the buffered
+//     path produced a `ModelReply` directly, the two would accumulate separately and could
+//     disagree. Making the buffered door speak the same vocabulary means the event stream and the
+//     accumulator below it are literally the same code for both.
 pub trait Provider {
     // The vendor's stable identity — `"anthropic"`, `"openai"`, `"mock"`. Used as
     // `gen_ai.provider.name` on every span and metric, so it must be low-cardinality and stable.
@@ -298,8 +387,20 @@ pub trait Provider {
     // Neutral request in, request description out. Rejects a part the vendor cannot express.
     fn encode(req: ModelRequest): Result<Wire, AiError>
 
-    // A 2xx response body in, neutral reply out.
+    // A whole 2xx response body in, the neutral increments it means out.
+    //
+    // The same vocabulary a `StreamDecoder` produces, so the run loop's event emission and
+    // accumulation do not care which transport ran.
+    fn decode_deltas(body: string): Result<List<Delta>, AiError>
+
+    // A 2xx response body in, neutral reply out. Every implementation is
+    // `Ok(fold(self.decode_deltas(body)?, ""))` — kept on the trait because it is the shape a
+    // caller wants and the shape the codec fixture tables assert on, not because it is a second
+    // decode.
     fn decode_reply(body: string): Result<ModelReply, AiError>
+
+    // A fresh, stateful decoder for one streamed request.
+    fn decoder(): dyn StreamDecoder
 
     // A non-2xx response body in, a typed `AiError.Provider` out. Never `Ok` — a non-2xx status is
     // always an error to the caller, it is only its *shape* that is vendor-specific.
@@ -381,6 +482,27 @@ pub fn obj_at(obj: Map<string, dyn>, key: string): Map<string, dyn> {
 pub fn list_at(obj: Map<string, dyn>, key: string): List<dyn> {
     empty: List<dyn> = []
     return (obj.get(key) ?? empty).as<List<dyn>>() ?? empty
+}
+
+// Fold a later usage report into a running total, field by field, **keeping what the later report
+// does not mention**.
+//
+// Streaming protocols split token accounting across frames: Anthropic sends the input count in
+// `message_start` and the output count in `message_delta`, each carrying only its own field. A
+// plain "last one wins" would zero the input count the moment the output count arrived. Zero is
+// therefore read as "not reported here" rather than as "none", which is the honest reading — a
+// vendor that genuinely served zero input tokens does not exist.
+pub fn merge_usage(base: Usage, fresh: Usage): Usage {
+    return Usage {
+        input_tokens: newer(base.input_tokens, fresh.input_tokens),
+        output_tokens: newer(base.output_tokens, fresh.output_tokens),
+        cached_input_tokens: newer(base.cached_input_tokens, fresh.cached_input_tokens),
+        reasoning_tokens: newer(base.reasoning_tokens, fresh.reasoning_tokens),
+    }
+}
+
+fn newer(base: int, fresh: int): int {
+    return if fresh == 0 then base else fresh
 }
 
 // The standard base64 alphabet (RFC 4648 §4).
@@ -537,6 +659,41 @@ pub fn rough_token_estimate(msgs: List<Message>): int {
         assert(reply.usage == Usage { input_tokens: 9, output_tokens: 4 })
         assert(reply.stop == StopReason.MaxTokens)
         assert(reply.model == "m-1")
+    }
+
+    // The served model rides in the delta stream, so a delta list fully describes a reply and the
+    // streaming path needs no side channel for it. The `model` argument is the fallback.
+    fn fold_takes_the_served_model_from_the_stream(): void {
+        reply = fold([
+            Delta.ModelDelta(model: "claude-opus-5"),
+            Delta.TextDelta(id: "0", text: "hi"),
+        ], "asked-for")
+        assert(reply.model == "claude-opus-5")
+        assert(fold([Delta.TextDelta(id: "0", text: "hi")], "asked-for").model == "asked-for",
+            "with no ModelDelta the fallback stands")
+    }
+
+    // A streamed call reports input tokens in one frame and output tokens in another, each naming
+    // only its own field. Last-one-wins would zero the input count; merging keeps it.
+    fn usage_merges_field_wise_keeping_what_is_not_reported(): void {
+        start = merge_usage(Usage {}, Usage { input_tokens: 472, cached_input_tokens: 100 })
+        finished = merge_usage(start, Usage { output_tokens: 89 })
+        assert(finished == Usage { input_tokens: 472, output_tokens: 89, cached_input_tokens: 100 },
+            "${finished}")
+    }
+
+    // --- The two transports --------------------------------------------------------------------
+
+    fn a_wire_says_which_transport_it_wants(): void {
+        assert(!Wire { url: "u" }.streamed(), "a whole body is the default")
+        assert(Wire { url: "u", framing: Framing.Sse }.streamed())
+        assert(Wire { url: "u", framing: Framing.Ndjson }.streamed())
+    }
+
+    fn a_wire_says_which_cut_a_streamed_body_takes(): void {
+        assert(!Wire { url: "u", framing: Framing.Sse }.ndjson())
+        assert(Wire { url: "u", framing: Framing.Ndjson }.ndjson())
+        assert(!Wire { url: "u" }.ndjson(), "a whole body has no cut at all")
     }
 
     fn folding_nothing_is_an_empty_end_turn(): void {
