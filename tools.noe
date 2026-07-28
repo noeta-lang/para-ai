@@ -1010,49 +1010,19 @@ pub fn dispatch(box: Toolbox, calls: List<Part>, concurrency: int): List<Part> {
     return map_bounded(jobs, at_least_one(concurrency), execute)
 }
 
-// --- The package's own tools, for its own tests -------------------------------------------------
-//
-// These are `#[Tool]` functions in this package, which means `attributes_of::<Tool>()` finds them
-// from anywhere in the program — including from a consumer's suite. That is the closed-world
-// reflection the whole design rides on, demonstrated on itself.
-
-#[Tool(about: "Echo a string back, uppercased")]
-fn shout(#[Arg(help: "The text to shout")] text: string): string {
-    return text.upper()
-}
-
-#[Tool(about: "Add two integers", name: "add")]
-fn add_ints(
-    #[Arg(help: "The left operand")] a: int,
-    #[Arg(help: "The right operand")] b: int = 1,
-): Result<int, string> {
-    if a > 1000000 {
-        return Err("`a` is unreasonably large")
-    }
-    return Ok(a + b)
-}
-
-#[Tool(about: "Every declared parameter shape that has a schema")]
-fn shapes(
-    flag: bool,
-    ratio: float,
-    tags: List<string>,
-    uniq: Set<int>,
-    lookup: Map<string, int>,
-    maybe: ?string,
-    anything: dyn,
-    either: int|string,
-): string {
-    return "${flag}/${ratio}/${tags.len()}/${uniq.len()}/${lookup.len()}/${maybe ?? "-"}/${anything}/${either}"
-}
-
 // --- The shapes that have no schema, as real declarations ---------------------------------------
 //
 // Deliberately **not** `#[Tool]`: they exist so the refusal path is exercised against genuinely
 // declared signatures — what `params_of` actually reports — rather than against `Type` values
-// assembled by hand. That is the stricter test, and it is also the only one available: the prelude
-// `Type` enum cannot be constructed in expression position today (`Type.Unit` type-checks and then
-// aborts at runtime with E0005), so a synthesized-`Type` test could not run at all.
+// assembled by hand. That is the stricter test: a hand-built `Type` asserts what this module
+// believes a signature means, where a real declaration asserts what the checker says it means.
+//
+// They stay at **module level**, unlike the `#[Tool]` fixtures in the `@test` block below, and the
+// difference is load-bearing rather than an oversight. A declaration lifted out of a dev tier is
+// keyed by its **bare** name, where a module-level one is keyed `para.ai.tools.<name>` — so these
+// are what keep `schema_of` and `params_of` under test against a *qualified* reflection key, which
+// is the shape every tool in a namespaced consumer module has. Nothing here is `#[Tool]`, so none
+// of it is reachable by a model, which is the property the tier exists to protect.
 
 fn refuses_bytes(blob: bytes): void {
     return
@@ -1115,6 +1085,61 @@ fn types_probe(
 }
 
 @test {
+    // --- The package's own tools, for its own tests ----------------------------------------------
+    //
+    // These live **inside the dev tier**, and that is a correctness requirement rather than tidiness.
+    // `attributes_of::<Tool>()` is whole-program: a `#[Tool]` declared at module level in library
+    // code is discovered from every consuming application, and `Local` would offer it to that
+    // application's model. `Tool` is `@role(Semantic.TrustBoundary)` precisely because a tool is
+    // reachable by a model, so a library shipping its own fixtures across that boundary is a
+    // security defect, not a test-fixture nuisance. A `@test` block is stripped before lowering on
+    // any build that is not `noeta test`, so these three exist only while this file's own suite runs.
+    //
+    // `#[std.test.Skip]` is what makes a *parameterized* fixture possible: every `fn` in a top-level
+    // `@test` block is a test root, and the runner would otherwise try to call `shout()` with no
+    // argument and fail it. Skipped means "never run as a test" and nothing more — the function is
+    // still compiled, still discovered by `attributes_of`, still carries its role, and is still
+    // dispatchable through `invoke`, which is exactly what a fixture needs. The attribute is
+    // qualified inline rather than imported: a top-level `use std.test.{Skip}` would put a
+    // dev-only import in the module's shipping surface, and a `use` *inside* the block is silently
+    // ineffective (AGENTS.md).
+    //
+    // One consequence to know when reading the tests below: a declaration lifted out of a tier
+    // block is keyed by its **bare** name (`shout`), not `para.ai.tools.shout`.
+
+    #[std.test.Skip("a tool fixture for this module's suite, not a test")]
+    #[Tool(about: "Echo a string back, uppercased")]
+    fn shout(#[Arg(help: "The text to shout")] text: string): string {
+        return text.upper()
+    }
+
+    #[std.test.Skip("a tool fixture for this module's suite, not a test")]
+    #[Tool(about: "Add two integers", name: "add")]
+    fn add_ints(
+        #[Arg(help: "The left operand")] a: int,
+        #[Arg(help: "The right operand")] b: int = 1,
+    ): Result<int, string> {
+        if a > 1000000 {
+            return Err("`a` is unreasonably large")
+        }
+        return Ok(a + b)
+    }
+
+    #[std.test.Skip("a tool fixture for this module's suite, not a test")]
+    #[Tool(about: "Every declared parameter shape that has a schema")]
+    fn shapes(
+        flag: bool,
+        ratio: float,
+        tags: List<string>,
+        uniq: Set<int>,
+        lookup: Map<string, int>,
+        maybe: ?string,
+        anything: dyn,
+        either: int|string,
+    ): string {
+        return "${flag}/${ratio}/${tags.len()}/${uniq.len()}/${lookup.len()}/${maybe ?? "-"}/${anything}/${either}"
+    }
+
     // --- Discovery and the trust-boundary role ---------------------------------------------------
 
     fn the_tool_attribute_finds_the_functions_it_annotates(): void {
@@ -1125,29 +1150,50 @@ fn types_probe(
         assert(!seen.contains("add_ints"), "the override replaces the function name: ${seen}")
     }
 
+    // The model-facing name is a reflection key's last segment, and a key is qualified — so a
+    // consumer's `#[Tool] fn weather` inside `namespace app.tools` is offered as `weather`, not as
+    // `app.tools.weather`, which no vendor's name grammar accepts. Asserted directly on the three
+    // helpers rather than only through the fixtures above: this module's own fixtures live in the
+    // dev tier and so carry *bare* keys, and a bare key makes `last_segment` an identity function
+    // that would pass whether or not it stripped anything.
+    fn a_qualified_reflection_key_shortens_to_its_last_segment(): void {
+        assert(last_segment("app.tools.weather") == "weather")
+        assert(last_segment("weather") == "weather")
+        assert(owner_of("app.tools.weather") == "app.tools")
+        assert(owner_of("weather") == "")
+    }
+
+    // What separates a method from a namespaced free function is not the dots — both have them —
+    // but whether the key minus its last segment names a declared type.
+    fn a_method_key_is_told_from_a_namespaced_function_key(): void {
+        assert(is_method_target(local_target("Toolbox.call")), "a real method on a real type")
+        assert(!is_method_target(local_target("refuses_bytes")), "a namespaced free function")
+        assert(!is_method_target("shout"), "a bare key has no owner at all")
+    }
+
     // The line that makes "what can a model reach in this program?" a query rather than a code
     // review. Asserted rather than merely written: an annotation that confers no role is a comment.
     //
-    // The role is matched, not compared with `==`: the prelude `Semantic` enum has no expression
-    // form today (`Semantic.TrustBoundary` type-checks and aborts at runtime), so a pattern is the
-    // only spelling that works. See AGENTS.md.
+    // Written as `==` against a constructed `Semantic.TrustBoundary`. That spelling used to be
+    // impossible — the prelude enums had no expression form and aborted at runtime with E0005, so
+    // this had to be a `match` pattern — and it now works, which is worth asserting here rather
+    // than only in a comment.
     fn every_tool_is_tagged_a_trust_boundary(): void {
         mut tagged: List<string> = []
         for r in roles_of::<Semantic>() {
-            match r.role {
-                Semantic.TrustBoundary => {
-                    tagged = tagged ~ [r.target]
-                },
-                _ => {},
+            if r.role == Semantic.TrustBoundary {
+                tagged = tagged ~ [r.target]
             }
         }
-        // Targets are the **qualified** reflection keys, which is also what `params_of`/`invoke`
-        // take — a namespaced module's own free function is `para.ai.tools.shout`.
-        assert(tagged.contains(local_target("shout")), "roles_of::<Semantic>() sees the tools: ${tagged}")
-        assert(tagged.contains(local_target("add_ints")), "the role rides the target, not the model-facing name: ${tagged}")
-        assert(tagged.contains(local_target("shapes")), "${tagged}")
+        // A dev-tier declaration is keyed by its bare name; a module-level one by the **qualified**
+        // reflection key `params_of`/`invoke` take (`para.ai.tools.refuses_bytes`). Both shapes are
+        // asserted here, which is the whole reason the refusal probes stayed at module level.
+        assert(tagged.contains("shout"), "roles_of::<Semantic>() sees the tools: ${tagged}")
+        assert(tagged.contains("add_ints"), "the role rides the target, not the model-facing name: ${tagged}")
+        assert(tagged.contains("shapes"), "${tagged}")
         // And nothing else in this module is a trust boundary.
         assert(!tagged.contains(local_target("refuses_bytes")), "${tagged}")
+        assert(!tagged.contains("refuses_bytes"), "${tagged}")
     }
 
     // --- Schema derivation -----------------------------------------------------------------------
@@ -1155,7 +1201,7 @@ fn types_probe(
     // The exact bytes a known signature produces. `json.stringify` sorts keys, so this is stable —
     // and an exact-string assertion is the only kind that catches a schema silently changing shape.
     fn a_signature_derives_exactly_this_json_schema(): void {
-        derived = schema_or_fail(local_target("add_ints"))
+        derived = schema_or_fail("add_ints")
         assert(derived
             == "{\"additionalProperties\":false,\"properties\":{\"a\":{\"description\":\"The left operand\",\"type\":\"integer\"},\"b\":{\"description\":\"The right operand\",\"type\":\"integer\"}},\"required\":[\"a\"],\"type\":\"object\"}",
             derived)
@@ -1164,18 +1210,18 @@ fn types_probe(
     // `#[Arg(help)]` is the parameter's `description`, which is where a model learns what a bare
     // `string` is for.
     fn arg_help_becomes_the_parameters_description(): void {
-        s = schema_or_fail(local_target("shout"))
+        s = schema_or_fail("shout")
         assert(s.contains("\"description\":\"The text to shout\""), s)
     }
 
     // A defaulted parameter is absent from `required`; a mandatory one is in it.
     fn a_default_makes_a_parameter_optional(): void {
-        s = schema_or_fail(local_target("add_ints"))
+        s = schema_or_fail("add_ints")
         assert(s.contains("\"required\":[\"a\"]"), s)
     }
 
     fn every_supported_type_derives_its_schema(): void {
-        s = schema_or_fail(local_target("shapes"))
+        s = schema_or_fail("shapes")
         assert(s.contains("\"flag\":{\"type\":\"boolean\"}"), s)
         assert(s.contains("\"ratio\":{\"type\":\"number\"}"), s)
         assert(s.contains("\"tags\":{\"items\":{\"type\":\"string\"},\"type\":\"array\"}"), s)
@@ -1397,8 +1443,13 @@ fn types_probe(
 // Unwrap-or-fail, kept out of the `@test` block because a `match` arm cannot both fail an assertion
 // and produce a value — so the unwrapping lives here instead of being repeated per test.
 
-// A reflection key for a function declared in this module. Reflection keys are **qualified**, so a
-// namespaced module's own `shout` is keyed `para.ai.tools.shout` and nothing finds a bare `shout`.
+// A reflection key for a function declared at **module level** in this module. Reflection keys are
+// qualified, so a namespaced module's own `refuses_bytes` is keyed `para.ai.tools.refuses_bytes` and
+// nothing finds a bare `refuses_bytes`.
+//
+// Not for the `#[Tool]` fixtures in the `@test` block: a declaration lifted out of a dev tier is
+// keyed by its bare name, because the namespace qualifier is applied to a module's top-level
+// declarations before the tier block is inlined. Those are addressed as `"shout"` and friends.
 fn local_target(name: string): string {
     return "para.ai.tools." ~ name
 }

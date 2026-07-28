@@ -7,7 +7,7 @@ version = "0.1.0"
 source = "path"
 path = "../.."
 edition = "2026"
-hash = "03ab7d683abb321102bda2f110bf083d54237af10d2c9bb580c91d54ff6a3862"
+hash = "593dd18e4fbfd25a1494d81f93e67cb12ca7f2ff43681bdff1b859765fb09fec"
 
 [[package]]
 name = "para/api"
