@@ -21,10 +21,18 @@
 //     there, and it still sees them.
 //   * `params_of(target)`       — each parameter's name, declared `Type`, whether it is `optional`
 //     (it declared a default), and its own `#[Arg(...)]` metadata. That is the JSON Schema.
-//   * `field_specs_of(name)`    — used only to tell a struct-typed parameter from an enum-typed one
-//     so the two get different, accurate rejections.
+//   * `field_specs_of(name)` / `variants_of(name)` — the declaration-side pair, asked **together**.
+//     A struct-typed parameter expands into a nested object schema and is built back with
+//     `construct`; an enum is told apart from a field-less struct by the second query, which is the
+//     only thing that can tell them apart at all.
 //   * `invoke(target, args)`    — call it by name. It returns `Result<dyn, dyn>` and **never aborts
 //     on a resolution failure**, which is what makes a bad tool call a turn instead of an outage.
+//
+// **The `Type` → JSON Schema walk here is the package's only one.** Structured output (DESIGN §8)
+// asks of a struct's *fields* exactly what a tool asks of a callable's *parameters*, so `Output.of`
+// below shares this derivation rather than growing a second copy that would drift apart from it.
+// `schema_of` is the callable door, `Output.of` the type door, and `json_schema` is the one total
+// function underneath both.
 //
 // **Tools are a trust boundary, and the package says so.** `Tool` carries
 // `@role(Semantic.TrustBoundary)`, which turns "which functions in this program can a language
@@ -86,6 +94,50 @@ pub struct ToolSpec {
     pub name: string
     pub description: string = ""
     pub parameters: string
+}
+
+// The shape a structured reply must take — `ToolSpec`'s twin, and deliberately the same three
+// fields, because a vendor asks the same question of both. Anthropic literally makes it a tool.
+//
+// It lives beside `ToolSpec` rather than in `para.ai` because the derivation lives here: DESIGN §8.5
+// is emphatic that structured output needs no schema machinery of its own, only the same
+// `field_specs_of` walk §6's parameters already take. One walk, two doors.
+//
+//     out = Output.of(type_name::<Extraction>())?
+//     e   = extract::<Extraction>(agent, conv, out)?
+//
+// `target` is the **qualified** reflection identity (`app.review.Extraction`), which is what
+// `field_specs_of(name)` keys on. `name` is the model-facing one — the last segment, because every
+// vendor constrains a schema or tool name to `[A-Za-z0-9_-]`, which a dotted path is not.
+@derive(Equatable, Display)
+pub struct Output {
+    pub name: string
+    pub target: string
+    pub schema: string
+    pub description: string = ""
+
+    // The schema for a declared type, derived from its fields, recursively.
+    //
+    // Fallible for the same reason `ToolSource.specs` is: a field whose declared type has no JSON
+    // representation is a bug in the *type*, and answering with a half-schema would let a vendor
+    // enforce a shape that decodes into nothing.
+    fn of(target: string): Result<Output, AiError> {
+        return Output.described(target, "")
+    }
+
+    // The same, with a description the model reads — the structured-output counterpart of
+    // `#[Tool(about: …)]`, and worth writing for the same reason.
+    fn described(target: string, about: string): Result<Output, AiError> {
+        return match schema_for(target) {
+            Ok(text) => Ok(Output {
+                name: last_segment(target),
+                target: target,
+                schema: text,
+                description: about,
+            }),
+            Err(e) => Err(AiError.Tool(name: last_segment(target), message: "`${target}` has no output schema: ${e}")),
+        }
+    }
 }
 
 // --- The source seam ------------------------------------------------------------------------------
@@ -343,7 +395,29 @@ pub fn schema_of(target: string): Result<string, string> {
     return Ok(json.stringify(obj))
 }
 
+// The whole object schema for one declared **type**, as JSON text — the door `Output.of` takes,
+// where `schema_of` is the door a callable takes.
+//
+// It is the same walk. A callable's `params_of` and a type's `field_specs_of` report the same
+// name/type/optional triple, so "the parameters of `weather`" and "the fields of `Extraction`"
+// produce byte-identical schemas for the same shapes, and there is exactly one place a schema bug
+// can live. DESIGN §8.5's correction is this function: no `@schema` directive, no second
+// derivation, no instance of `T` needed anywhere.
+pub fn schema_for(target: string): Result<string, string> {
+    // Deliberately routed through the nominal walk rather than opened by hand, so the type door and
+    // a nested field of the same type agree byte for byte — including the refusals.
+    return Ok(json.stringify(nominal_schema(target, [], [])?))
+}
+
 fn param_schema(p: ParamInfo): Result<Map<string, dyn>, string> {
+    // Asked *before* the schema, because a shape this module cannot build an argument for must not
+    // be described to a model at all — see `undispatchable`.
+    match undispatchable(p.type, []) {
+        some(why) => {
+            return Err(why)
+        },
+        none => {},
+    }
     mut s = json_schema(p.type)?
     help = help_of(p)
     if help != "" {
@@ -369,6 +443,16 @@ fn scalar(kind: string): Map<string, dyn> {
 
 // One declared type as a JSON Schema fragment, or the reason it has none.
 pub fn json_schema(t: Type): Result<Map<string, dyn>, string> {
+    return schema_at(t, [])
+}
+
+// The walk, carrying the chain of nominal types already being expanded.
+//
+// `seen` is what makes a self-referential declaration a refusal by name instead of a walk that
+// recurses until the stack runs out. JSON Schema spells a cycle with `$ref`, and no vendor's strict
+// structured-output mode accepts one uniformly — so emitting a `$ref` here would produce a schema
+// half the vendors reject, which is worse than saying no.
+fn schema_at(t: Type, seen: List<string>): Result<Map<string, dyn>, string> {
     return match t {
         Type.Int => Ok(scalar("integer")),
         Type.Float => Ok(scalar("number")),
@@ -379,15 +463,18 @@ pub fn json_schema(t: Type): Result<Map<string, dyn>, string> {
         Type.Dyn => Ok(any_schema()),
         // An `?T` parameter is `T`'s schema and an absence from `required`; JSON has no separate
         // "optional" shape, and a `null` argument coerces back to `none` at dispatch.
-        Type.Option(inner) => json_schema(inner),
-        Type.List(inner) => array_schema(inner, false),
-        Type.Set(inner) => array_schema(inner, true),
-        Type.Map(key, value) => map_schema(key, value),
-        Type.Union(members) => union_schema(members),
-        Type.Named(name, args) => Err(nominal_refusal(name)),
-        Type.Struct(name, args) => Err(nominal_refusal(name)),
-        Type.Class(name, args) => Err(nominal_refusal(name)),
-        Type.Enum(name, args) => Err(nominal_refusal(name)),
+        Type.Option(inner) => schema_at(inner, seen),
+        Type.List(inner) => array_schema(inner, false, seen),
+        Type.Set(inner) => array_schema(inner, true, seen),
+        Type.Map(key, value) => map_schema(key, value, seen),
+        Type.Union(members) => union_schema(members, seen),
+        // A declared struct, class, or enum. `params_of` and `field_specs_of` both report every one
+        // of them **kind-agnostically** as `Type.Named(name, [])` — which is exactly why the two
+        // reflection queries have to be asked as a pair rather than the arm being trusted.
+        Type.Named(name, args) => nominal_schema(name, args, seen),
+        Type.Struct(name, args) => nominal_schema(name, args, seen),
+        Type.Class(name, args) => nominal_schema(name, args, seen),
+        Type.Enum(name, args) => nominal_schema(name, args, seen),
         // The fixed-width numerics are a physically distinct storage slot in container position
         // (`List<i32>` is packed), and a value built from JSON is not one. Rejecting is honest;
         // handing a boxed int to a packed list is a wrong answer with no error.
@@ -408,8 +495,8 @@ fn any_schema(): Map<string, dyn> {
     return out
 }
 
-fn array_schema(inner: Type, unique: bool): Result<Map<string, dyn>, string> {
-    items = json_schema(inner)?
+fn array_schema(inner: Type, unique: bool, seen: List<string>): Result<Map<string, dyn>, string> {
+    items = schema_at(inner, seen)?
     mut out: Map<string, dyn> = {"type": "array", "items": items}
     if unique {
         out = out.set("uniqueItems", true)
@@ -417,38 +504,214 @@ fn array_schema(inner: Type, unique: bool): Result<Map<string, dyn>, string> {
     return Ok(out)
 }
 
-fn map_schema(key: Type, value: Type): Result<Map<string, dyn>, string> {
+fn map_schema(key: Type, value: Type, seen: List<string>): Result<Map<string, dyn>, string> {
     if !is_string(key) {
         return Err("a `Map` argument must be keyed by `string` — a JSON object's keys are strings")
     }
-    values = json_schema(value)?
+    values = schema_at(value, seen)?
     out: Map<string, dyn> = {"type": "object", "additionalProperties": values}
     return Ok(out)
 }
 
-fn union_schema(members: List<Type>): Result<Map<string, dyn>, string> {
+fn union_schema(members: List<Type>, seen: List<string>): Result<Map<string, dyn>, string> {
     mut branches: List<dyn> = []
     for m in members {
-        branch = json_schema(m)?
+        branch = schema_at(m, seen)?
         branches = branches ~ [branch]
     }
     out: Map<string, dyn> = {"anyOf": branches}
     return Ok(out)
 }
 
-// The two nominal refusals, told apart by whether the name has a field schema. They are different
-// gaps with different fixes, and one message for both would send half the readers the wrong way.
+// A declared type's schema, from the two declaration-side reflection queries.
 //
-//   * A **struct or class** has fields, and `field_specs_of` can see them — but a nested object
-//     schema is DESIGN §8.5's slice, which `@schema` closes, and half-deriving it here would put a
-//     second, divergent copy of that logic in the package.
-//   * An **enum** has variants, and nothing at runtime can see them: there is no `variants_of` to
-//     mirror `field_specs_of`, so the `{"enum": […]}` DESIGN §6 sketches is not derivable today.
-fn nominal_refusal(name: string): string {
-    if field_specs_of(name).len() > 0 {
-        return "`${name}` is a struct or class, and a nested-object argument schema is not derived yet (DESIGN §8.5 — `@schema` closes it); declare its fields as separate parameters"
+// **They are asked as a pair, and that is the whole point.** `field_specs_of` answers an enum with
+// the empty list — and a field-less struct with the empty list too, so through that query alone an
+// enum is *indistinguishable from an empty struct*. A walk that recursed on fields alone would emit
+// `{"type":"object","properties":{}}` for an enum and be silently wrong, which is precisely why
+// DESIGN §6 refused a nominal parameter outright until `variants_of` landed. With the pair: fields
+// present means a struct or class, variants present means an enum, and both empty is the one honest
+// "nothing is known about this name".
+fn nominal_schema(name: string, args: List<Type>, seen: List<string>): Result<Map<string, dyn>, string> {
+    if args.len() > 0 {
+        return Err("`${name}` is a generic instantiation, and reflection keys on the head name with the parameters erased — its fields would reflect in terms of `T`, which names nothing at run time; declare a concrete type")
     }
-    return "`${name}` is an enum (or a name nothing declares), and an enum's variants are not reflectable at runtime — there is no `variants_of` to mirror `field_specs_of`; declare the parameter `string` and name the accepted values in `#[Arg(help: …)]`"
+    if in_chain(seen, name) {
+        return Err("`${name}` is recursive — it reaches itself through ${chain_of(seen, name)}, and a JSON Schema for a cycle needs `$ref`, which no vendor's strict structured-output mode accepts uniformly")
+    }
+    variants = variants_of(name)
+    if variants.len() > 0 {
+        return enum_schema(name, variants)
+    }
+    fields = field_specs_of(name)
+    if fields.len() > 0 {
+        return object_schema(name, fields, seen ~ [name])
+    }
+    return Err("`${name}` declares neither fields nor variants — `field_specs_of` and `variants_of` are both empty, which is what a name nothing declares looks like, and what a field-less struct looks like too; neither has a schema worth sending")
+}
+
+// A declared struct or class as a closed JSON object schema, recursing through its fields to any
+// depth. A field that declared a default may be omitted, and so may an `?T`; everything else is
+// required — the same rule `schema_of` applies to a callable's parameters, because it is the same
+// question about the same `FieldSpec`/`ParamInfo` shape.
+fn object_schema(name: string, fields: List<FieldSpec>, seen: List<string>): Result<Map<string, dyn>, string> {
+    mut props: Map<string, dyn> = {}
+    mut required: List<dyn> = []
+    for f in fields {
+        mut one: Map<string, dyn> = {}
+        match schema_at(f.type, seen) {
+            Ok(s) => {
+                one = s
+            },
+            Err(e) => {
+                // The path is rebuilt on the way out, so a failure four levels down reads as
+                // `field \`A.b\`: field \`B.c\`: …` rather than as a bare complaint about a type.
+                return Err("field `${name}.${f.name}`: ${e}")
+            },
+        }
+        props = props.set(f.name, one)
+        if !f.optional && !is_option(f.type) {
+            required = required ~ [f.name]
+        }
+    }
+    out: Map<string, dyn> = {
+        "type": "object",
+        "properties": props,
+        "required": required,
+        "additionalProperties": false,
+    }
+    return Ok(out)
+}
+
+// A declared enum as `{"enum": […]}` — DESIGN §6 step 3's shape, derivable at last because
+// `variants_of` exists.
+//
+// A **backed** enum's wire value is its backing, not its case name: `Status.Pending = "pending"` is
+// `"pending"` in every document that carries it, and emitting `"Pending"` would describe a shape
+// nothing produces. A plain enum has no backing, so its case names *are* the values.
+//
+// A variant carrying a **payload** is refused. A data-carrying sum type has no single conventional
+// JSON Schema — a tagged union wants `oneOf` plus a discriminator, and which spelling a vendor's
+// strict mode accepts differs between them — so guessing one would describe a document this package
+// could not read back. That is the same trade every other arm here makes.
+fn enum_schema(name: string, variants: List<VariantSpec>): Result<Map<string, dyn>, string> {
+    mut values: List<dyn> = []
+    mut backings = 0
+    for v in variants {
+        if v.payload.len() > 0 {
+            return Err("`${name}.${v.name}` carries a payload, and a data-carrying enum has no single JSON Schema spelling every vendor's strict mode accepts; use a payload-free enum, or a struct with a discriminant field")
+        }
+        match v.backing {
+            some(b) => {
+                values = values ~ [b]
+                backings = backings + 1
+            },
+            none => {
+                values = values ~ [v.name]
+            },
+        }
+    }
+    // A backed enum backs every case by declaration, so one reading of the first value types the
+    // whole set. A plain enum's values are its case names, which are strings.
+    kind = if backings == 0 then "string" else scalar_kind(values[0])
+    out: Map<string, dyn> = {"type": kind, "enum": values}
+    return Ok(out)
+}
+
+fn scalar_kind(v: dyn): string {
+    return match type_of(v) {
+        Type.Int => "integer",
+        Type.Float => "number",
+        Type.Bool => "boolean",
+        _ => "string",
+    }
+}
+
+fn in_chain(seen: List<string>, name: string): bool {
+    for s in seen {
+        if s == name {
+            return true
+        }
+    }
+    return false
+}
+
+fn chain_of(seen: List<string>, name: string): string {
+    return (seen ~ [name]).join(" → ")
+}
+
+// --- What a tool argument can actually be *built* from --------------------------------------------
+//
+// `json_schema` is total and derives a real `{"enum": […]}` for a declared enum. The schema is
+// right, and `Output` uses it. **A tool parameter asks a second question**, though: an argument has
+// to be *built*, and nothing at run time can build an enum value from a name. Four doors were
+// measured against `lang` `3aabcd22` and all four are shut:
+//
+//   * `@derive(Deserialize<Json>)` on a struct with an enum-typed field is **E0050 at check time**
+//     (`type_to_recipe` returns `None` for an enum), so no such type can even be declared.
+//   * `construct(name, fields)` answers `` `X` is not a constructible struct or class ``.
+//   * `json.decode_typed(name, text)` needs the recipe the derive would have registered.
+//   * `Enum.from(case)` exists, but takes a **case name** rather than a backing value and **aborts**
+//     on an unknown one — unusable on anything that came off a wire, exactly like `json.parse`.
+//
+// So an enum-typed parameter stays refused — one layer lower than before, and for the opposite
+// reason. The old message blamed a missing `variants_of`; that primitive shipped for this phase, and
+// what is left is a recoverable runtime enum *constructor*. Deriving the schema and failing at
+// dispatch would be the worse trade: it teaches a model to send arguments the function cannot
+// accept, which is the one failure this module exists to prevent.
+//
+// A **struct** is a different answer: `construct` builds one, `coerce_struct` fills it, and the
+// nested-object schema is derived above. Struct-typed parameters therefore work end to end now.
+fn undispatchable(t: Type, seen: List<string>): ?string {
+    return match t {
+        Type.Option(inner) => undispatchable(inner, seen),
+        Type.List(inner) => undispatchable(inner, seen),
+        Type.Set(inner) => undispatchable(inner, seen),
+        Type.Map(key, value) => undispatchable(value, seen),
+        Type.Union(members) => first_undispatchable(members, seen),
+        Type.Named(name, args) => undispatchable_nominal(name, seen),
+        Type.Struct(name, args) => undispatchable_nominal(name, seen),
+        Type.Class(name, args) => undispatchable_nominal(name, seen),
+        Type.Enum(name, args) => some(enum_argument_refusal(name)),
+        _ => none,
+    }
+}
+
+fn first_undispatchable(members: List<Type>, seen: List<string>): ?string {
+    for m in members {
+        match undispatchable(m, seen) {
+            some(why) => {
+                return some(why)
+            },
+            none => {},
+        }
+    }
+    return none
+}
+
+// A nominal name is an enum exactly when `variants_of` says so — the same pair `nominal_schema`
+// asks. A struct is walked field-wise, guarded by the same chain, so an enum three levels down is
+// refused at the parameter rather than discovered at the first model call.
+fn undispatchable_nominal(name: string, seen: List<string>): ?string {
+    if in_chain(seen, name) {
+        return none
+    }
+    if variants_of(name).len() > 0 {
+        return some(enum_argument_refusal(name))
+    }
+    for f in field_specs_of(name) {
+        match undispatchable(f.type, seen ~ [name]) {
+            some(why) => {
+                return some("field `${name}.${f.name}`: ${why}")
+            },
+            none => {},
+        }
+    }
+    return none
+}
+
+fn enum_argument_refusal(name: string): string {
+    return "`${name}` is an enum, and nothing at run time can build an enum value from JSON — `construct` takes structs and classes only, `Deserialize<Json>` refuses an enum-typed field at check time, and `Enum.from` takes a case name and aborts on an unknown one. Its `{\"enum\": …}` *schema* derives fine (`variants_of` landed), so this is a missing constructor and not a missing description; declare the parameter `string` and name the accepted values in `#[Arg(help: …)]`"
 }
 
 fn is_option(t: Type): bool {
@@ -504,10 +767,91 @@ fn coerce(t: Type, v: dyn): Result<dyn, string> {
         Type.Set(inner) => coerce_set(inner, v),
         Type.Map(key, value) => coerce_map(value, v),
         Type.Union(members) => coerce_union(members, v),
-        // Unreachable by construction: every remaining variant is refused by `json_schema`, so no
+        Type.Named(name, args) => coerce_struct(name, v),
+        Type.Struct(name, args) => coerce_struct(name, v),
+        Type.Class(name, args) => coerce_struct(name, v),
+        // Unreachable by construction: every remaining variant is refused by `param_schema`, so no
         // tool carrying one ever reaches a `Toolbox`, let alone a dispatch. Loud anyway.
         _ => Err("no coercion for ${spelling(t)}"),
     }
+}
+
+// A JSON object as a declared struct or class value.
+//
+// **Every field is coerced before `construct` sees it, and that is load-bearing.** `construct`
+// validates a field's *presence* and nothing about its type: handed `{"inner": {"a": 2}}` for a
+// field declared `Inner` it stores the raw `Map` and answers `Ok`, and the wrong value survives an
+// `.as<Outer>()` narrowing to abort at the first field read with `no field \`b\` on map` — a crash
+// several layers from its cause. That is the same hole `invoke` has for arguments, and this module
+// closes it the same way: the coercion layer is the type check, and nothing reaches the builder
+// around it. Filed upstream; see AGENTS.md.
+//
+// A key no field declares is refused rather than dropped, because the derived schema says
+// `additionalProperties: false` and quietly ignoring a key the model believed it sent answers a
+// different question. An absent `?T` that declared no default is filled with `none` — `construct`
+// requires the slot even though the value is an absence.
+fn coerce_struct(name: string, v: dyn): Result<dyn, string> {
+    mut obj: Map<string, dyn> = {}
+    match v.as<Map<string, dyn>>() {
+        some(m) => {
+            obj = m
+        },
+        none => {
+            return Err("expected an object for `${name}`, got `${v}`")
+        },
+    }
+    fields = field_specs_of(name)
+    for k in obj.keys() {
+        if !has_field(fields, k) {
+            return Err("`${name}` has no field `${k}` — it takes ${field_names(fields)}")
+        }
+    }
+    mut built: Map<string, dyn> = {}
+    for f in fields {
+        match obj.get(f.name) {
+            some(raw) => {
+                match coerce(f.type, raw) {
+                    Ok(one) => {
+                        built = built.set(f.name, one)
+                    },
+                    Err(e) => {
+                        return Err("field `${name}.${f.name}`: ${e}")
+                    },
+                }
+            },
+            none => {
+                if is_option(f.type) {
+                    built = built.set(f.name, none)
+                } else if !f.optional {
+                    return Err("`${name}` requires the field `${f.name}`")
+                }
+            },
+        }
+    }
+    return match construct(name, built) {
+        Ok(value) => Ok(value),
+        Err(e) => Err("`${name}` would not build: ${e}"),
+    }
+}
+
+fn has_field(fields: List<FieldSpec>, name: string): bool {
+    for f in fields {
+        if f.name == name {
+            return true
+        }
+    }
+    return false
+}
+
+fn field_names(fields: List<FieldSpec>): string {
+    mut names: List<string> = []
+    for f in fields {
+        names = names ~ [f.name]
+    }
+    if names.len() == 0 {
+        return "no fields"
+    }
+    return names.join(", ")
 }
 
 fn coerce_int(v: dyn): Result<dyn, string> {
@@ -1052,15 +1396,74 @@ fn refuses_map_key(m: Map<int, string>): void {
     return
 }
 
-fn refuses_struct(s: ToolSpec): void {
-    return
-}
-
 fn refuses_enum(p: Part): void {
     return
 }
 
 fn refuses_nested(xs: List<bytes>): void {
+    return
+}
+
+// --- Probe declarations for the nominal walk ------------------------------------------------------
+//
+// Module level, for the same reason the refusals above are: a declaration lifted out of a `@test`
+// block is keyed by its **bare** name, and the qualified key (`para.ai.tools.Mood`) is the shape
+// every type in a namespaced consumer module actually has. None of these is `#[Tool]` and none is
+// `pub`, so nothing here is reachable by a model or nameable by a consumer — they exist to be
+// *reflected*, which needs neither.
+
+// A payload-free enum, whose case names are its wire values.
+enum Mood {
+    Positive
+    Negative
+    Mixed
+}
+
+// A **backed** enum: the schema must carry the backings, not the case names.
+enum Tier: string {
+    Free = "free"
+    Paid = "paid"
+}
+
+// A nested struct, one level down from `SchemaProbe`.
+struct Mention {
+    who: string
+    weight: float = 1.0
+}
+
+// One declared type carrying every shape the walk has to get right at once: a scalar, a nested
+// struct, an enum, a list of nested structs, an `?T`, and a defaulted field.
+struct SchemaProbe {
+    company: string
+    mood: Mood
+    tier: Tier
+    lead: Mention
+    mentions: List<Mention>
+    note: ?string
+    confidence: float = 0.5
+}
+
+// Self-referential: a cycle has no finite JSON Schema without `$ref`.
+struct Cyclic {
+    label: string
+    next: ?Cyclic
+}
+
+// A struct-typed parameter, which now derives a nested object schema and coerces back through
+// `construct`. It is a real declaration rather than a hand-built `Type` for the usual reason.
+fn takes_a_struct(m: Mention): string {
+    return "${m.who}@${m.weight}"
+}
+
+// An enum-typed parameter, still refused — at the *dispatch* layer now, because nothing at run time
+// can build an enum value from JSON even though its schema derives perfectly.
+fn takes_an_enum(m: Mood): void {
+    return
+}
+
+// An enum two levels down inside a struct, so the parameter refusal is proved to walk rather than
+// to look only at the top.
+fn takes_a_struct_hiding_an_enum(p: SchemaProbe): void {
     return
 }
 
@@ -1256,15 +1659,92 @@ fn types_probe(
         assert(refusal("refuses_nested").contains("`bytes`"), refusal("refuses_nested"))
     }
 
-    // The two nominal refusals are different gaps with different fixes, so they are different
-    // messages. `field_specs_of` is what tells them apart.
-    fn a_struct_and_an_enum_parameter_get_different_refusals(): void {
-        struct_message = refusal("refuses_struct")
-        assert(struct_message.contains("struct or class"), struct_message)
-        assert(struct_message.contains("@schema"), "it points at the slice that closes it: ${struct_message}")
-        enum_message = refusal("refuses_enum")
-        assert(enum_message.contains("variants are not reflectable"), enum_message)
-        assert(enum_message.contains("variants_of"), "it names the primitive that is missing: ${enum_message}")
+    // --- The nominal walk ------------------------------------------------------------------------
+
+    // The exact bytes a declared *type* produces, with a nested struct, a plain enum, a backed enum,
+    // a list of nested structs, an `?T` and a defaulted field all in one. Exact rather than
+    // `contains`, because this is the whole claim of DESIGN §8.5: the schema is **derived** from the
+    // declaration, and an exact assertion is the only kind that catches it silently changing shape.
+    //
+    // Read the interesting parts off it: `mood` is its case names, `tier` is its *backings* and not
+    // its case names, `lead` and `mentions` recurse into a second object schema (with `weight`
+    // absent from the inner `required` because it declared a default), `note` is present in
+    // `properties` and absent from `required`, and every object is closed.
+    fn a_declared_type_derives_exactly_this_json_schema(): void {
+        derived = type_schema_or_fail("para.ai.tools.SchemaProbe")
+        assert(derived
+            == "{\"additionalProperties\":false,\"properties\":{\"company\":{\"type\":\"string\"},\"confidence\":{\"type\":\"number\"},\"lead\":{\"additionalProperties\":false,\"properties\":{\"weight\":{\"type\":\"number\"},\"who\":{\"type\":\"string\"}},\"required\":[\"who\"],\"type\":\"object\"},\"mentions\":{\"items\":{\"additionalProperties\":false,\"properties\":{\"weight\":{\"type\":\"number\"},\"who\":{\"type\":\"string\"}},\"required\":[\"who\"],\"type\":\"object\"},\"type\":\"array\"},\"mood\":{\"enum\":[\"Positive\",\"Negative\",\"Mixed\"],\"type\":\"string\"},\"note\":{\"type\":\"string\"},\"tier\":{\"enum\":[\"free\",\"paid\"],\"type\":\"string\"}},\"required\":[\"company\",\"mood\",\"tier\",\"lead\",\"mentions\"],\"type\":\"object\"}",
+            derived)
+    }
+
+    // The two queries are asked as a pair, and this is why: through `field_specs_of` alone an enum
+    // and a field-less struct are the same answer. A schema builder that walked fields only would
+    // have emitted an empty object for `Mood` and been silently wrong.
+    fn an_enum_is_told_from_a_fieldless_struct_by_variants_of(): void {
+        assert(field_specs_of("para.ai.tools.Mood").len() == 0, "an enum has no fields")
+        assert(variants_of("para.ai.tools.Mood").len() == 3, "and three variants")
+        assert(field_specs_of("para.ai.tools.Mention").len() == 2, "a struct has fields")
+        assert(variants_of("para.ai.tools.Mention").len() == 0, "and no variants")
+    }
+
+    // A backed enum's wire value is its backing. Emitting the case names would describe a document
+    // nothing produces.
+    fn a_backed_enum_carries_its_backings_not_its_case_names(): void {
+        s = type_schema_or_fail("para.ai.tools.Tier")
+        assert(s == "{\"enum\":[\"free\",\"paid\"],\"type\":\"string\"}", s)
+    }
+
+    // A cycle is refused by name rather than walked until the stack runs out.
+    fn a_recursive_type_is_refused_naming_the_cycle(): void {
+        e = type_refusal("para.ai.tools.Cyclic")
+        assert(e.contains("is recursive"), e)
+        assert(e.contains("para.ai.tools.Cyclic → para.ai.tools.Cyclic"), "it prints the chain: ${e}")
+        assert(e.contains("$ref"), "and says what a cycle would need: ${e}")
+    }
+
+    // A name nothing declares answers both queries with nothing, which is the one honest "unknown".
+    fn a_name_nothing_declares_is_neither_a_struct_nor_an_enum(): void {
+        e = type_refusal("para.ai.tools.NoSuchType")
+        assert(e.contains("declares neither fields nor variants"), e)
+    }
+
+    // The callable door and the type door are the same walk, so a struct-typed *parameter* and a
+    // struct-typed *field* produce byte-identical fragments. One walk, one place a bug can live.
+    fn the_parameter_door_and_the_type_door_derive_the_same_bytes(): void {
+        // `local_target` because `takes_a_struct` is a module-level declaration and so is keyed
+        // `para.ai.tools.takes_a_struct`, where a fixture lifted out of this `@test` block is keyed
+        // by its bare name.
+        param = schema_or_fail(local_target("takes_a_struct"))
+        field = type_schema_or_fail("para.ai.tools.Mention")
+        assert(param.contains(field), "the parameter schema embeds the type schema verbatim: ${param} vs ${field}")
+    }
+
+    // The refusal DESIGN §6 records has changed layer and reason, and the message says so. The old
+    // one blamed a missing `variants_of`; that primitive shipped, the schema derives, and what is
+    // left is a missing runtime *constructor*.
+    fn an_enum_parameter_is_refused_for_the_constructor_not_the_schema(): void {
+        e = refusal("takes_an_enum")
+        assert(e.contains("nothing at run time can build an enum value"), e)
+        assert(e.contains("schema* derives fine"), "it says the schema is not the problem: ${e}")
+        assert(!e.contains("there is no `variants_of`"), "the primitive it used to blame has landed: ${e}")
+        // And the schema really does derive, which is what makes that claim checkable rather than
+        // an apology.
+        assert(type_schema_or_fail("para.ai.tools.Mood") == "{\"enum\":[\"Positive\",\"Negative\",\"Mixed\"],\"type\":\"string\"}")
+    }
+
+    // The parameter refusal walks: an enum buried two levels down is caught at the parameter, not
+    // discovered at the first model call.
+    fn an_enum_nested_inside_a_struct_parameter_is_caught_at_the_parameter(): void {
+        e = refusal("takes_a_struct_hiding_an_enum")
+        assert(e.contains("SchemaProbe.mood"), "it names the path to the enum: ${e}")
+        assert(e.contains("build an enum value"), e)
+    }
+
+    // A payload-carrying enum is refused by the *schema*, separately from the parameter refusal
+    // above: a data-carrying sum type has no one spelling every vendor's strict mode accepts.
+    fn a_data_carrying_enum_has_no_schema(): void {
+        e = type_refusal("para.ai.Part")
+        assert(e.contains("carries a payload"), e)
     }
 
     // The two arms of `json_schema` no *declared* signature can reach: `void` is not a parameter
@@ -1332,6 +1812,48 @@ fn types_probe(
         assert(coerced("uis", "7") == "7")
         assert(coerced("uis", "\"seven\"") == "seven")
         assert(coercion_error("uib", "{}").contains("matches no member"))
+    }
+
+    // A JSON object becomes a real struct value, with a defaulted field filled by the declaration.
+    //
+    // The `Mention {who: "ada", weight: 1.0}` rendering rather than a `{"who": …}` map rendering is
+    // the whole assertion: `construct` alone would have stored the raw map and produced a value that
+    // aborts at the first field read.
+    fn a_struct_parameter_is_built_from_its_json_object(): void {
+        target = local_target("takes_a_struct")
+        assert(coerced_param(target, "m", "{\"who\": \"ada\"}") == "Mention {who: \"ada\", weight: 1.0}",
+            coerced_param(target, "m", "{\"who\": \"ada\"}"))
+        assert(coerced_param(target, "m", "{\"who\": \"ada\", \"weight\": 2}") == "Mention {who: \"ada\", weight: 2.0}",
+            "a neighboring JSON type coerces inside a struct too")
+    }
+
+    // The closed schema is enforced on the way in, exactly as it is for a callable's arguments: a
+    // key no field declares is refused rather than dropped.
+    fn a_struct_parameter_refuses_what_its_schema_closed(): void {
+        target = local_target("takes_a_struct")
+        assert(coerced_param(target, "m", "{\"who\": \"ada\", \"nope\": 1}").contains("no field `nope`"),
+            coerced_param(target, "m", "{\"who\": \"ada\", \"nope\": 1}"))
+        assert(coerced_param(target, "m", "{}").contains("requires the field `who`"),
+            coerced_param(target, "m", "{}"))
+        assert(coerced_param(target, "m", "{\"who\": {\"a\": 1}}").contains("Mention.who"),
+            "a field failure names its path: ${coerced_param(target, "m", "{\"who\": {\"a\": 1}}")}")
+        assert(coerced_param(target, "m", "5").contains("expected an object"))
+    }
+
+    // The real dispatch, end to end: a struct-typed parameter reaches the function as a struct.
+    fn a_struct_argument_reaches_the_function_as_a_struct(): void {
+        // `takes_a_struct` is not a `#[Tool]`, so it is called through the same coercion + `invoke`
+        // pair the dispatcher uses rather than through the toolbox.
+        target = local_target("takes_a_struct")
+        built = coerce(params_of(target)[0].type, parsed("{\"who\": \"ada\", \"weight\": 3}"))
+        match built {
+            Ok(v) => {
+                assert(invoke(target, [v]) == Ok("ada@3.0"), "${invoke(target, [v])}")
+            },
+            Err(e) => {
+                assert(false, "coercion failed: ${e}")
+            },
+        }
     }
 
     // --- Dispatch ----------------------------------------------------------------------------------
@@ -1515,6 +2037,48 @@ fn schema_or_fail(target: string): string {
             assert(false, "schema failed: ${e}")
         },
     }
+    return ""
+}
+
+// The schema a declared **type** produces, or a loud failure. The type door's twin of
+// `schema_or_fail`, and it takes a fully qualified reflection identity because that is what
+// `field_specs_of(name)` keys on.
+fn type_schema_or_fail(target: string): string {
+    match schema_for(target) {
+        Ok(s) => {
+            return s
+        },
+        Err(e) => {
+            assert(false, "type schema failed for `${target}`: ${e}")
+        },
+    }
+    return ""
+}
+
+// The refusal a declared type produces, or a loud failure if it produced a schema instead.
+fn type_refusal(target: string): string {
+    match schema_for(target) {
+        Ok(s) => {
+            assert(false, "`${target}` must not derive a schema, got ${s}")
+        },
+        Err(e) => {
+            return e
+        },
+    }
+    return ""
+}
+
+// Coerce a JSON fragment to a declared type read off a real parameter, rendered for assertion.
+fn coerced_param(target: string, param: string, fragment: string): string {
+    for p in params_of(target) {
+        if p.name == param {
+            return match coerce(p.type, parsed(fragment)) {
+                Ok(c) => "${c}",
+                Err(e) => "ERR ${e}",
+            }
+        }
+    }
+    assert(false, "no parameter `${param}` on `${target}`")
     return ""
 }
 
