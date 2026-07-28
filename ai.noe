@@ -876,6 +876,17 @@ pub struct Agent<P: Provider> {
         return self.drive(conv, Channel { tx: out }, true).await
     }
 
+    // Run a conversation, handing every event to a sink of your own.
+    //
+    // The door for a consumer that does not need a channel: a CLI renderer that writes to the
+    // terminal as tokens arrive, and `para.ai.mock.Collector`, which is how asserting on a run's
+    // exact event sequence is a `@test` block with no server and no socket. Unlike `stream`, this
+    // follows `AgentConfig.stream` — a synchronous renderer over a buffered call is a legitimate
+    // thing to want, and it gets the identical events.
+    async fn run_into(conv: Conversation, sink: dyn EventSink): Result<Run, AiError> {
+        return self.drive(conv, sink, self.config.stream).await
+    }
+
     // Run a conversation to an answer.
     //
     // The same run as `stream`, with the events dropped instead of sent — one loop, one delta
