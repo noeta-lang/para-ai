@@ -1034,9 +1034,13 @@ pub class McpClient {
         return McpClient.begin(t, s, true, budget)
     }
 
-    // A client that never connected to anything, and knows it. It exists for the unreachable branch
-    // of an unwrap-or-fail test helper — a `match` arm cannot both fail an assertion and produce a
-    // value, and a `class`'s fields are private, so the fallback has to be built in here.
+    // A client that never connected to anything, and knows it: every call answers `closed` rather
+    // than reaching for a transport that is not there.
+    //
+    // It exists for the unreachable branch of an unwrap-or-fail test helper — such a helper needs
+    // *some* value after its failed assertion, because a `match` arm cannot both fail an assertion
+    // and produce one, and a `class`'s fields are private so only the class can build it. Public
+    // because a **consumer's** helper needs it too (`examples/memory` has one).
     fn unstarted(): McpClient {
         return McpClient {
             transport: Stdio.new("true", []),
