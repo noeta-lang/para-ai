@@ -313,10 +313,6 @@ pub class ScriptedFrames {
     fn was_closed(): bool {
         return self.closed
     }
-
-    fn remaining(): int {
-        return self.frames.len() - self.at
-    }
 }
 
 impl Frames for ScriptedFrames {

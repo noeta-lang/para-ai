@@ -1192,6 +1192,85 @@ fn refusal_text(reply: ModelReply): string {
         assert(tuned.tool_concurrency == 1)
     }
 
+    // Streaming is off by default and both directions are one builder call, because turning it on
+    // trades the `para/api` layers away (DESIGN O-4) and that should be a thing you wrote down.
+    fn streaming_is_opt_in_and_reversible(): void {
+        base = AgentConfig.new("m")
+        assert(!base.stream, "the covered path is the default")
+        assert(base.stream_retries == 2, "the same shape para/api's Retry defaults to")
+        assert(base.stream_backoff_ms == 500)
+        on = base.streamed().with_stream_retries(5).with_stream_backoff(20)
+        assert(!base.stream, "the original is untouched")
+        assert(on.stream)
+        assert(on.stream_retries == 5)
+        assert(on.stream_backoff_ms == 20)
+        assert(!on.buffered().stream, "and back again")
+    }
+
+    // Only the retryable statuses, and a transport failure. A 400 retried is a 400 twice.
+    fn only_a_later_not_a_never_is_retried(): void {
+        assert(retryable(AiError.Provider(status: 429, code: "rate_limit_error", message: "")))
+        assert(retryable(AiError.Provider(status: 503, code: "overloaded_error", message: "")))
+        assert(retryable(AiError.Provider(status: 529, code: "overloaded_error", message: "")))
+        assert(!retryable(AiError.Provider(status: 400, code: "invalid_request_error", message: "")))
+        assert(!retryable(AiError.Provider(status: 401, code: "authentication_error", message: "")))
+        assert(!retryable(AiError.Refused(reason: "policy")))
+        assert(!retryable(AiError.MaxTurns(turns: 8)))
+    }
+
+    // --- The event emitter ------------------------------------------------------------------------
+    //
+    // Pure, so it can be tested without a run at all — and it is the single reason a buffered run
+    // and a streamed run of the same reply produce the same events.
+
+    fn a_block_opens_once_and_closes_once(): void {
+        assert(events_of([
+            Delta.TextDelta(id: "0", text: "Hel"),
+            Delta.TextDelta(id: "0", text: "lo"),
+        ]) == [
+            Event.TextStart(id: "0"),
+            Event.TextDelta(id: "0", delta: "Hel"),
+            Event.TextDelta(id: "0", delta: "lo"),
+            Event.TextEnd(id: "0"),
+        ])
+    }
+
+    // A change of id closes the old block before opening the new one, so a consumer never has two
+    // open at once.
+    fn a_new_block_closes_the_previous_one(): void {
+        assert(events_of([
+            Delta.TextDelta(id: "0", text: "a"),
+            Delta.ToolCallStart(id: "t1", name: "weather"),
+            Delta.ToolCallArgs(id: "t1", fragment: "{}"),
+        ]) == [
+            Event.TextStart(id: "0"),
+            Event.TextDelta(id: "0", delta: "a"),
+            Event.TextEnd(id: "0"),
+            Event.ToolCallStart(id: "t1", name: "weather"),
+            Event.ToolCallArgsDelta(id: "t1", delta: "{}"),
+            Event.ToolCallEnd(id: "t1"),
+        ])
+    }
+
+    // Thinking has a delta and nothing else in the vocabulary — no start, no end — so its block
+    // opens and closes silently. The signature is state, not something a consumer renders.
+    fn thinking_has_a_delta_and_no_brackets(): void {
+        assert(events_of([
+            Delta.ThinkingDelta(id: "0", text: "hm"),
+            Delta.ThinkingSignature(id: "0", signature: "sig"),
+        ]) == [Event.ThinkingDelta(id: "0", delta: "hm")])
+    }
+
+    // The result deltas are the run's outcome rather than increments of a block, and they surface
+    // in the terminal event instead.
+    fn stop_usage_and_model_produce_no_events(): void {
+        assert(events_of([
+            Delta.ModelDelta(model: "claude-opus-5"),
+            Delta.Stop(reason: StopReason.EndTurn),
+            Delta.UsageDelta(usage: Usage { input_tokens: 1 }),
+        ]) == [])
+    }
+
     // A run that never finished is not an answer. The message names the knob rather than leaving a
     // reader to find it.
     fn exhausting_the_turn_budget_is_its_own_error(): void {

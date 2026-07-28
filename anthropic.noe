@@ -348,12 +348,9 @@ fn event_type(doc: Map<string, dyn>, frame: Frame): string {
 
 pub class AnthropicStream {
     // Block index (rendered as a string, since that is also the delta id for text and thinking) to
-    // the neutral delta id that block's increments carry.
+    // the neutral delta id that block's increments carry. The whole of the indexed protocol's
+    // state: a `content_block_delta` names only an index, and its own `type` says the rest.
     mut ids: Map<string, string>
-    // Block index to `"text"` / `"thinking"` / `"tool"`. Not read by the decoder itself — a delta's
-    // own type already routes it — but kept because a block's kind is the thing a future codec
-    // change will need and reconstructing it after the fact is impossible.
-    mut kinds: Map<string, string>
     mut usage: Usage
     mut model: string
     // Whether `message_start` and `message_stop` were seen. Both halves of `finish`'s job: a stream
@@ -364,7 +361,6 @@ pub class AnthropicStream {
     fn new(): AnthropicStream {
         return AnthropicStream {
             ids: {},
-            kinds: {},
             usage: Usage {},
             model: "",
             opened: false,
@@ -372,8 +368,7 @@ pub class AnthropicStream {
         }
     }
 
-    fn remember(at: string, kind: string, id: string): void {
-        self.kinds = self.kinds.set(at, kind)
+    fn remember(at: string, id: string): void {
         self.ids = self.ids.set(at, id)
     }
 
@@ -394,18 +389,18 @@ pub class AnthropicStream {
         block = provider.obj_at(doc, "content_block")
         kind = provider.str_at(block, "type")
         if kind == "text" {
-            self.remember(at, "text", at)
+            self.remember(at, at)
             return Ok([])
         }
         if kind == "thinking" {
-            self.remember(at, "thinking", at)
+            self.remember(at, at)
             return Ok([])
         }
         if kind == "tool_use" {
             // The vendor's own call id, not the block index — it is what a `tool_result` must
             // address, exactly as in the buffered decode.
             call_id = provider.str_at(block, "id")
-            self.remember(at, "tool", call_id)
+            self.remember(at, call_id)
             return Ok([Delta.ToolCallStart(id: call_id, name: provider.str_at(block, "name"))])
         }
         // Loud, for the same reason `decode_block` is: a block carries answer content, and dropping
