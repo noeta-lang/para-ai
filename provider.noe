@@ -1,0 +1,625 @@
+// `para.ai.provider` — the codec seam.
+//
+// **A provider is a pure codec, not a client.** The thing that varies between model vendors is the
+// wire format; auth headers, retries, timeouts, mocking, recording, and tracing are identical
+// across all of them. So a `Provider` turns a neutral `ModelRequest` into a `Wire` (a request
+// description) and a response body back into a neutral `ModelReply` — and never performs I/O. The
+// run loop in `para.ai` owns the transport, over a `para.api.Api`.
+//
+// Everything falls out of that split:
+//
+//   * **Transport is written once.** Retry with `Retry-After`, `Mock`, `Record`, `Cache`, and
+//     `Logging` come from `para/api` for free — a 429 backoff is not para/ai code.
+//   * **A provider is trivially testable.** `encode` and `decode_reply` are pure string-in /
+//     string-out functions, so a codec's whole test suite is a table of fixtures with no network
+//     and no clock. `providers/anthropic` is tested exactly that way.
+//   * **Adding a provider is pure-Noeta afternoon work** — no async, no HTTP, no telemetry to
+//     re-implement.
+//   * **The `Mock` provider is not a special case.** It is a `Provider` whose `encode` ignores the
+//     request and whose `decode_reply` returns a scripted reply.
+//
+// **`Provider` is a bound (`<P: Provider>`), never a trait object.** A bound keeps the provider
+// `Send` (codecs are value structs), dispatches statically, and types the body — a wrong argument
+// or return against a `Provider` method is a check-time error at the definition, before any call
+// site exists. It also happens to be the spelling that works: `async` trait methods are correct
+// under a bound and unsound through `dyn` today. Runtime provider selection is therefore the
+// *caller's* `match`; see the README.
+namespace para.ai.provider
+
+use std.json
+use para.ai.{Message, Part, AiError}
+
+// --- The wire ------------------------------------------------------------------------------------
+
+// How a streaming response body is cut into frames. `Whole` is the non-streaming case — read the
+// body in one piece — and is the only framing phase 1 produces.
+//
+// One enum rather than an SSE reader with newline-delimited JSON bolted on later, because Ollama's
+// native endpoint is NDJSON while OpenAI-compatible endpoints are SSE: both are "read the body
+// incrementally and cut it into frames", and only the cut differs.
+@derive(Equatable, Display)
+pub enum Framing {
+    Whole
+    Sse
+    Ndjson
+}
+
+// What a codec's `encode` produces: everything the run loop needs to perform the call, and nothing
+// about how to perform it.
+//
+// `url` is normally **absolute** — the codec knows its vendor's endpoint, and `Anthropic.at(...)`
+// is how you point one at a gateway. `std.http`'s client uses an absolute target as-is, so an
+// absolute `url` also flows through a based client unchanged.
+@derive(Equatable, Display)
+pub struct Wire {
+    pub url: string
+    pub method: string = "post"
+    pub headers: Map<string, string> = {}
+    pub body: string = ""
+    pub framing: Framing = Framing.Whole
+}
+
+// --- The neutral request -------------------------------------------------------------------------
+
+// What every provider is asked for, in vendor-neutral terms.
+//
+// `extra` exists because a neutral model that cannot express a vendor's newest knob forces a fork.
+// It is a map of **raw JSON fragments** merged into the request body by the codec, and it is
+// documented as unchecked: a malformed fragment is the caller's bug, surfaced at `encode`.
+//
+// Phase 2 adds `tools`, phase 5 adds `output` — both defaulted, so adding them breaks no caller.
+@derive(Equatable, Display)
+pub struct ModelRequest {
+    pub model: string
+    pub messages: List<Message>
+    pub max_tokens: ?int = none
+    pub temperature: ?float = none
+    pub stop: List<string> = []
+    pub extra: Map<string, string> = {}
+}
+
+// --- The neutral reply ---------------------------------------------------------------------------
+
+// Token accounting for one model call, or aggregated over a run with `+`.
+//
+// `cached_input_tokens` is the part of the input served from the vendor's prompt cache; it is a
+// *subset* of what the vendor charged for, not an addition, so `total()` does not count it twice.
+// `reasoning_tokens` is reported by the vendors that separate it out and stays `0` for those that
+// fold reasoning into `output_tokens` (Anthropic does).
+@derive(Equatable, Display)
+pub struct Usage {
+    pub input_tokens: int = 0
+    pub output_tokens: int = 0
+    pub cached_input_tokens: int = 0
+    pub reasoning_tokens: int = 0
+
+    fn total(): int {
+        return self.input_tokens + self.output_tokens
+    }
+
+    // Aggregating usage across the turns of a run is `a + b`, which is what the run loop does.
+    impl Add {
+        fn add(other: Usage): Usage {
+            return Usage {
+                input_tokens: self.input_tokens + other.input_tokens,
+                output_tokens: self.output_tokens + other.output_tokens,
+                cached_input_tokens: self.cached_input_tokens + other.cached_input_tokens,
+                reasoning_tokens: self.reasoning_tokens + other.reasoning_tokens,
+            }
+        }
+    }
+}
+
+// Why the model stopped. `Other(raw)` keeps a vendor's unrecognized reason verbatim rather than
+// flattening it to `EndTurn` — a stop reason nobody modeled yet is information, not noise.
+@derive(Equatable, Display)
+pub enum StopReason {
+    EndTurn
+    ToolUse
+    MaxTokens
+    StopSequence
+    Refusal
+    Other(raw: string)
+
+    // The `gen_ai.response.finish_reasons` spelling, which is the OTel GenAI convention's — not
+    // this enum's Noeta rendering.
+    fn semconv(): string {
+        return match self {
+            StopReason.EndTurn => "stop",
+            StopReason.ToolUse => "tool_calls",
+            StopReason.MaxTokens => "length",
+            StopReason.StopSequence => "stop_sequence",
+            StopReason.Refusal => "content_filter",
+            StopReason.Other(raw) => raw,
+        }
+    }
+}
+
+// One model call's answer, in neutral terms. `model` is the model the vendor actually served with,
+// which is not always the one that was asked for.
+@derive(Equatable, Display)
+pub struct ModelReply {
+    pub parts: List<Part>
+    pub usage: Usage = Usage {}
+    pub stop: StopReason = StopReason.EndTurn
+    pub model: string = ""
+}
+
+// --- Deltas: the incremental unit ------------------------------------------------------------------
+//
+// A `Delta` is one neutral increment of an assistant turn. Every codec produces deltas and
+// `fold` turns them into a `ModelReply`, so the accumulate-into-parts logic exists **once**.
+//
+// Phase 1 has no streaming, but it still goes through this path: a non-streaming `decode_reply`
+// emits one delta per content block and folds them. That is deliberate — when phase 3 adds
+// `StreamDecoder`, streaming and non-streaming share the accumulator rather than growing a second
+// copy of it that can disagree.
+//
+// `id` groups deltas belonging to one block. Every vendor emits a block's deltas contiguously
+// (Anthropic's indexed `content_block_start`/`_delta`/`_stop`, OpenAI's `choices[].delta`,
+// Google's partial `candidates`), so `fold` extends the trailing block when the id matches and
+// opens a new one otherwise.
+@derive(Equatable, Display)
+pub enum Delta {
+    TextDelta(id: string, text: string)
+    ThinkingDelta(id: string, text: string)
+    ThinkingSignature(id: string, signature: string)
+    ToolCallStart(id: string, name: string)
+    ToolCallArgs(id: string, fragment: string)
+    Stop(reason: StopReason)
+    UsageDelta(usage: Usage)
+}
+
+// One accumulating block. Private: it is the fold's working state, never a boundary type.
+//
+// `kind` is one of `KIND_TEXT` / `KIND_THINKING` / `KIND_TOOL`; `a` and `b` are the two string
+// slots a block needs (text/signature, or tool name/arguments). Two slots rather than a variant per
+// kind, because the fold's only job is to append to whichever slot the delta names.
+@derive(Equatable, Display)
+struct Block {
+    kind: string
+    id: string
+    a: string = ""
+    b: string = ""
+}
+
+fn kind_text(): string {
+    return "text"
+}
+
+fn kind_thinking(): string {
+    return "thinking"
+}
+
+fn kind_tool(): string {
+    return "tool"
+}
+
+// Ensure the trailing block is `(id, kind)`, opening a new one if it is not. Returns the block list
+// and the index of the block to write into.
+fn open_block(blocks: List<Block>, id: string, kind: string): (List<Block>, int) {
+    if blocks.len() > 0 {
+        tail = blocks[blocks.len() - 1]
+        if tail.id == id && tail.kind == kind {
+            return (blocks, blocks.len() - 1)
+        }
+    }
+    grown = blocks ~ [Block { kind: kind, id: id }]
+    return (grown, grown.len() - 1)
+}
+
+fn append_a(blocks: List<Block>, at: int, text: string): List<Block> {
+    b = blocks[at]
+    return blocks.set(at, Block { ...b, a: b.a ~ text })
+}
+
+fn append_b(blocks: List<Block>, at: int, text: string): List<Block> {
+    b = blocks[at]
+    return blocks.set(at, Block { ...b, b: b.b ~ text })
+}
+
+// Accumulate a delta stream into a `ModelReply`. Pure, total, and the single place where "these
+// increments make that message" is decided.
+//
+// A `Stop` or `UsageDelta` may arrive at any point; the last one of each wins, which is what every
+// vendor's protocol means by them.
+pub fn fold(deltas: List<Delta>, model: string): ModelReply {
+    mut blocks: List<Block> = []
+    mut usage = Usage {}
+    mut stop = StopReason.EndTurn
+    for d in deltas {
+        match d {
+            Delta.TextDelta(text_id, text) => {
+                (grown, at) = open_block(blocks, text_id, kind_text())
+                blocks = append_a(grown, at, text)
+            },
+            Delta.ThinkingDelta(think_id, think) => {
+                (grown, at) = open_block(blocks, think_id, kind_thinking())
+                blocks = append_a(grown, at, think)
+            },
+            Delta.ThinkingSignature(sig_id, signature) => {
+                (grown, at) = open_block(blocks, sig_id, kind_thinking())
+                blocks = append_b(grown, at, signature)
+            },
+            Delta.ToolCallStart(call_id, name) => {
+                (grown, at) = open_block(blocks, call_id, kind_tool())
+                blocks = append_a(grown, at, name)
+            },
+            Delta.ToolCallArgs(args_id, fragment) => {
+                (grown, at) = open_block(blocks, args_id, kind_tool())
+                blocks = append_b(grown, at, fragment)
+            },
+            Delta.Stop(reason) => {
+                stop = reason
+            },
+            Delta.UsageDelta(u) => {
+                usage = u
+            },
+        }
+    }
+    mut parts: List<Part> = []
+    for b in blocks {
+        if b.kind == kind_text() {
+            parts = parts ~ [Part.Text(text: b.a)]
+        } else if b.kind == kind_thinking() {
+            parts = parts ~ [Part.Thinking(text: b.a, signature: b.b)]
+        } else {
+            parts = parts ~ [Part.ToolCall(id: b.id, name: b.a, args: b.b)]
+        }
+    }
+    return ModelReply { parts: parts, usage: usage, stop: stop, model: model }
+}
+
+// --- The trait ------------------------------------------------------------------------------------
+
+// A model vendor's wire format, as a pure codec.
+//
+// Two methods are not in the design's original sketch, and both are forced by decisions elsewhere
+// in it:
+//
+//   * **`encode` returns a `Result`.** Each codec is responsible for rejecting what its vendor
+//     cannot express — loudly, at `encode`, with a message naming the part and the provider. A
+//     codec that silently drops an image is a bug we can prevent by construction, and that
+//     rejection needs somewhere to go.
+//   * **`decode_error` exists.** An HTTP error *status* from a vendor is an answer, not a transport
+//     failure, and the error body's shape is vendor-specific — so turning `429 {"error":{"type":
+//     "rate_limit_error",…}}` into `AiError.Provider(429, "rate_limit_error", …)` is codec work.
+//
+// `decoder(): dyn StreamDecoder` joins the trait in phase 3, when streaming lands.
+pub trait Provider {
+    // The vendor's stable identity — `"anthropic"`, `"openai"`, `"mock"`. Used as
+    // `gen_ai.provider.name` on every span and metric, so it must be low-cardinality and stable.
+    fn name(): string
+
+    // Neutral request in, request description out. Rejects a part the vendor cannot express.
+    fn encode(req: ModelRequest): Result<Wire, AiError>
+
+    // A 2xx response body in, neutral reply out.
+    fn decode_reply(body: string): Result<ModelReply, AiError>
+
+    // A non-2xx response body in, a typed `AiError.Provider` out. Never `Ok` — a non-2xx status is
+    // always an error to the caller, it is only its *shape* that is vendor-specific.
+    fn decode_error(status: int, body: string): AiError
+
+    // A local token estimate, or `none` when the provider has no local tokenizer.
+    //
+    // `none` is a real answer, and the `?int` is doing real work: a provider that cannot count
+    // locally says so rather than returning a number that will be trusted absolutely and is wrong
+    // by a few percent — a failure that otherwise surfaces as a vendor-side context error in the
+    // middle of a run, which is the worst possible place to learn about it.
+    fn estimate_tokens(msgs: List<Message>): ?int
+}
+
+// --- Shared codec utilities -------------------------------------------------------------------------
+
+// Parse a JSON document into a dynamic tree, **recoverably**.
+//
+// This is two steps because std has no recoverable dynamic door: `json.parse(text)` walks a
+// document into `Map`/`List`/scalars but *aborts* on malformed input, and `json.try_parse::<T>`
+// is recoverable but cannot build a `Map<string, dyn>`. So: prove well-formedness with a
+// decodable type (which also yields a path-carrying `JsonError`), then walk the proven-good
+// document dynamically. A `json.try_parse(text): Result<dyn, JsonError>` in std would collapse
+// this to one call.
+//
+// `what` names the document in the error message, so a failure reads
+// `anthropic reply: invalid JSON: …` rather than a bare parser complaint.
+pub fn parse_object(body: string, what: string): Result<Map<string, dyn>, AiError> {
+    match json.try_parse::<JsonObject>(body) {
+        Ok(_) => {},
+        Err(e) => {
+            return Err(AiError.Decode(path: e.path(), message: "${what}: ${e.message()}"))
+        },
+    }
+    return Ok(json.parse(body).as<Map<string, dyn>>() ?? {})
+}
+
+// The well-formedness witness for `parse_object`. A field-less struct decodes from any JSON
+// **object** and rejects anything else (a scalar, an array, a syntax error) with the exact reason.
+@derive(Deserialize<Json>)
+struct JsonObject {
+}
+
+// Parse an arbitrary JSON **value** — an object, an array, or a scalar — recoverably.
+//
+// The `extra` escape hatch and a tool call's raw `args` are both arbitrary JSON fragments, and
+// neither is necessarily an object, so `parse_object` is too narrow. Wrapping the fragment in a
+// one-key object reuses the same well-formedness witness: a malformed fragment fails there, with
+// the fragment's own parser message, instead of aborting the run.
+pub fn parse_value(fragment: string, what: string): Result<dyn, AiError> {
+    wrapped = parse_object("{\"v\": " ~ fragment ~ "}", what)?
+    return Ok(wrapped.get("v") ?? 0)
+}
+
+// Read a string member, or `""` when it is absent or not a string.
+//
+// These four readers are **total** on purpose. A vendor that omits `cache_read_input_tokens`, or
+// sends `null` where a string was documented, must not take a run down — the zero value is the
+// honest reading of "not present", and the fields that genuinely cannot be missing are checked by
+// the codec that needs them.
+pub fn str_at(obj: Map<string, dyn>, key: string): string {
+    return (obj.get(key) ?? "").as<string>() ?? ""
+}
+
+// Read an integer member, or `0` when it is absent or not a number. JSON has one number type, so a
+// count that arrived as `12.0` still reads as `12`.
+pub fn int_at(obj: Map<string, dyn>, key: string): int {
+    v = obj.get(key) ?? 0
+    return v.as<int>() ?? (v.as<float>() ?? 0.0).to_int()
+}
+
+// Read an object member, or `{}` when it is absent or not an object.
+pub fn obj_at(obj: Map<string, dyn>, key: string): Map<string, dyn> {
+    empty: Map<string, dyn> = {}
+    return (obj.get(key) ?? empty).as<Map<string, dyn>>() ?? empty
+}
+
+// Read an array member, or `[]` when it is absent or not an array.
+pub fn list_at(obj: Map<string, dyn>, key: string): List<dyn> {
+    empty: List<dyn> = []
+    return (obj.get(key) ?? empty).as<List<dyn>>() ?? empty
+}
+
+// The standard base64 alphabet (RFC 4648 §4).
+fn b64_alphabet(): string {
+    return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+}
+
+fn hex_digit(c: string): int {
+    return "0123456789abcdef".index_of(c) ?? 0
+}
+
+fn byte_at(hex: string, i: int): int {
+    return hex_digit(hex.char_at(i * 2) ?? "0") * 16 + hex_digit(hex.char_at(i * 2 + 1) ?? "0")
+}
+
+// Base64-encode a byte buffer (RFC 4648 §4, padded) — what every vendor's inline-image and inline
+// document blocks carry.
+//
+// It goes through `bytes.to_hex()` because `bytes` exposes no per-byte read; that is a std gap, not
+// a design choice, and this function is the one place in the package that pays for it. A `base64`
+// module in std would replace the body and nothing else. Correct for every input, including the
+// two padded tail cases.
+pub fn base64(data: bytes): string {
+    alphabet = b64_alphabet()
+    hex = data.to_hex()
+    n = data.len()
+    mut out = ""
+    mut i = 0
+    while i < n {
+        b0 = byte_at(hex, i)
+        has1 = i + 1 < n
+        has2 = i + 2 < n
+        b1 = if has1 then byte_at(hex, i + 1) else 0
+        b2 = if has2 then byte_at(hex, i + 2) else 0
+        out = out ~ alphabet[(b0 >> 2) & 63]
+        out = out ~ alphabet[((b0 << 4) | (b1 >> 4)) & 63]
+        out = out ~ (if has1 then alphabet[((b1 << 2) | (b2 >> 6)) & 63] else "=")
+        out = out ~ (if has2 then alphabet[b2 & 63] else "=")
+        i = i + 3
+    }
+    return out
+}
+
+// A crude character-count-based token estimate — roughly four characters per token, the ratio that
+// holds for English prose across every current tokenizer.
+//
+// Exported so a codec with no local tokenizer can be explicit about using it, and so nobody
+// re-derives the constant. A codec that has no basis for even this should return `none` instead:
+// `?int` exists precisely so "I don't know" is sayable.
+pub fn rough_token_estimate(msgs: List<Message>): int {
+    mut chars = 0
+    for m in msgs {
+        for p in m.parts {
+            chars = chars + match p {
+                Part.Text(text) => text.len(),
+                Part.Thinking(text, signature) => text.len() + signature.len(),
+                Part.ToolCall(id, name, args) => name.len() + args.len(),
+                Part.ToolResult(id, content, is_error) => content.len(),
+                // A base64 payload is ~4/3 of the byte length, and vendors bill images by area
+                // rather than by token, so counting the encoding would be doubly wrong. Count the
+                // envelope only.
+                Part.Image(mime, data) => mime.len(),
+                Part.File(mime, name, data) => mime.len() + name.len(),
+            }
+        }
+        // Every vendor spends a handful of tokens per message on role framing.
+        chars = chars + 12
+    }
+    return chars / 4
+}
+
+@test {
+    fn usage_adds_field_wise(): void {
+        a = Usage { input_tokens: 10, output_tokens: 5, cached_input_tokens: 2 }
+        b = Usage { input_tokens: 1, output_tokens: 3, reasoning_tokens: 7 }
+        sum = a + b
+        assert(sum.input_tokens == 11)
+        assert(sum.output_tokens == 8)
+        assert(sum.cached_input_tokens == 2)
+        assert(sum.reasoning_tokens == 7)
+        assert(sum.total() == 19, "total is input + output; cached input is a subset, not an extra")
+    }
+
+    fn stop_reasons_render_in_the_semconv_spelling(): void {
+        assert(StopReason.EndTurn.semconv() == "stop")
+        assert(StopReason.ToolUse.semconv() == "tool_calls")
+        assert(StopReason.MaxTokens.semconv() == "length")
+        assert(StopReason.Refusal.semconv() == "content_filter")
+        // An unmodeled reason is passed through rather than flattened.
+        assert(StopReason.Other(raw: "pause_turn").semconv() == "pause_turn")
+    }
+
+    // --- The delta fold ---------------------------------------------------------------------------
+
+    fn fold_concatenates_deltas_of_one_block(): void {
+        reply = fold([
+            Delta.TextDelta(id: "0", text: "Hello, "),
+            Delta.TextDelta(id: "0", text: "world"),
+            Delta.TextDelta(id: "0", text: "!"),
+        ], "m")
+        assert(reply.parts == [Part.Text(text: "Hello, world!")])
+    }
+
+    fn fold_opens_a_new_block_on_a_new_id(): void {
+        reply = fold([
+            Delta.TextDelta(id: "0", text: "one"),
+            Delta.TextDelta(id: "1", text: "two"),
+        ], "m")
+        assert(reply.parts == [Part.Text(text: "one"), Part.Text(text: "two")])
+    }
+
+    // A tool call's arguments arrive as partial JSON fragments; keeping them raw means the
+    // accumulate-then-decode boundary is in exactly one place.
+    fn fold_accumulates_tool_call_arguments(): void {
+        reply = fold([
+            Delta.ToolCallStart(id: "call_1", name: "weather"),
+            Delta.ToolCallArgs(id: "call_1", fragment: "{\"city\":"),
+            Delta.ToolCallArgs(id: "call_1", fragment: " \"Malmo\"}"),
+            Delta.Stop(reason: StopReason.ToolUse),
+        ], "m")
+        assert(reply.parts == [Part.ToolCall(id: "call_1", name: "weather", args: "{\"city\": \"Malmo\"}")])
+        assert(reply.stop == StopReason.ToolUse)
+    }
+
+    // A thinking block's signature is round-tripped verbatim; nothing here interprets it.
+    fn fold_pairs_thinking_text_with_its_signature(): void {
+        reply = fold([
+            Delta.ThinkingDelta(id: "0", text: "step one"),
+            Delta.ThinkingDelta(id: "0", text: " and two"),
+            Delta.ThinkingSignature(id: "0", signature: "sig-abc"),
+        ], "m")
+        assert(reply.parts == [Part.Thinking(text: "step one and two", signature: "sig-abc")])
+    }
+
+    fn fold_keeps_interleaved_blocks_in_arrival_order(): void {
+        reply = fold([
+            Delta.ThinkingDelta(id: "0", text: "hm"),
+            Delta.TextDelta(id: "1", text: "answer"),
+            Delta.ToolCallStart(id: "2", name: "t"),
+            Delta.ToolCallArgs(id: "2", fragment: "{}"),
+        ], "m")
+        assert(reply.parts.len() == 3)
+        assert(reply.parts[0] == Part.Thinking(text: "hm", signature: ""))
+        assert(reply.parts[1] == Part.Text(text: "answer"))
+        assert(reply.parts[2] == Part.ToolCall(id: "2", name: "t", args: "{}"))
+    }
+
+    fn fold_takes_the_last_usage_and_stop(): void {
+        reply = fold([
+            Delta.UsageDelta(usage: Usage { input_tokens: 1 }),
+            Delta.Stop(reason: StopReason.MaxTokens),
+            Delta.UsageDelta(usage: Usage { input_tokens: 9, output_tokens: 4 }),
+        ], "m-1")
+        assert(reply.usage == Usage { input_tokens: 9, output_tokens: 4 })
+        assert(reply.stop == StopReason.MaxTokens)
+        assert(reply.model == "m-1")
+    }
+
+    fn folding_nothing_is_an_empty_end_turn(): void {
+        reply = fold([], "m")
+        assert(reply.parts == [])
+        assert(reply.stop == StopReason.EndTurn)
+        assert(reply.usage == Usage {})
+    }
+
+    // --- JSON helpers -----------------------------------------------------------------------------
+
+    fn parse_object_reports_a_syntax_error_rather_than_aborting(): void {
+        match parse_object("{ nope", "anthropic reply") {
+            Ok(_) => {
+                assert(false, "malformed JSON must not decode")
+            },
+            Err(e) => {
+                assert("${e}".contains("anthropic reply"), "the error names the document: ${e}")
+                assert("${e}".contains("invalid JSON"))
+            },
+        }
+    }
+
+    fn parse_object_rejects_a_document_that_is_not_an_object(): void {
+        assert(match parse_object("[1, 2]", "reply") { Ok(_) => false, Err(_) => true })
+        assert(match parse_object("\"text\"", "reply") { Ok(_) => false, Err(_) => true })
+        assert(match parse_object("", "reply") { Ok(_) => false, Err(_) => true })
+    }
+
+    fn parse_object_walks_a_nested_document(): void {
+        match parse_object("{\"a\": 1, \"s\": \"x\", \"o\": {\"k\": true}, \"l\": [1, 2]}", "doc") {
+            Ok(o) => {
+                assert(int_at(o, "a") == 1)
+                assert(str_at(o, "s") == "x")
+                assert(obj_at(o, "o").keys() == ["k"])
+                assert(list_at(o, "l").len() == 2)
+            },
+            Err(e) => {
+                assert(false, "${e}")
+            },
+        }
+    }
+
+    // Absent and wrong-typed members read as the zero value rather than aborting — a vendor that
+    // omits `cache_read_input_tokens` must not take the run down.
+    fn json_readers_are_total(): void {
+        match parse_object("{\"n\": \"not a number\"}", "doc") {
+            Ok(o) => {
+                assert(int_at(o, "n") == 0)
+                assert(int_at(o, "absent") == 0)
+                assert(str_at(o, "absent") == "")
+                assert(obj_at(o, "absent") == {})
+                assert(list_at(o, "absent") == [])
+            },
+            Err(e) => {
+                assert(false, "${e}")
+            },
+        }
+    }
+
+    fn int_at_reads_a_whole_json_number_written_as_a_float(): void {
+        match parse_object("{\"n\": 12.0}", "doc") {
+            Ok(o) => {
+                assert(int_at(o, "n") == 12)
+            },
+            Err(e) => {
+                assert(false, "${e}")
+            },
+        }
+    }
+
+    // --- base64 ------------------------------------------------------------------------------------
+
+    // The RFC 4648 §10 test vectors, which pin all three tail cases (0, 1, and 2 padding bytes).
+    fn base64_matches_the_rfc_vectors(): void {
+        assert(base64("".to_bytes()) == "")
+        assert(base64("f".to_bytes()) == "Zg==")
+        assert(base64("fo".to_bytes()) == "Zm8=")
+        assert(base64("foo".to_bytes()) == "Zm9v")
+        assert(base64("foob".to_bytes()) == "Zm9vYg==")
+        assert(base64("fooba".to_bytes()) == "Zm9vYmE=")
+        assert(base64("foobar".to_bytes()) == "Zm9vYmFy")
+    }
+
+    fn base64_encodes_high_bytes_and_multibyte_text(): void {
+        // UTF-8 for "hé" is 68 c3 a9 — the c3/a9 pair exercises the high bit.
+        assert(base64("hé".to_bytes()) == "aMOp")
+        assert(base64("Malmö kl. 18:00".to_bytes()) == "TWFsbcO2IGtsLiAxODowMA==")
+    }
+}

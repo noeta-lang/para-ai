@@ -1,0 +1,66 @@
+name: CI
+
+# The para/ai package's CI: check + test the package itself and every example with a pinned
+# released `noeta`. This package is pure Noeta, so there is no Rust job — but `para/api` ships a
+# native extension crate, so the first `noeta check` composes a toolchain (a cargo build) and the
+# later ones reuse the cached binary. That is why a Rust toolchain and a cargo cache are set up
+# here even though this repo contains no Rust.
+#
+# NOTE: these workflows go green once the noeta toolchain repo is published under
+# github.com/noeta-lang/noeta and the ecosystem's pre-publish `file:///` git deps are flipped to
+# it, and once `para/api` resolves from the registry rather than the sibling path (tracked in the
+# pre-alpha run-list). Until then they fail at the noeta-install step by design.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Callable as the release gate (release.yml runs the full CI before publishing).
+  workflow_call:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Pinned in lockstep with the toolchain repo's own CI (dtolnay/rust-toolchain@1.97.0 there): the
+# NOETA_VERSION resolves from the org-level Actions variable of the same name (single bump point
+# for every para repo), falling back to the literal. Bumping is deliberate — raise it here and in
+# `release.yml` together.
+env:
+  CARGO_TERM_COLOR: always
+  NOETA_VERSION: ${{ vars.NOETA_VERSION || 'v0.2.3' }}
+
+jobs:
+  package:
+    name: Package (noeta check + test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # `para/api` is a sibling path dependency until it resolves from the registry.
+      - name: Check out para/api alongside
+        uses: actions/checkout@v4
+        with:
+          repository: noeta-lang/para-api
+          path: ../para-api
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install noeta ${{ env.NOETA_VERSION }}
+        run: |
+          DIST="noeta-${NOETA_VERSION}-x86_64-unknown-linux-gnu"
+          curl -fsSL "https://github.com/noeta-lang/noeta/releases/download/${NOETA_VERSION}/${DIST}.tar.gz" | tar -xz
+          echo "${PWD}/${DIST}" >> "$GITHUB_PATH"
+      - name: noeta check + test the package
+        run: |
+          for f in *.noe; do
+            echo "== ${f}"
+            noeta check "$f"
+            noeta test "$f"
+          done
+      - name: noeta check + test every example
+        run: |
+          for ex in examples/*/; do
+            echo "== ${ex}"
+            for f in "${ex}"*.noe; do
+              (cd "${ex}" && noeta check "$(basename "$f")" && noeta test "$(basename "$f")")
+            done
+          done

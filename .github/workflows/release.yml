@@ -1,0 +1,92 @@
+name: Release
+
+# Tag-triggered package publish. On a `v*` tag: install the pinned released `noeta`, then
+# `noeta publish` this repo + tag to the hosted registry. Provenance is keyless Sigstore via the
+# ambient GitHub OIDC identity — hence `id-token: write`.
+#
+# NOTE: goes live once the noeta toolchain repo is published under github.com/noeta-lang/noeta,
+# the pre-publish `file:///` git deps are flipped to it, and the registry scope `para` is claimed
+# by the noeta-lang org (tracked in the pre-alpha run-list).
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write # checkout + creating the GitHub release
+  id-token: write # keyless Sigstore signing via the ambient GitHub OIDC identity
+
+# Kept in lockstep with `ci.yml` — publish with the same toolchain release the gates proved
+# the tree against.
+env:
+  CARGO_TERM_COLOR: always
+  NOETA_VERSION: ${{ vars.NOETA_VERSION || 'v0.1.0' }}
+
+jobs:
+  # The repo's full CI, reused as the release gate: a tag can only publish a tree that
+  # passes everything CI checks (one gate definition, no drift).
+  gate:
+    name: CI gates
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Publish para/ai to the registry
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history: the notes compiler diffs against the previous tag
+      - name: Install noeta ${{ env.NOETA_VERSION }}
+        run: |
+          DIST="noeta-${NOETA_VERSION}-x86_64-unknown-linux-gnu"
+          curl -fsSL "https://github.com/noeta-lang/noeta/releases/download/${NOETA_VERSION}/${DIST}.tar.gz" | tar -xz
+          echo "${PWD}/${DIST}" >> "$GITHUB_PATH"
+      - name: noeta publish
+        env:
+          NOETA_REGISTRY_URL: https://registry.noeta.dev
+          NOETA_REGISTRY_TOKEN: ${{ secrets.NOETA_REGISTRY_TOKEN }}
+        run: noeta publish --git https://github.com/noeta-lang/para-ai --tag ${{ github.ref_name }}
+      - name: Compile release notes from conventional commits
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          PREV=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)
+          RANGE=${PREV:+${PREV}..}${TAG}
+          {
+            declare -A SECTION=( [feat]="Features" [fix]="Fixes" [perf]="Performance" \
+              [docs]="Documentation" [refactor]="Refactoring" [ci]="CI & build" [build]="CI & build" \
+              [test]="Housekeeping" [chore]="Housekeeping" [style]="Housekeeping" )
+            ORDER=(Breaking Features Fixes Performance Documentation Refactoring "CI & build" Housekeeping Other)
+            CONVENTIONAL='^([a-z]+)(\([^)]*\))?(!)?: (.*)$'
+            declare -A BODY
+            while IFS= read -r line; do
+              subject=${line#* }
+              [[ "$subject" == Merge\ * ]] && continue
+              if [[ "$subject" =~ $CONVENTIONAL ]]; then
+                type=${BASH_REMATCH[1]}; scope=${BASH_REMATCH[2]}; bang=${BASH_REMATCH[3]}; msg=${BASH_REMATCH[4]}
+                scope=${scope#(}; scope=${scope%)}
+                entry="- ${scope:+**${scope}:** }${msg}"
+                if [[ -n "$bang" ]]; then key="Breaking"; else key=${SECTION[$type]:-Other}; fi
+              else
+                entry="- ${subject}"; key="Other"
+              fi
+              BODY[$key]+="${entry}"$'\n'
+            done < <(git log --no-merges --pretty='%H %s' "$RANGE")
+            for key in "${ORDER[@]}"; do
+              [[ -n "${BODY[$key]:-}" ]] || continue
+              [[ "$key" == "Breaking" ]] && echo "## ⚠ Breaking changes" || echo "## ${key}"
+              printf '%s\n' "${BODY[$key]}"
+            done
+            if [[ -n "$PREV" ]]; then
+              echo "**Full changelog:** https://github.com/${GITHUB_REPOSITORY}/compare/${PREV}...${TAG}"
+            fi
+          } > notes.md
+          echo "--- notes for ${RANGE}:"; cat notes.md
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --notes-file notes.md --verify-tag

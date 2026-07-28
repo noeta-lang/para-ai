@@ -1,0 +1,533 @@
+// `para.ai.mock` — the hermetic test double.
+//
+//     m = Mock.new().reply_text("18°C and clear in Malmö.")
+//     agent = m.agent(AgentConfig.new("test-model"))
+//     assert(agent.run_sync("What's the weather in Malmö?")?.contains("18°C"))
+//     assert(m.calls().len() == 1)
+//
+// `Mock` is **not a special case in the framework** — it is an ordinary `Provider` whose `encode`
+// ignores what the request says and whose `decode_reply` reads back a scripted answer. It is also a
+// `para.api.Middleware`, which is what closes the loop: the run loop still encodes, still sends
+// through the chain, still decodes, and the layer that would have opened a socket answers from the
+// script instead. Nothing about the run is bypassed and nothing about it touches the network.
+//
+// Because it is both halves, `calls()` records **the bytes the codec actually produced** rather
+// than a re-derivation of them — which is what makes "assert on what was sent" mean something.
+//
+// It is a `class` and every other type in this package is a value: a recorder accumulates across
+// calls, so it needs reference identity and mutable state — exactly the reason `para/api`'s
+// `Record` is one. That makes a `Mock`-backed agent `!Send`, which is fine: a test is not an
+// isolate.
+namespace para.ai.mock
+
+use std.http.client
+use std.http.server
+use std.http.{HttpError, Request, Response}
+use std.json
+use para.api.{Api, Middleware, Next}
+use para.ai.{Agent, AgentConfig, AiError, Conversation, Message, Part, Role}
+use para.ai.provider
+use para.ai.provider.{Delta, ModelReply, ModelRequest, Provider, StopReason, Usage, Wire}
+
+// One scripted answer. The script is consumed in order, one entry per model call.
+@derive(Equatable, Display)
+pub enum Scripted {
+    // A plain assistant answer; the run finishes.
+    Text(text: string)
+    // The model asks for a tool. Phase 1 ends the run and hands the call back in `Run.messages`;
+    // phase 2 dispatches it and continues.
+    Tool(id: string, name: string, args: string)
+    // The model declines — surfaces as `AiError.Refused`, never as a decode failure.
+    Refusal(reason: string)
+    // The vendor answers with an error status — surfaces as `AiError.Provider`.
+    Failure(status: int, code: string, message: string)
+}
+
+// The neutral JSON this codec speaks. It is `Mock`'s own wire format, so it can be whatever is
+// most readable in a failing assertion — a faithful, flat rendering of the parts.
+
+fn part_to_json(p: Part): Map<string, dyn> {
+    return match p {
+        Part.Text(text) => {"type": "text", "text": text},
+        Part.Thinking(text, signature) => {"type": "thinking", "text": text, "signature": signature},
+        Part.ToolCall(id, name, args) => {"type": "tool_call", "id": id, "name": name, "args": args},
+        Part.ToolResult(id, content, is_error) => {"type": "tool_result", "id": id, "content": content, "is_error": is_error},
+        // The bytes themselves are noise in an assertion; their length is the part that varies.
+        Part.Image(mime, data) => {"type": "image", "mime": mime, "bytes": data.len()},
+        Part.File(mime, name, data) => {"type": "file", "mime": mime, "name": name, "bytes": data.len()},
+    }
+}
+
+fn part_from_json(o: Map<string, dyn>): Result<Part, AiError> {
+    kind = provider.str_at(o, "type")
+    if kind == "text" {
+        return Ok(Part.Text(text: provider.str_at(o, "text")))
+    }
+    if kind == "thinking" {
+        return Ok(Part.Thinking(text: provider.str_at(o, "text"), signature: provider.str_at(o, "signature")))
+    }
+    if kind == "tool_call" {
+        return Ok(Part.ToolCall(
+            id: provider.str_at(o, "id"),
+            name: provider.str_at(o, "name"),
+            args: provider.str_at(o, "args"),
+        ))
+    }
+    return Err(AiError.Decode(path: "parts[].type", message: "mock cannot decode a `${kind}` part"))
+}
+
+fn role_name(r: Role): string {
+    return match r {
+        Role.System => "system",
+        Role.User => "user",
+        Role.Assistant => "assistant",
+        Role.Tool => "tool",
+    }
+}
+
+fn message_to_json(m: Message): Map<string, dyn> {
+    mut parts: List<dyn> = []
+    for p in m.parts {
+        parts = parts ~ [part_to_json(p)]
+    }
+    out: Map<string, dyn> = {"role": role_name(m.role), "parts": parts}
+    return out
+}
+
+fn stop_name(s: StopReason): string {
+    return match s {
+        StopReason.EndTurn => "end_turn",
+        StopReason.ToolUse => "tool_use",
+        StopReason.MaxTokens => "max_tokens",
+        StopReason.StopSequence => "stop_sequence",
+        StopReason.Refusal => "refusal",
+        StopReason.Other(raw) => raw,
+    }
+}
+
+fn stop_from_name(raw: string): StopReason {
+    return match raw {
+        "end_turn" => StopReason.EndTurn,
+        "tool_use" => StopReason.ToolUse,
+        "max_tokens" => StopReason.MaxTokens,
+        "stop_sequence" => StopReason.StopSequence,
+        "refusal" => StopReason.Refusal,
+        _ => StopReason.Other(raw: raw),
+    }
+}
+
+fn one_part(m: Map<string, dyn>): List<dyn> {
+    out: List<dyn> = [m]
+    return out
+}
+
+fn scripted_parts(s: Scripted): List<dyn> {
+    return match s {
+        Scripted.Text(text) => one_part(part_to_json(Part.Text(text: text))),
+        Scripted.Tool(id, name, args) => one_part(part_to_json(Part.ToolCall(id: id, name: name, args: args))),
+        Scripted.Refusal(reason) => one_part(part_to_json(Part.Text(text: reason))),
+        // Never reached: a failure is an error status, which the run loop routes to `decode_error`
+        // before `decode_reply` is consulted.
+        Scripted.Failure(status, code, message) => [],
+    }
+}
+
+fn scripted_stop(s: Scripted): StopReason {
+    return match s {
+        Scripted.Text(text) => StopReason.EndTurn,
+        Scripted.Tool(id, name, args) => StopReason.ToolUse,
+        Scripted.Refusal(reason) => StopReason.Refusal,
+        Scripted.Failure(status, code, message) => StopReason.EndTurn,
+    }
+}
+
+// A scripted entry as the reply body this codec reads back. Usage is synthesized from the sizes
+// involved so a telemetry assertion has something deterministic and non-zero to look at.
+fn reply_body(s: Scripted, input_tokens: int): string {
+    parts = scripted_parts(s)
+    usage: Map<string, dyn> = {
+        "input_tokens": input_tokens,
+        "output_tokens": json.stringify(parts).len() / 4,
+    }
+    body: Map<string, dyn> = {
+        "model": "mock",
+        "stop": stop_name(scripted_stop(s)),
+        "parts": parts,
+        "usage": usage,
+    }
+    return json.stringify(body)
+}
+
+// The scripted `Provider` and the transport layer that answers it, in one object.
+pub class Mock {
+    mut script: List<Scripted>
+    mut cursor: int
+    mut sent: List<string>
+
+    fn new(): Mock {
+        return Mock { script: [], cursor: 0, sent: [] }
+    }
+
+    // --- Scripting ---------------------------------------------------------------------------
+    //
+    // Each of these appends one answer and returns the same `Mock`, so a multi-turn script reads
+    // top to bottom in the order the model would produce it.
+
+    fn reply_text(text: string): Mock {
+        self.script = self.script ~ [Scripted.Text(text: text)]
+        return self
+    }
+
+    fn reply_tool(id: string, name: string, args: string): Mock {
+        self.script = self.script ~ [Scripted.Tool(id: id, name: name, args: args)]
+        return self
+    }
+
+    fn refuse(reason: string): Mock {
+        self.script = self.script ~ [Scripted.Refusal(reason: reason)]
+        return self
+    }
+
+    fn fail(status: int, code: string, message: string): Mock {
+        self.script = self.script ~ [Scripted.Failure(status: status, code: code, message: message)]
+        return self
+    }
+
+    // --- Introspection -----------------------------------------------------------------------
+
+    // Every request body the codec produced, in order — the answer to "what did the agent actually
+    // send?". Worth asserting on: it is the difference between "the agent replied" and "the agent
+    // asked the right question".
+    fn calls(): List<string> {
+        return self.sent
+    }
+
+    // How many model calls the agent made.
+    fn call_count(): int {
+        return self.sent.len()
+    }
+
+    // How many scripted answers are still unused. A test that ends with this above zero scripted
+    // more turns than the run took.
+    fn remaining(): int {
+        return self.script.len() - self.cursor
+    }
+
+    // --- Wiring ------------------------------------------------------------------------------
+
+    // A transport chain whose only layer is this mock. Nothing below it exists, so no socket can
+    // be opened even by accident.
+    fn api(): Api {
+        return Api.new(client.new()).with(self)
+    }
+
+    // The whole hermetic setup in one call: an agent whose codec **and** transport are this mock.
+    fn agent(cfg: AgentConfig): Agent<Mock> {
+        return Agent.over(cfg, self, self.api())
+    }
+}
+
+impl Provider for Mock {
+    fn name(): string {
+        return "mock"
+    }
+
+    fn encode(req: ModelRequest): Result<Wire, AiError> {
+        mut msgs: List<dyn> = []
+        for m in req.messages {
+            msgs = msgs ~ [message_to_json(m)]
+        }
+        mut body: Map<string, dyn> = {"model": req.model, "messages": msgs}
+        match req.max_tokens {
+            some(n) => {
+                body = body.set("max_tokens", n)
+            },
+            none => {},
+        }
+        match req.temperature {
+            some(t) => {
+                body = body.set("temperature", t)
+            },
+            none => {},
+        }
+        if req.stop.len() > 0 {
+            stop: List<dyn> = req.stop.map(fn(s) => s)
+            body = body.set("stop", stop)
+        }
+        // The host is unroutable on purpose (RFC 6761 reserves `.invalid`): if this mock is ever
+        // wired into a chain that does reach the network, the failure is instant and obvious
+        // rather than a real request to a real vendor.
+        return Ok(Wire {
+            url: "https://mock.invalid/v1/messages",
+            method: "post",
+            headers: {"content-type": "application/json"},
+            body: json.stringify(body),
+        })
+    }
+
+    fn decode_reply(body: string): Result<ModelReply, AiError> {
+        doc = provider.parse_object(body, "mock reply")?
+        mut deltas: List<Delta> = []
+        for (i, raw) in provider.list_at(doc, "parts").enumerate() {
+            p = part_from_json(raw.as<Map<string, dyn>>() ?? {})?
+            deltas = deltas ~ match p {
+                Part.Text(text) => [Delta.TextDelta(id: "${i}", text: text)],
+                Part.Thinking(text, signature) => [
+                    Delta.ThinkingDelta(id: "${i}", text: text),
+                    Delta.ThinkingSignature(id: "${i}", signature: signature),
+                ],
+                Part.ToolCall(id, name, args) => [
+                    Delta.ToolCallStart(id: id, name: name),
+                    Delta.ToolCallArgs(id: id, fragment: args),
+                ],
+                _ => [],
+            }
+        }
+        usage = provider.obj_at(doc, "usage")
+        deltas = deltas ~ [
+            Delta.Stop(reason: stop_from_name(provider.str_at(doc, "stop"))),
+            Delta.UsageDelta(usage: Usage {
+                input_tokens: provider.int_at(usage, "input_tokens"),
+                output_tokens: provider.int_at(usage, "output_tokens"),
+            }),
+        ]
+        return Ok(provider.fold(deltas, provider.str_at(doc, "model")))
+    }
+
+    fn decode_error(status: int, body: string): AiError {
+        return match provider.parse_object(body, "mock error") {
+            Ok(doc) => AiError.Provider(
+                status: status,
+                code: provider.str_at(doc, "code"),
+                message: provider.str_at(doc, "message"),
+            ),
+            Err(_) => AiError.Provider(status: status, code: "", message: body),
+        }
+    }
+
+    // The `some(n)` half of O-5, so a caller's `match provider.estimate_tokens(...)` has both
+    // branches reachable in a test. Rough by construction — a mock has nothing better to offer,
+    // and saying `none` here would make the `some` path untestable without a real tokenizer.
+    fn estimate_tokens(msgs: List<Message>): ?int {
+        return some(provider.rough_token_estimate(msgs))
+    }
+}
+
+// The transport half. A layer that never calls `next` answers on its own — which is exactly what a
+// mock is, and why `para/api`'s middleware takes a callable `next` rather than a hook pair.
+impl Middleware for Mock {
+    fn handle(req: Request, next: Next): Result<Response, HttpError> {
+        self.sent = self.sent ~ [req.body()]
+        if self.cursor >= self.script.len() {
+            // Loud. A run that outlasts its script is a test that scripted the wrong number of
+            // turns, and answering something plausible would hide that.
+            return Ok(server.response(500, json.stringify({
+                "code": "mock_script_exhausted",
+                "message": "the mock script ran out after ${self.cursor} scripted repl(y/ies)",
+            })))
+        }
+        entry = self.script[self.cursor]
+        self.cursor = self.cursor + 1
+        input_tokens = req.body().len() / 4
+        return Ok(match entry {
+            Scripted.Failure(status, code, message) => server.response(status, json.stringify({
+                "code": code,
+                "message": message,
+            })),
+            _ => server.response(200, reply_body(entry, input_tokens)),
+        })
+    }
+}
+
+@test {
+    fn a_scripted_text_answer_comes_back_through_the_whole_run_loop(): void {
+        m = Mock.new().reply_text("18°C and clear in Malmö.")
+        agent = m.agent(AgentConfig.new("test-model"))
+        answer = match agent.run_sync("What's the weather in Malmö?") {
+            Ok(s) => s,
+            Err(e) => "FAILED: ${e}",
+        }
+        assert(answer == "18°C and clear in Malmö.", answer)
+        assert(m.call_count() == 1)
+        assert(m.remaining() == 0)
+    }
+
+    // The point of recording the *encoded* body: it proves the agent asked the right question, not
+    // merely that it got an answer.
+    fn calls_record_what_the_codec_actually_sent(): void {
+        m = Mock.new().reply_text("ok")
+        agent = m.agent(AgentConfig.new("test-model").with_system("Be terse.").with_max_tokens(32))
+        one = agent.run_sync("hello")
+        assert(m.calls().len() == 1)
+        sent = m.calls()[0]
+        assert(sent.contains("\"model\":\"test-model\""), sent)
+        assert(sent.contains("\"max_tokens\":32"), sent)
+        // The config's system prompt is prepended by the run loop, not by the caller.
+        assert(sent.contains("\"role\":\"system\""), sent)
+        assert(sent.contains("Be terse."), sent)
+        assert(sent.contains("hello"), sent)
+    }
+
+    async fn a_run_returns_the_whole_conversation(): void {
+        m = Mock.new().reply_text("second")
+        agent = m.agent(AgentConfig.new("test-model"))
+        conv = Conversation.of("first")
+        match agent.run(conv).await {
+            Ok(run) => {
+                assert(run.turns == 1)
+                assert(run.messages.len() == 2)
+                assert(run.messages[0].role == Role.User)
+                assert(run.messages[1].role == Role.Assistant)
+                assert(run.text() == "second")
+                assert(run.usage.output_tokens > 0, "usage is threaded out of the reply")
+                assert(run.stop == StopReason.EndTurn)
+            },
+            Err(e) => {
+                assert(false, "${e}")
+            },
+        }
+    }
+
+    // A refusal is `AiError.Refused`, never a decode failure — conflating them sends people
+    // debugging the wrong thing.
+    fn a_refusal_is_its_own_error(): void {
+        m = Mock.new().refuse("I can't help with that.")
+        agent = m.agent(AgentConfig.new("test-model"))
+        match agent.run_sync("...") {
+            Ok(s) => {
+                assert(false, "a refusal is not an answer, got ${s}")
+            },
+            Err(e) => {
+                assert(match e { AiError.Refused(reason) => reason == "I can't help with that.", _ => false }, "${e}")
+            },
+        }
+    }
+
+    // An HTTP error status is an answer with a typed body, decoded into a matchable code.
+    fn a_vendor_error_status_becomes_a_typed_provider_error(): void {
+        m = Mock.new().fail(429, "rate_limit_error", "slow down")
+        agent = m.agent(AgentConfig.new("test-model"))
+        match agent.run_sync("hi") {
+            Ok(_) => {
+                assert(false, "a 429 is not an answer")
+            },
+            Err(e) => {
+                assert(match e {
+                    AiError.Provider(status, code, message) => status == 429 && code == "rate_limit_error" && message == "slow down",
+                    _ => false,
+                }, "${e}")
+            },
+        }
+    }
+
+    // Phase 1 sends no tools, so a tool-use stop ends the run rather than looping against a
+    // dispatcher that does not exist yet — and the requested call is handed back intact.
+    async fn a_tool_call_ends_the_run_and_is_handed_back(): void {
+        m = Mock.new().reply_tool("call_1", "weather", "{\"city\":\"Malmö\"}")
+        agent = m.agent(AgentConfig.new("test-model"))
+        match agent.run(Conversation.of("weather?")).await {
+            Ok(run) => {
+                assert(run.stop == StopReason.ToolUse)
+                calls = run.messages[run.messages.len() - 1].tool_calls()
+                assert(calls == [Part.ToolCall(id: "call_1", name: "weather", args: "{\"city\":\"Malmö\"}")])
+            },
+            Err(e) => {
+                assert(false, "${e}")
+            },
+        }
+    }
+
+    // A run that outlasts its script fails loudly rather than answering something plausible.
+    fn an_exhausted_script_is_a_loud_failure(): void {
+        m = Mock.new()
+        agent = m.agent(AgentConfig.new("test-model"))
+        match agent.run_sync("hi") {
+            Ok(_) => {
+                assert(false, "an unscripted call must not succeed")
+            },
+            Err(e) => {
+                assert("${e}".contains("mock_script_exhausted"), "${e}")
+            },
+        }
+        assert(m.call_count() == 1, "the call is still recorded — that is how you see it happened")
+    }
+
+    // The script is consumed in order, one entry per call, across separate runs.
+    fn the_script_is_consumed_in_order(): void {
+        m = Mock.new().reply_text("one").reply_text("two")
+        agent = m.agent(AgentConfig.new("test-model"))
+        assert(agent.run_sync("a") == Ok("one"))
+        assert(m.remaining() == 1)
+        assert(agent.run_sync("b") == Ok("two"))
+        assert(m.remaining() == 0)
+        assert(m.call_count() == 2)
+    }
+
+    // The transport arm: a chain with no mock layer bottoms out in the real client, and a request
+    // that cannot leave the machine surfaces as `AiError.Transport` through `impl From<HttpError>`
+    // — the one conversion `?` performs implicitly in the run loop.
+    //
+    // `mock.invalid` is reserved by RFC 6761 precisely so it can never resolve, so this is a local
+    // DNS failure rather than a request to anything: the only assertion in the suite that touches
+    // the resolver, and the only way to exercise this arm without one.
+    fn a_transport_failure_becomes_an_ai_error(): void {
+        naked = Agent.over(AgentConfig.new("test-model"), Mock.new(), Api.new(client.new()))
+        match naked.run_sync("hi") {
+            Ok(_) => {
+                assert(false, "an unresolvable host cannot answer")
+            },
+            Err(e) => {
+                assert(match e { AiError.Transport(inner) => true, _ => false },
+                    "a broken transport is `Transport`, not `Provider`: ${e}")
+                assert("${e}".contains("transport failed"), "${e}")
+            },
+        }
+    }
+
+    // --- The codec, on its own ---------------------------------------------------------------
+
+    // Every part kind survives the mock's own wire format, which is what makes `calls()` readable
+    // for a conversation that is not just text.
+    fn the_mock_codec_renders_every_part_kind(): void {
+        req = ModelRequest {
+            model: "m",
+            messages: [Message {
+                role: Role.Assistant,
+                parts: [
+                    Part.Text(text: "hi"),
+                    Part.Thinking(text: "hm", signature: "sig"),
+                    Part.ToolCall(id: "t1", name: "w", args: "{}"),
+                    Part.ToolResult(id: "t1", content: "18C", is_error: false),
+                    Part.Image(mime: "image/png", data: "foobar".to_bytes()),
+                    Part.File(mime: "application/pdf", name: "a.pdf", data: "xy".to_bytes()),
+                ],
+            }],
+        }
+        match Mock.new().encode(req) {
+            Ok(w) => {
+                assert(w.url == "https://mock.invalid/v1/messages", "unroutable by construction")
+                assert(w.body.contains("\"type\":\"thinking\""), w.body)
+                assert(w.body.contains("\"signature\":\"sig\""), w.body)
+                assert(w.body.contains("\"type\":\"tool_result\""), w.body)
+                assert(w.body.contains("\"bytes\":6"), "an image is summarized by length: ${w.body}")
+                assert(w.body.contains("\"name\":\"a.pdf\""), w.body)
+            },
+            Err(e) => {
+                assert(false, "${e}")
+            },
+        }
+    }
+
+    // The `some(n)` half of `estimate_tokens(): ?int` — the branch Anthropic's `none` cannot cover.
+    fn the_mock_estimates_tokens(): void {
+        assert(match Mock.new().estimate_tokens([Message.user("a rather long sentence to count")]) {
+            some(n) => n > 0,
+            none => false,
+        })
+        // Longer input, larger estimate — the estimate tracks the content rather than being a
+        // constant that happens to be positive.
+        short = Mock.new().estimate_tokens([Message.user("hi")]) ?? 0
+        long = Mock.new().estimate_tokens([Message.user("hi".repeat(200))]) ?? 0
+        assert(long > short)
+    }
+}

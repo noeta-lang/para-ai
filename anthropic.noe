@@ -1,0 +1,746 @@
+// `para.ai.providers.anthropic` — the Anthropic Messages API codec.
+//
+//     use para.ai.providers.anthropic.Anthropic
+//
+//     agent = Agent.from(AgentConfig.new("claude-opus-5"), Anthropic.from_env()?)
+//
+// Pure: `encode` builds a request body, `decode_reply` reads a response body, and neither touches
+// the network. Every test below is a fixture table for exactly that reason — the request half
+// asserts on the **exact JSON** a known request produces, and the response half decodes a captured
+// Anthropic response body.
+//
+// Three things about this wire format are easy to get wrong, and all three are handled here:
+//
+//   * **`system` is a top-level field, not a message role.** System turns are hoisted out of
+//     `messages` into `system`; a request that leaves one in `messages` is rejected by the vendor.
+//   * **There is no `tool` role.** A tool result is a `user` turn carrying `tool_result` blocks.
+//   * **A `thinking` block must carry its `signature` back** on the next turn or the vendor
+//     invalidates it, so both are round-tripped verbatim.
+namespace para.ai.providers.anthropic
+
+use std.{env, json}
+use para.ai.{AiError, Message, Part, Role}
+use para.ai.provider
+use para.ai.provider.{Delta, ModelReply, ModelRequest, Provider, StopReason, Usage, Wire}
+
+// The Anthropic Messages API, as a codec.
+//
+// `base_url` is a field rather than a constant so a gateway, a proxy, or a record/replay fixture
+// server is a constructor argument instead of a fork. `version` is the dated API version the
+// vendor requires on every request; `beta` is the `anthropic-beta` header's comma-joined list.
+@derive(Equatable, Display)
+pub struct Anthropic {
+    pub key: string
+    pub base_url: string = "https://api.anthropic.com"
+    pub version: string = "2023-06-01"
+    pub beta: List<string> = []
+
+    fn new(key: string): Anthropic {
+        return Anthropic { key: key }
+    }
+
+    // Point the codec at a gateway or a proxy. The path (`/v1/messages`) is unchanged — this
+    // replaces the origin only.
+    fn at(base_url: string, key: string): Anthropic {
+        return Anthropic { key: key, base_url: base_url }
+    }
+
+    // Read the key from `ANTHROPIC_API_KEY`. `none` when it is unset or empty — para/ai never
+    // reads a config file and never writes one, so the environment is the whole story.
+    fn from_env(): ?Anthropic {
+        key = env.get("ANTHROPIC_API_KEY") ?? ""
+        if key == "" {
+            return none
+        }
+        return some(Anthropic.new(key))
+    }
+
+    // Opt into one or more `anthropic-beta` features.
+    fn with_beta(flag: string): Anthropic {
+        return Anthropic { ...self, beta: self.beta ~ [flag] }
+    }
+
+    // `max_tokens` is **required** by the Messages API, so a request that does not name one gets
+    // this. 4096 is deliberately unambitious: it is large enough for ordinary answers and small
+    // enough that forgetting to set a budget cannot run up a bill.
+    fn default_max_tokens(): int {
+        return 4096
+    }
+}
+
+// --- Encoding ----------------------------------------------------------------------------------
+
+fn text_block(text: string): Map<string, dyn> {
+    return {"type": "text", "text": text}
+}
+
+fn media_source(mime: string, data: bytes): Map<string, dyn> {
+    src: Map<string, dyn> = {
+        "type": "base64",
+        "media_type": mime,
+        "data": provider.base64(data),
+    }
+    return src
+}
+
+fn encode_image(mime: string, data: bytes): Result<Map<string, dyn>, AiError> {
+    if !mime.starts_with("image/") {
+        return Err(AiError.Encode(
+            provider: "anthropic",
+            message: "an Image part needs an image/* media type, got `${mime}`",
+        ))
+    }
+    blk: Map<string, dyn> = {"type": "image", "source": media_source(mime, data)}
+    return Ok(blk)
+}
+
+// The vendor's `document` block takes PDFs only; anything else has to become text before it can be
+// sent, and guessing that conversion here would be a silent data loss.
+fn encode_file(mime: string, name: string, data: bytes): Result<Map<string, dyn>, AiError> {
+    if mime != "application/pdf" {
+        return Err(AiError.Encode(
+            provider: "anthropic",
+            message: "cannot send `${name}` — Anthropic accepts application/pdf documents, got `${mime}`",
+        ))
+    }
+    doc: Map<string, dyn> = {
+        "type": "document",
+        "source": media_source(mime, data),
+        "title": name,
+    }
+    return Ok(doc)
+}
+
+// `args` is raw JSON text, so it is embedded as real JSON rather than as a quoted string — a
+// vendor reading `"input": "{\"city\":…}"` sees one string parameter, not an object.
+fn tool_use_block(id: string, name: string, input: dyn): Map<string, dyn> {
+    return {"type": "tool_use", "id": id, "name": name, "input": input}
+}
+
+fn encode_tool_call(id: string, name: string, args: string): Result<Map<string, dyn>, AiError> {
+    return match provider.parse_value(args, "tool call `${name}` arguments") {
+        Ok(input) => Ok(tool_use_block(id, name, input)),
+        // A decode failure on the way *out* is an encode failure — re-labeled so the error names
+        // the direction the caller was going.
+        Err(e) => Err(AiError.Encode(provider: "anthropic", message: "${e}")),
+    }
+}
+
+fn tool_result_block(id: string, content: string, is_error: bool): Map<string, dyn> {
+    return {
+        "type": "tool_result",
+        "tool_use_id": id,
+        "content": content,
+        "is_error": is_error,
+    }
+}
+
+fn thinking_block(text: string, signature: string): Map<string, dyn> {
+    return {"type": "thinking", "thinking": text, "signature": signature}
+}
+
+// One neutral `Part` as one Anthropic content block. Returns the codec's rejection for a part the
+// vendor cannot express, naming the part and the provider rather than dropping it.
+fn encode_part(p: Part): Result<Map<string, dyn>, AiError> {
+    return match p {
+        Part.Text(text) => Ok(text_block(text)),
+        Part.Image(mime, data) => encode_image(mime, data),
+        Part.File(mime, name, data) => encode_file(mime, name, data),
+        Part.ToolCall(id, name, args) => encode_tool_call(id, name, args),
+        Part.ToolResult(id, content, is_error) => Ok(tool_result_block(id, content, is_error)),
+        Part.Thinking(text, signature) => Ok(thinking_block(text, signature)),
+    }
+}
+
+fn encode_parts(parts: List<Part>): Result<List<dyn>, AiError> {
+    mut out: List<dyn> = []
+    for p in parts {
+        out = out ~ [encode_part(p)?]
+    }
+    return Ok(out)
+}
+
+// The vendor's role name for a neutral role. `System` never reaches here (it is hoisted), and
+// `Tool` becomes a `user` turn, because Anthropic carries tool results on the user side.
+fn wire_role(r: Role): string {
+    return match r {
+        Role.Assistant => "assistant",
+        _ => "user",
+    }
+}
+
+// Split a conversation into the top-level `system` blocks and the `messages` array.
+//
+// A system turn anywhere in the conversation is hoisted, not just a leading one: some flows append
+// a system reminder mid-conversation, and silently leaving it in `messages` is a vendor-side 400
+// far from the cause.
+fn encode_messages(msgs: List<Message>): Result<(List<dyn>, List<dyn>), AiError> {
+    mut system: List<dyn> = []
+    mut turns: List<dyn> = []
+    for m in msgs {
+        blocks = encode_parts(m.parts)?
+        if m.role == Role.System {
+            system = system ~ blocks
+        } else {
+            turn: Map<string, dyn> = {"role": wire_role(m.role), "content": blocks}
+            turns = turns ~ [turn]
+        }
+    }
+    return Ok((system, turns))
+}
+
+// --- Decoding ----------------------------------------------------------------------------------
+
+fn decode_stop(raw: string): StopReason {
+    return match raw {
+        "end_turn" => StopReason.EndTurn,
+        "" => StopReason.EndTurn,
+        "tool_use" => StopReason.ToolUse,
+        "max_tokens" => StopReason.MaxTokens,
+        "stop_sequence" => StopReason.StopSequence,
+        "refusal" => StopReason.Refusal,
+        // `pause_turn`, `model_context_window_exceeded`, and whatever the vendor adds next: kept
+        // verbatim rather than flattened into `EndTurn`, which would report a truncated answer as
+        // a complete one.
+        _ => StopReason.Other(raw: raw),
+    }
+}
+
+fn decode_usage(u: Map<string, dyn>): Usage {
+    return Usage {
+        input_tokens: provider.int_at(u, "input_tokens"),
+        output_tokens: provider.int_at(u, "output_tokens"),
+        // Cache *reads* are the part of the input that was served from the vendor's prompt cache.
+        // `cache_creation_input_tokens` is a separate (more expensive) billing bucket rather than a
+        // saving, so it is deliberately not folded in here.
+        cached_input_tokens: provider.int_at(u, "cache_read_input_tokens"),
+    }
+}
+
+// One content block as neutral deltas. The block index is the delta id, which is exactly what the
+// streaming protocol uses — so phase 3's decoder produces the same ids and the same fold applies.
+fn decode_block(b: Map<string, dyn>, index: int): Result<List<Delta>, AiError> {
+    id = "${index}"
+    kind = provider.str_at(b, "type")
+    if kind == "text" {
+        return Ok([Delta.TextDelta(id: id, text: provider.str_at(b, "text"))])
+    }
+    if kind == "thinking" {
+        return Ok([
+            Delta.ThinkingDelta(id: id, text: provider.str_at(b, "thinking")),
+            Delta.ThinkingSignature(id: id, signature: provider.str_at(b, "signature")),
+        ])
+    }
+    if kind == "tool_use" {
+        // The vendor's own call id, not the block index — it is what a `tool_result` must address.
+        call_id = provider.str_at(b, "id")
+        return Ok([
+            Delta.ToolCallStart(id: call_id, name: provider.str_at(b, "name")),
+            Delta.ToolCallArgs(id: call_id, fragment: json.stringify(b.get("input") ?? {})),
+        ])
+    }
+    // Loud, not silent. A block type nobody modeled is information — a server-tool result, a
+    // future content kind — and dropping it would turn a partial answer into a complete-looking
+    // one. The path names the offending block so the fix is obvious.
+    return Err(AiError.Decode(
+        path: "content[${index}].type",
+        message: "unsupported Anthropic content block type `${kind}`",
+    ))
+}
+
+// `{"type":"error","error":{"type":…,"message":…}}` as a matchable `AiError.Provider`.
+fn typed_error(status: int, doc: Map<string, dyn>): AiError {
+    inner = provider.obj_at(doc, "error")
+    return AiError.Provider(
+        status: status,
+        code: provider.str_at(inner, "type"),
+        message: provider.str_at(inner, "message"),
+    )
+}
+
+impl Provider for Anthropic {
+    fn name(): string {
+        return "anthropic"
+    }
+
+    fn encode(req: ModelRequest): Result<Wire, AiError> {
+        (system, turns) = encode_messages(req.messages)?
+
+        mut body: Map<string, dyn> = {
+            "model": req.model,
+            "max_tokens": req.max_tokens ?? Anthropic.default_max_tokens(),
+            "messages": turns,
+        }
+        if system.len() > 0 {
+            body = body.set("system", system)
+        }
+        match req.temperature {
+            some(t) => {
+                body = body.set("temperature", t)
+            },
+            none => {},
+        }
+        if req.stop.len() > 0 {
+            stop: List<dyn> = req.stop.map(fn(s) => s)
+            body = body.set("stop_sequences", stop)
+        }
+        // The escape hatch, merged verbatim and last, so it can also override a key this codec
+        // set. Unchecked by design — but a fragment that is not JSON at all is caught here rather
+        // than becoming a vendor-side 400 with no context.
+        for k in req.extra.keys() {
+            body = body.set(k, provider.parse_value(req.extra[k], "extra key `${k}`")?)
+        }
+
+        mut headers = {
+            "x-api-key": self.key,
+            "anthropic-version": self.version,
+            "content-type": "application/json",
+        }
+        if self.beta.len() > 0 {
+            headers = headers.set("anthropic-beta", self.beta.join(","))
+        }
+        return Ok(Wire {
+            url: self.base_url ~ "/v1/messages",
+            method: "post",
+            headers: headers,
+            body: json.stringify(body),
+        })
+    }
+
+    fn decode_reply(body: string): Result<ModelReply, AiError> {
+        doc = provider.parse_object(body, "anthropic reply")?
+        mut deltas: List<Delta> = []
+        for (i, blk) in provider.list_at(doc, "content").enumerate() {
+            deltas = deltas ~ decode_block(blk.as<Map<string, dyn>>() ?? {}, i)?
+        }
+        deltas = deltas ~ [
+            Delta.Stop(reason: decode_stop(provider.str_at(doc, "stop_reason"))),
+            Delta.UsageDelta(usage: decode_usage(provider.obj_at(doc, "usage"))),
+        ]
+        return Ok(provider.fold(deltas, provider.str_at(doc, "model")))
+    }
+
+    // Anthropic's error body is `{"type":"error","error":{"type":…,"message":…}}`. Decoding it into
+    // `AiError.Provider(status, code, message)` is what makes `code == "rate_limit_error"`
+    // matchable instead of a regex over prose.
+    fn decode_error(status: int, body: string): AiError {
+        return match provider.parse_object(body, "anthropic error") {
+            Ok(doc) => typed_error(status, doc),
+            // A body that is not the documented envelope (an HTML error page from a proxy, an
+            // empty 502) is reported verbatim rather than swallowed — the raw text is the only
+            // evidence of what actually answered.
+            Err(_) => AiError.Provider(status: status, code: "", message: body),
+        }
+    }
+
+    // **`none`, and that is a real answer.** Anthropic publishes no local tokenizer — exact counts
+    // need the count-tokens endpoint, which is a network round trip and therefore not something a
+    // pure codec may do. Returning a fabricated number here would be trusted absolutely and be
+    // wrong by a few percent, which surfaces as a vendor-side context error in the middle of a run.
+    // A caller that needs a budget names its own margin instead.
+    fn estimate_tokens(msgs: List<Message>): ?int {
+        return none
+    }
+}
+
+// --- Test helpers ---------------------------------------------------------------------------------
+//
+// Unwrap-or-fail for the two codec doors. A `match` arm cannot both fail an assertion and produce a
+// value, so the unwrapping lives here instead of being repeated (and half-written) per test.
+
+fn encode_or_fail(codec: Anthropic, req: ModelRequest): Wire {
+    match codec.encode(req) {
+        Ok(w) => {
+            return w
+        },
+        Err(e) => {
+            assert(false, "encode failed: ${e}")
+        },
+    }
+    return Wire { url: "" }
+}
+
+fn decode_or_fail(codec: Anthropic, body: string): ModelReply {
+    match codec.decode_reply(body) {
+        Ok(r) => {
+            return r
+        },
+        Err(e) => {
+            assert(false, "decode failed: ${e}")
+        },
+    }
+    return ModelReply { parts: [] }
+}
+
+fn captured_text_reply(): string {
+    return "{\"id\":\"msg_01XFDUDYJgAACzvnptvVoYEL\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5\",\"content\":[{\"type\":\"text\",\"text\":\"Hej! Hur mår du?\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":2095,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":1024,\"output_tokens\":503}}"
+}
+
+fn captured_tool_use_reply(): string {
+    return "{\"id\":\"msg_01Aq9w8rhu5yE8CHnK516NS\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"The user wants the weather.\",\"signature\":\"ErUBCkYIBBgCIkD\"},{\"type\":\"text\",\"text\":\"Let me check.\"},{\"type\":\"tool_use\",\"id\":\"toolu_01A09q90qw90lq917835lq9\",\"name\":\"get_weather\",\"input\":{\"city\":\"Malmö\",\"unit\":\"celsius\"}}],\"stop_reason\":\"tool_use\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":472,\"output_tokens\":91}}"
+}
+
+@test {
+    // A known request, asserted against the exact bytes it produces. `json.stringify` emits map
+    // keys in sorted order, so this is stable — and an exact-string assertion is the only kind that
+    // catches a key silently changing name or moving nesting level.
+    fn encode_produces_exactly_this_json(): void {
+        req = ModelRequest {
+            model: "claude-opus-5",
+            messages: [
+                Message.system("Answer in Swedish."),
+                Message.user("Say hello."),
+            ],
+            max_tokens: some(64),
+            temperature: some(0.0),
+            stop: ["\n\n"],
+        }
+        wire = encode_or_fail(Anthropic.new("sk-test"), req)
+        assert(wire.url == "https://api.anthropic.com/v1/messages")
+        assert(wire.method == "post")
+        assert(wire.body == "{\"max_tokens\":64,\"messages\":[{\"content\":[{\"text\":\"Say hello.\",\"type\":\"text\"}],\"role\":\"user\"}],\"model\":\"claude-opus-5\",\"stop_sequences\":[\"\\n\\n\"],\"system\":[{\"text\":\"Answer in Swedish.\",\"type\":\"text\"}],\"temperature\":0.0}",
+            "exact request body, got: ${wire.body}")
+    }
+
+    fn encode_sends_the_vendors_headers(): void {
+        req = ModelRequest { model: "m", messages: [Message.user("hi")] }
+        match Anthropic.new("sk-abc").with_beta("token-counting-2024-11-01").encode(req) {
+            Ok(w) => {
+                assert(w.headers["x-api-key"] == "sk-abc")
+                assert(w.headers["anthropic-version"] == "2023-06-01")
+                assert(w.headers["content-type"] == "application/json")
+                assert(w.headers["anthropic-beta"] == "token-counting-2024-11-01")
+            },
+            Err(e) => {
+                assert(false, "${e}")
+            },
+        }
+        // No beta flags, no header — an empty `anthropic-beta` is not the same as an absent one.
+        match Anthropic.new("k").encode(req) {
+            Ok(w) => {
+                assert(!w.headers.has("anthropic-beta"))
+            },
+            Err(_) => {
+                assert(false)
+            },
+        }
+    }
+
+    // `max_tokens` is required by the vendor, so a request that omits it still produces a valid
+    // body rather than a 400.
+    fn encode_supplies_the_required_max_tokens(): void {
+        req = ModelRequest { model: "m", messages: [Message.user("hi")] }
+        match Anthropic.new("k").encode(req) {
+            Ok(w) => {
+                assert(w.body.contains("\"max_tokens\":4096"))
+            },
+            Err(e) => {
+                assert(false, "${e}")
+            },
+        }
+    }
+
+    fn encode_points_at_a_gateway_when_told_to(): void {
+        req = ModelRequest { model: "m", messages: [Message.user("hi")] }
+        match Anthropic.at("https://gateway.internal", "k").encode(req) {
+            Ok(w) => {
+                assert(w.url == "https://gateway.internal/v1/messages")
+            },
+            Err(e) => {
+                assert(false, "${e}")
+            },
+        }
+    }
+
+    // A system turn is hoisted out of `messages` wherever it appears — the vendor rejects a
+    // `"role": "system"` entry, and a mid-conversation reminder is a real pattern.
+    fn encode_hoists_every_system_turn(): void {
+        req = ModelRequest {
+            model: "m",
+            messages: [
+                Message.system("first"),
+                Message.user("a"),
+                Message.system("second"),
+                Message.assistant("b"),
+            ],
+        }
+        match Anthropic.new("k").encode(req) {
+            Ok(w) => {
+                assert(w.body.contains("\"system\":[{\"text\":\"first\",\"type\":\"text\"},{\"text\":\"second\",\"type\":\"text\"}]"),
+                    "both system turns hoisted, in order: ${w.body}")
+                assert(!w.body.contains("\"role\":\"system\""), "no system role reaches `messages`")
+            },
+            Err(e) => {
+                assert(false, "${e}")
+            },
+        }
+    }
+
+    // Anthropic has no `tool` role: a tool result rides a `user` turn.
+    fn encode_carries_tool_results_on_a_user_turn(): void {
+        req = ModelRequest {
+            model: "m",
+            messages: [
+                Message.user("weather?"),
+                Message {
+                    role: Role.Assistant,
+                    parts: [Part.ToolCall(id: "toolu_1", name: "weather", args: "{\"city\":\"Malmo\"}")],
+                },
+                Message.tool("toolu_1", "18C", false),
+            ],
+        }
+        match Anthropic.new("k").encode(req) {
+            Ok(w) => {
+                assert(w.body.contains("{\"id\":\"toolu_1\",\"input\":{\"city\":\"Malmo\"},\"name\":\"weather\",\"type\":\"tool_use\"}"),
+                    "the raw args string is embedded as real JSON, not as a string: ${w.body}")
+                assert(w.body.contains("{\"content\":[{\"content\":\"18C\",\"is_error\":false,\"tool_use_id\":\"toolu_1\",\"type\":\"tool_result\"}],\"role\":\"user\"}"),
+                    "tool results ride a user turn: ${w.body}")
+            },
+            Err(e) => {
+                assert(false, "${e}")
+            },
+        }
+    }
+
+    // The signature has to come back or the vendor invalidates the block; nothing here reads it.
+    fn encode_round_trips_a_thinking_signature(): void {
+        req = ModelRequest {
+            model: "m",
+            messages: [Message {
+                role: Role.Assistant,
+                parts: [Part.Thinking(text: "let me see", signature: "EqQBCgIYAh")],
+            }],
+        }
+        match Anthropic.new("k").encode(req) {
+            Ok(w) => {
+                assert(w.body.contains("{\"signature\":\"EqQBCgIYAh\",\"thinking\":\"let me see\",\"type\":\"thinking\"}"),
+                    "${w.body}")
+            },
+            Err(e) => {
+                assert(false, "${e}")
+            },
+        }
+    }
+
+    fn encode_inlines_an_image_as_base64(): void {
+        req = ModelRequest {
+            model: "m",
+            messages: [Message {
+                role: Role.User,
+                parts: [Part.Image(mime: "image/png", data: "foobar".to_bytes())],
+            }],
+        }
+        match Anthropic.new("k").encode(req) {
+            Ok(w) => {
+                assert(w.body.contains("{\"data\":\"Zm9vYmFy\",\"media_type\":\"image/png\",\"type\":\"base64\"}"),
+                    "${w.body}")
+            },
+            Err(e) => {
+                assert(false, "${e}")
+            },
+        }
+    }
+
+    // Loud, at encode, naming the part and the provider — a codec that silently dropped this
+    // would answer a question the user never asked.
+    fn encode_rejects_a_part_the_vendor_cannot_express(): void {
+        req = ModelRequest {
+            model: "m",
+            messages: [Message {
+                role: Role.User,
+                parts: [Part.File(mime: "video/mp4", name: "clip.mp4", data: "x".to_bytes())],
+            }],
+        }
+        match Anthropic.new("k").encode(req) {
+            Ok(w) => {
+                assert(false, "a video must not silently encode")
+            },
+            Err(e) => {
+                assert("${e}".contains("anthropic"), "${e}")
+                assert("${e}".contains("clip.mp4"), "the message names the part: ${e}")
+                assert("${e}".contains("application/pdf"), "and what would work: ${e}")
+            },
+        }
+    }
+
+    fn encode_rejects_a_tool_call_whose_arguments_are_not_json(): void {
+        req = ModelRequest {
+            model: "m",
+            messages: [Message {
+                role: Role.Assistant,
+                parts: [Part.ToolCall(id: "t1", name: "weather", args: "{city: Malmo")],
+            }],
+        }
+        match Anthropic.new("k").encode(req) {
+            Ok(_) => {
+                assert(false, "malformed arguments must not encode")
+            },
+            Err(e) => {
+                assert("${e}".contains("weather"), "${e}")
+            },
+        }
+    }
+
+    // The escape hatch is unchecked in content but not in syntax: a fragment that is not JSON is
+    // caught here rather than becoming an opaque vendor 400.
+    fn encode_merges_the_extra_escape_hatch(): void {
+        req = ModelRequest {
+            model: "m",
+            messages: [Message.user("hi")],
+            extra: {"thinking": "{\"type\": \"adaptive\"}", "top_k": "5"},
+        }
+        match Anthropic.new("k").encode(req) {
+            Ok(w) => {
+                assert(w.body.contains("\"thinking\":{\"type\":\"adaptive\"}"), "${w.body}")
+                assert(w.body.contains("\"top_k\":5"), "${w.body}")
+            },
+            Err(e) => {
+                assert(false, "${e}")
+            },
+        }
+        broken = ModelRequest { model: "m", messages: [], extra: {"thinking": "{oops"} }
+        match Anthropic.new("k").encode(broken) {
+            Ok(_) => {
+                assert(false, "a malformed fragment must be caught at encode")
+            },
+            Err(e) => {
+                assert("${e}".contains("thinking"), "${e}")
+            },
+        }
+    }
+
+    // --- Decoding a real captured response body ---------------------------------------------------
+
+    // A verbatim Anthropic `POST /v1/messages` response — the shape the vendor documents, keys and
+
+    fn decode_reads_a_captured_text_reply(): void {
+        match Anthropic.new("k").decode_reply(captured_text_reply()) {
+            Ok(reply) => {
+                assert(reply.parts == [Part.Text(text: "Hej! Hur mår du?")])
+                assert(reply.stop == StopReason.EndTurn)
+                assert(reply.model == "claude-opus-5")
+                assert(reply.usage.input_tokens == 2095)
+                assert(reply.usage.output_tokens == 503)
+                assert(reply.usage.cached_input_tokens == 1024, "cache reads are the cached input")
+                assert(reply.usage.reasoning_tokens == 0, "Anthropic folds reasoning into output")
+            },
+            Err(e) => {
+                assert(false, "${e}")
+            },
+        }
+    }
+
+    // A captured reply with thinking, prose, and a tool call in one turn — the shape an extended
+
+    fn decode_reads_a_captured_tool_use_reply(): void {
+        match Anthropic.new("k").decode_reply(captured_tool_use_reply()) {
+            Ok(reply) => {
+                assert(reply.stop == StopReason.ToolUse)
+                assert(reply.parts.len() == 3)
+                assert(reply.parts[0] == Part.Thinking(text: "The user wants the weather.", signature: "ErUBCkYIBBgCIkD"))
+                assert(reply.parts[1] == Part.Text(text: "Let me check."))
+                // The vendor's own call id, not the block index — a `tool_result` has to address it.
+                // Arguments come back as raw JSON with keys in `json.stringify`'s sorted order.
+                assert(reply.parts[2] == Part.ToolCall(
+                    id: "toolu_01A09q90qw90lq917835lq9",
+                    name: "get_weather",
+                    args: "{\"city\":\"Malmö\",\"unit\":\"celsius\"}",
+                ))
+                assert(reply.usage.cached_input_tokens == 0, "an absent cache field reads as zero")
+            },
+            Err(e) => {
+                assert(false, "${e}")
+            },
+        }
+    }
+
+    // A reply → request round trip: what the model said, sent straight back as history, has to be
+    // re-encodable. This is the property that catches a decode which loses the tool id or the
+    // thinking signature.
+    fn a_decoded_reply_re_encodes_as_history(): void {
+        codec = Anthropic.new("k")
+        reply = decode_or_fail(codec, captured_tool_use_reply())
+        history = [
+            Message.user("weather in Malmö?"),
+            Message { role: Role.Assistant, parts: reply.parts },
+            Message.tool("toolu_01A09q90qw90lq917835lq9", "18°C, clear", false),
+        ]
+        match codec.encode(ModelRequest { model: "claude-opus-5", messages: history }) {
+            Ok(w) => {
+                assert(w.body.contains("\"signature\":\"ErUBCkYIBBgCIkD\""), "the signature survives")
+                assert(w.body.contains("\"tool_use_id\":\"toolu_01A09q90qw90lq917835lq9\""), "the id survives")
+                assert(w.body.contains("\"input\":{\"city\":\"Malmö\",\"unit\":\"celsius\"}"),
+                    "the arguments go back as JSON, not as a quoted string")
+            },
+            Err(e) => {
+                assert(false, "${e}")
+            },
+        }
+    }
+
+    fn decode_maps_every_stop_reason(): void {
+        assert(decode_stop("end_turn") == StopReason.EndTurn)
+        assert(decode_stop("") == StopReason.EndTurn, "an absent stop reason is a normal end")
+        assert(decode_stop("tool_use") == StopReason.ToolUse)
+        assert(decode_stop("max_tokens") == StopReason.MaxTokens)
+        assert(decode_stop("stop_sequence") == StopReason.StopSequence)
+        assert(decode_stop("refusal") == StopReason.Refusal)
+        // Unmodeled reasons survive rather than being reported as a clean finish.
+        assert(decode_stop("pause_turn") == StopReason.Other(raw: "pause_turn"))
+    }
+
+    // Silently dropping a block nobody modeled would turn a partial answer into one that looks
+    // complete. The path names the block.
+    fn decode_rejects_an_unknown_content_block(): void {
+        body = "{\"model\":\"m\",\"content\":[{\"type\":\"text\",\"text\":\"a\"},{\"type\":\"server_tool_use\",\"id\":\"x\"}],\"stop_reason\":\"end_turn\"}"
+        match Anthropic.new("k").decode_reply(body) {
+            Ok(_) => {
+                assert(false, "an unmodeled block must not be dropped")
+            },
+            Err(e) => {
+                assert("${e}".contains("content[1].type"), "the path names the block: ${e}")
+                assert("${e}".contains("server_tool_use"), "${e}")
+            },
+        }
+    }
+
+    fn decode_reports_a_malformed_body_rather_than_aborting(): void {
+        match Anthropic.new("k").decode_reply("<html>502 Bad Gateway</html>") {
+            Ok(_) => {
+                assert(false, "HTML is not a reply")
+            },
+            Err(e) => {
+                assert("${e}".contains("anthropic reply"), "${e}")
+            },
+        }
+    }
+
+    // --- Error bodies ------------------------------------------------------------------------------
+
+    fn decode_error_reads_the_vendors_typed_error(): void {
+        body = "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Number of request tokens has exceeded your per-minute rate limit\"},\"request_id\":\"req_011CSHoE\"}"
+        e = Anthropic.new("k").decode_error(429, body)
+        // `code` is matchable; nobody has to regex the prose.
+        assert(match e {
+            AiError.Provider(status, code, message) => status == 429 && code == "rate_limit_error"
+                && message.contains("per-minute rate limit"),
+            _ => false,
+        }, "${e}")
+    }
+
+    // An HTML error page from a proxy is not the documented envelope; its text is the only evidence
+    // of what answered, so it is reported verbatim instead of swallowed.
+    fn decode_error_keeps_an_undecodable_body_verbatim(): void {
+        e = Anthropic.new("k").decode_error(502, "<html>Bad Gateway</html>")
+        assert(match e {
+            AiError.Provider(status, code, message) => status == 502 && code == ""
+                && message == "<html>Bad Gateway</html>",
+            _ => false,
+        }, "${e}")
+    }
+
+    // O-5, demonstrated: Anthropic ships no local tokenizer, so it says so rather than guessing.
+    fn estimate_tokens_is_none_because_there_is_no_local_tokenizer(): void {
+        assert(Anthropic.new("k").estimate_tokens([Message.user("hello")]) == none)
+    }
+}

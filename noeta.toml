@@ -1,0 +1,21 @@
+[package]
+name = "para/ai"
+version = "0.1.0"
+toolchain = ">=0.2"
+license = "MIT OR Apache-2.0"
+description = "An agent harness for Noeta: a provider codec seam, a run loop over para/api, and GenAI-semconv telemetry."
+keywords = ["ai", "llm", "agent", "anthropic", "openai"]
+
+[dependencies]
+# The transport para/ai composes over (DESIGN O-6). Retry-with-`Retry-After`, `Mock`, `Record`,
+# `Cache`, and `Logging` are already written and already the idiom this suite documents; the run
+# loop bottoms out in an `Api`, so none of them is para/ai code.
+para = { path = "../para-api" }
+
+# `para/api` ships a native extension crate — the `@openapi` directive's compile-time expansion hook
+# and the `para.api.url` percent-encoder its generated query strings are built with. para/ai
+# contributes no native code of its own, but the grant is per package and a dependency can never
+# authorize its own, so composing over para/api's transport means naming it here. A consumer of
+# para/ai names it too; the README says why.
+[trust]
+native = ["para/api"]
