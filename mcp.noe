@@ -1,0 +1,1473 @@
+// `para.ai.mcp` — an MCP client, and nothing else.
+//
+//     use para.ai.mcp.{McpClient, Stdio}
+//
+//     mem = McpClient.connect(Stdio.new("mcp-memory", ["--db", "./memory.db"]))?
+//     agent = Agent.from(cfg, provider).tools(mem)?
+//
+// **An MCP server's tools and local `#[Tool]` functions are the same thing to an `Agent`.**
+// `McpClient` is a `ToolSource` (DESIGN §6) and nothing more exotic: it goes into the same
+// `Toolbox`, collides on the same names, dispatches through the same `dispatch`, and produces the
+// same `ToolResult` parts. There is deliberately **no MCP-only call path** — the phase-5 approval
+// guard attaches above `Toolbox.call` and therefore covers a memory server's `remember` exactly as
+// it covers a local `weather`, which it could not do if this module dispatched on its own.
+//
+// **Memory is a server, not a subsystem** (DESIGN §1, §7). This package ships no store, no
+// embedder, and no recall heuristic; it ships the client that talks to whichever one you point it
+// at. `examples/memory` is the zero-configuration path — the agent is told the memory tools exist
+// and calls them itself — and phase 5's `Recall` guard is the automatic one.
+//
+// **Resources are not auto-injected.** `client.resources()` and `client.read(uri)` hand you the
+// server's documents; putting one in the context is your decision, because auto-injection is how
+// context windows quietly fill up (DESIGN §7).
+//
+// **Sampling is off by default.** A server that asks the client to call a model is asking for your
+// API key and your budget, so `connect` advertises no `sampling` capability at all and answers such
+// a request with a JSON-RPC "method not found". `connect_sampling(t, sampler, budget)` turns it on
+// explicitly, counts every call against `budget`, and refuses past it.
+//
+// ## What happens when a server crashes, hangs, or dies mid-call
+//
+// Written down deliberately, because "the agent hung" is the worst failure this module can have.
+// Every claim here was measured against the toolchain rather than assumed; the measurements are in
+// the comments at each mechanism.
+//
+//   * **A server that will not start** is an error, not an abort. `os.spawn` of a missing binary
+//     aborts the whole process (E0021, measured), so `Stdio.start` resolves the command against
+//     `PATH` *first* and returns `AiError.Mcp(server, "spawn", …)` when it is not there.
+//   * **A server that crashes** closes its stdout, which ends the blocked read at once — a crashed
+//     server unblocks the agent rather than hanging it. The exit status and the last stderr line
+//     come back in the error, the session is marked dead, and every later call fails immediately
+//     instead of writing to a broken pipe.
+//   * **A server that dies mid-call** is that same path: the call in flight becomes
+//     `AiError.Mcp(server, "server_exited", …)`, which `dispatch` turns into a
+//     `ToolResult(is_error: true)` turn — the model is told the tool is gone and can try something
+//     else. The `Toolbox` keeps the source; a later call re-reports the dead session rather than
+//     resurrecting it silently.
+//   * **A server that hangs** — alive, holding its stdout open, answering nothing — is the case the
+//     language cannot bound for free, so `Stdio.with_deadline(ms)` bounds it with a watchdog that
+//     kills the server. It is **opt-in** and terminal; see `deadline_watch` for why it is built the
+//     way it is and what it costs.
+//   * **A chatty server** cannot spin forever either way: a reply is awaited for at most
+//     `read_budget` intervening documents (default 64), after which the exchange fails.
+namespace para.ai.mcp
+
+use std.{env, fs, json, os}
+use std.id.{uuid}
+use std.task.{map_bounded, sleep}
+use para.ai.{AiError, Message, Part, Role}
+use para.ai.provider
+use para.ai.tools.{ToolSource, ToolSpec}
+
+// --- The protocol ---------------------------------------------------------------------------------
+
+// The MCP revision this client speaks, sent as `initialize.protocolVersion`.
+//
+// A server that answers with a different revision is **recorded, not rejected**: every revision so
+// far has been additive over the parts this client uses (initialize, tools, resources, prompts), and
+// refusing to talk to a server one revision newer than us would be a worse failure than the one it
+// prevents. `client.protocol()` reports what the server actually said, so a caller who cares can
+// check.
+pub fn protocol_version(): string {
+    return "2025-06-18"
+}
+
+// How many documents that are *not* the reply may arrive before an exchange gives up.
+//
+// Notifications and server→client requests legitimately interleave with a reply, so the count
+// cannot be zero — but it has to be finite, or a server that emits progress notifications in a loop
+// is an agent that never returns.
+fn read_budget(): int {
+    return 64
+}
+
+fn empty_object(): Map<string, dyn> {
+    e: Map<string, dyn> = {}
+    return e
+}
+
+// One JSON-RPC request document, as the exact bytes that go on the wire.
+//
+// `json.stringify` sorts keys, which is what makes the wire format assertable in a test the way the
+// provider codecs' request bodies are.
+pub fn request_doc(id: int, method: string, params: Map<string, dyn>): string {
+    doc: Map<string, dyn> = {"id": id, "jsonrpc": "2.0", "method": method, "params": params}
+    return json.stringify(doc)
+}
+
+// A notification — a request with no `id`, which is precisely what tells a server not to answer it.
+pub fn notification_doc(method: string, params: Map<string, dyn>): string {
+    doc: Map<string, dyn> = {"jsonrpc": "2.0", "method": method, "params": params}
+    return json.stringify(doc)
+}
+
+// A reply to a **server→client** request. The id is echoed back verbatim as the `dyn` it arrived as,
+// because JSON-RPC allows a string id and a client that renumbered one would answer nobody.
+fn result_doc(id: dyn, result: Map<string, dyn>): string {
+    doc: Map<string, dyn> = {"id": id, "jsonrpc": "2.0", "result": result}
+    return json.stringify(doc)
+}
+
+fn error_doc(id: dyn, code: int, message: string): string {
+    err: Map<string, dyn> = {"code": code, "message": message}
+    doc: Map<string, dyn> = {"error": err, "id": id, "jsonrpc": "2.0"}
+    return json.stringify(doc)
+}
+
+// The `initialize` parameters. `sampling` is in `capabilities` only when a sampler was supplied —
+// advertising a capability this client would then refuse to honor is how a server ends up waiting
+// on a request that will never be answered.
+pub fn initialize_params(sampling: bool): Map<string, dyn> {
+    mut caps: Map<string, dyn> = {}
+    if sampling {
+        caps = caps.set("sampling", empty_object())
+    }
+    info: Map<string, dyn> = {"name": "para/ai", "title": "para/ai", "version": "0.1.0"}
+    params: Map<string, dyn> = {
+        "capabilities": caps,
+        "clientInfo": info,
+        "protocolVersion": protocol_version(),
+    }
+    return params
+}
+
+// Parse one JSON-RPC document, **recoverably**.
+//
+// `json.try_parse(text)` is the dynamic door — `Result<dyn, JsonError>`, no declared type — and it
+// is the right one here for the reason DESIGN §13 gives: every document this module reads is remote
+// input of a shape we did not declare. `json.parse` aborts on malformed input, so a server that
+// emitted one bad line would take the agent's whole process down with it.
+fn parse_doc(text: string, what: string): Result<Map<string, dyn>, AiError> {
+    return match json.try_parse(text) {
+        Ok(v) => object_of(v, text, what),
+        Err(e) => Err(AiError.Decode(path: e.path(), message: "${what}: ${e.message()}")),
+    }
+}
+
+fn object_of(v: dyn, text: string, what: string): Result<Map<string, dyn>, AiError> {
+    return match v.as<Map<string, dyn>>() {
+        some(o) => Ok(o),
+        none => Err(AiError.Decode(
+            path: "",
+            message: "${what}: a JSON-RPC message is an object, and this is `${text}`",
+        )),
+    }
+}
+
+// --- What a server said it can do -----------------------------------------------------------------
+
+// A server's advertised capabilities, flattened to the questions this client actually asks.
+//
+// Negotiation is not decoration here: `specs()` refuses a server that advertises no `tools`, and
+// `resources()`/`prompt()` refuse one that advertises no `resources`/`prompts`. The alternative is
+// an empty list that reads exactly like "this server has nothing", which sends people looking in the
+// wrong place.
+@derive(Equatable, Display)
+pub struct Capabilities {
+    pub tools: bool = false
+    pub tools_list_changed: bool = false
+    pub resources: bool = false
+    pub resources_subscribe: bool = false
+    pub resources_list_changed: bool = false
+    pub prompts: bool = false
+    pub prompts_list_changed: bool = false
+    pub logging: bool = false
+    pub completions: bool = false
+}
+
+fn sub_flag(caps: Map<string, dyn>, group: string, key: string): bool {
+    inner = provider.obj_at(caps, group)
+    return (inner.get(key) ?? false).as<bool>() ?? false
+}
+
+pub fn capabilities_of(caps: Map<string, dyn>): Capabilities {
+    return Capabilities {
+        tools: caps.has("tools"),
+        tools_list_changed: sub_flag(caps, "tools", "listChanged"),
+        resources: caps.has("resources"),
+        resources_subscribe: sub_flag(caps, "resources", "subscribe"),
+        resources_list_changed: sub_flag(caps, "resources", "listChanged"),
+        prompts: caps.has("prompts"),
+        prompts_list_changed: sub_flag(caps, "prompts", "listChanged"),
+        logging: caps.has("logging"),
+        completions: caps.has("completions"),
+    }
+}
+
+// --- The value types the non-tool surfaces hand back ----------------------------------------------
+
+// One resource a server offers. Value types throughout, so a resource can cross a channel or an
+// isolate boundary like every other type in this package (DESIGN §2.3).
+@derive(Equatable, Display)
+pub struct Resource {
+    pub uri: string
+    pub name: string = ""
+    pub title: string = ""
+    pub description: string = ""
+    pub mime: string = ""
+}
+
+// One resource's contents.
+//
+// `blob` is **base64 exactly as the server sent it**, undecoded. The package has a base64 encoder
+// (`provider.base64`) and no decoder, and handing back invented bytes would be worse than handing
+// back the text that arrived — so a binary resource is passed through for the caller to decode.
+@derive(Equatable, Display)
+pub struct ResourceContent {
+    pub uri: string
+    pub mime: string = ""
+    pub text: string = ""
+    pub blob: string = ""
+}
+
+@derive(Equatable, Display)
+pub struct PromptArg {
+    pub name: string
+    pub description: string = ""
+    pub required: bool = false
+}
+
+@derive(Equatable, Display)
+pub struct PromptSpec {
+    pub name: string
+    pub title: string = ""
+    pub description: string = ""
+    pub arguments: List<PromptArg> = []
+}
+
+// --- The transport seam ---------------------------------------------------------------------------
+
+// Where JSON-RPC documents go and come from.
+//
+// **Correlation is not here.** A transport moves whole documents and knows nothing about ids,
+// notifications, or server→client requests; matching a reply to its request, answering a sampling
+// request, and noticing a `list_changed` all live once in `McpClient`. That is what keeps stdio and
+// streamable HTTP from growing two copies of the protocol.
+pub trait Transport {
+    // A stable, low-cardinality identity for messages: `stdio:mcp-memory`, `http:https://…/mcp`.
+    fn label(): string
+
+    // Bring the transport up — spawn the child, or check the endpoint. Separate from construction
+    // because it can fail, and a constructor that returns a `Result` cannot be chained.
+    fn start(): Result<void, AiError>
+
+    // Put one document on the wire.
+    fn send_doc(doc: string): Result<void, AiError>
+
+    // The next document, blocking until it arrives. `Ok(none)` means "no more in this exchange" —
+    // an HTTP response with nothing left in it, not a broken session; a broken session is `Err`.
+    fn next_doc(): Result<?string, AiError>
+
+    // Server→client documents that arrive outside a reply, up to `max` of them.
+    fn poll(max: int): Result<List<string>, AiError>
+
+    // Release the server. Idempotent — `close` on an already-closed client is not an error.
+    fn shutdown(): void
+}
+
+// --- stdio ------------------------------------------------------------------------------------------
+
+// The transport DESIGN §7 says needs no native code at all: `os.spawn` gives a `Process` with
+// `write`/`read_line`/`try_wait`/`kill`, and newline-delimited JSON over that is ordinary Noeta.
+//
+// Three toolchain facts shape this class, each measured rather than assumed:
+//
+//   1. **`os.spawn` of a missing binary aborts the process** (E0021 `cannot start …`). A library
+//      whose contract is "a failing tool is a turn, not an outage" cannot call it blind, so `start`
+//      resolves the command against `PATH` itself and refuses first.
+//   2. **`Process.write` to a dead child aborts the process** (E0021 `Broken pipe`). So every write
+//      is preceded by a `try_wait` liveness check, and a session known dead is never written to.
+//      The residual race — the child dying between the check and the write — is real and named in
+//      the bug list; closing it needs a recoverable write door in std.
+//   3. **`Process.read_line` blocks the whole scheduler.** A sibling task `spawn`ed in the same
+//      isolate never runs while it is parked (measured: a 300 ms watchdog fired only after the 5 s
+//      child exited), so a timeout cannot be a `race` and has to be `deadline_watch`'s isolate.
+pub class Stdio {
+    mut command: string
+    mut args: List<string>
+    // 0 disables the watchdog, which is the default. See `with_deadline`.
+    mut deadline_ms: int
+    mut child: ?os.Process
+    mut running: bool
+    mut exit_status: int
+    mut exited: bool
+    mut beacon: string
+    mut seq: int
+    mut last_error: string
+
+    fn new(command: string, args: List<string> = []): Stdio {
+        return Stdio {
+            command: command,
+            args: args,
+            deadline_ms: 0,
+            child: none,
+            running: false,
+            exit_status: 0,
+            exited: false,
+            beacon: "",
+            seq: 0,
+            last_error: "",
+        }
+    }
+
+    // Bound each blocking read by `ms` of wall clock. **Opt-in, and terminal**: when it fires, the
+    // server is killed and the session ends.
+    //
+    // It is off by default and that is a decision rather than an omission, because of what it costs
+    // and what the language makes it cost:
+    //
+    //   * A blocked `read_line` parks the scheduler, so the only thing that can run beside it is a
+    //     separate **isolate** (measured: an isolate watchdog killed a silent child at 300 ms while
+    //     a `spawn`ed task in the same isolate could not). An isolate needs a `concurrent` block,
+    //     which is E0040 in a synchronous `fn` — and `ToolSource.call` is synchronous and must stay
+    //     so, since it is held as `dyn` and `async` through `dyn` is unsound (DESIGN O-2). So the
+    //     read is driven through `map_bounded`, exactly as `run_sync` drives the run loop.
+    //   * A parked isolate **cannot be cancelled**: `h.cancel()` reports `Err(Cancelled)` to the
+    //     joiner and the isolate still runs to completion in its own thread (measured — the kill
+    //     still landed). So the watchdog is disarmed by a **beacon file** it polls, and the join
+    //     costs at most one poll slice.
+    //   * The kill goes through `kill(1)`, since the `Process` handle is not `Send` and cannot cross
+    //     into the isolate. That makes the deadline POSIX-only, which is the second reason it is not
+    //     the default.
+    //
+    // What you get for that: a hung server ends the *call* rather than the process, as
+    // `AiError.Mcp(server, "timeout", …)` — a failed turn like any other.
+    fn with_deadline(ms: int): Stdio {
+        self.deadline_ms = ms
+        return self
+    }
+
+    // The child, or a typed failure if it was never started or has already gone.
+    fn handle(): Result<os.Process, AiError> {
+        return match self.child {
+            some(p) => Ok(p),
+            none => Err(AiError.Mcp(
+                server: self.label(),
+                code: "closed",
+                message: "the server is not running — `connect` starts it and `close` stops it",
+            )),
+        }
+    }
+
+    // Refresh liveness from the child itself. Non-blocking: `try_wait` reaps an exited child and
+    // reports `none` for one that is still going.
+    fn reap(): void {
+        match self.child {
+            some(p) => {
+                match p.try_wait() {
+                    some(r) => {
+                        self.running = false
+                        self.exited = true
+                        self.exit_status = r.status()
+                    },
+                    none => {},
+                }
+            },
+            none => {},
+        }
+        return
+    }
+
+    // What the server said on the way out, for the error message. Read only after the child has
+    // exited, where `read_err_line` cannot block for long.
+    fn stderr_tail(): string {
+        return match self.child {
+            some(p) => match p.read_err_line() {
+                some(line) => line,
+                none => "",
+            },
+            none => "",
+        }
+    }
+
+    fn exit_note(): string {
+        tail = self.stderr_tail()
+        base = "the server exited with status ${self.exit_status}"
+        return if tail == "" then base else "${base}: ${tail}"
+    }
+
+    // The child's stdout closed. Either it exited — in which case the status and its last words are
+    // the useful part — or it closed the channel and stayed up, which is just as terminal.
+    fn ended(): Result<?string, AiError> {
+        self.reap()
+        if self.exited {
+            self.running = false
+            return Err(AiError.Mcp(server: self.label(), code: "server_exited", message: self.exit_note()))
+        }
+        self.running = false
+        return Err(AiError.Mcp(
+            server: self.label(),
+            code: "eof",
+            message: "the server closed its output stream without answering",
+        ))
+    }
+
+    // One line off the child's stdout, bounded by the deadline when one is configured.
+    fn read_bounded(): Result<?string, AiError> {
+        p = self.handle()?
+        if self.deadline_ms <= 0 {
+            return Ok(p.read_line())
+        }
+        self.seq = self.seq + 1
+        token = "${self.seq}"
+        fs.write(self.beacon, token)
+        out = read_guarded(ReadJob {
+            child: p,
+            deadline_ms: self.deadline_ms,
+            beacon: self.beacon,
+            token: token,
+        })
+        if out.timed_out {
+            self.running = false
+            self.exited = true
+            return Err(AiError.Mcp(
+                server: self.label(),
+                code: "timeout",
+                message: "no reply within ${self.deadline_ms}ms — the server was terminated, and this session is over",
+            ))
+        }
+        return Ok(out.line)
+    }
+
+    // Inline rather than a standalone `impl Transport for Stdio` block: a standalone impl is
+    // invisible to `dyn` coercion from every module but this one, which makes `McpClient.connect`
+    // fail from a consumer and pass here (AGENTS.md).
+    impl Transport {
+        fn label(): string {
+            return "stdio:${self.command}"
+        }
+
+        // Resolve the command *before* spawning, because `os.spawn` aborts on a missing binary
+        // rather than returning an error — see the class comment.
+        fn start(): Result<void, AiError> {
+            if self.running {
+                return Ok()
+            }
+            resolved = resolve_command(self.command)
+            if resolved == "" {
+                return Err(AiError.Mcp(
+                    server: self.label(),
+                    code: "spawn",
+                    message: "no such command `${self.command}` on PATH — an MCP server that is not installed is a configuration error, not a tool failure",
+                ))
+            }
+            self.child = some(os.spawn(resolved, self.args))
+            self.running = true
+            self.exited = false
+            if self.deadline_ms > 0 {
+                self.beacon = "${temp_dir()}/para-ai-mcp-${uuid()}.beacon"
+                fs.write(self.beacon, "idle")
+            }
+            return Ok()
+        }
+
+        fn send_doc(doc: string): Result<void, AiError> {
+            p = self.handle()?
+            self.reap()
+            if !self.running {
+                return Err(AiError.Mcp(server: self.label(), code: "server_exited", message: self.exit_note()))
+            }
+            // One document, one line. `json.stringify` never emits a raw newline, so a document can
+            // never be split across two lines by accident.
+            p.write(doc ~ "\n")
+            return Ok()
+        }
+
+        fn next_doc(): Result<?string, AiError> {
+            self.reap()
+            if !self.running {
+                return Err(AiError.Mcp(server: self.label(), code: "server_exited", message: self.exit_note()))
+            }
+            line = self.read_bounded()?
+            return match line {
+                some(text) => Ok(some(text)),
+                // EOF. Reap first: a server that crashed *during* this read was alive at the
+                // liveness check above, and "exit status 3" is a far better error than "the stream
+                // ended" for the person who has to fix it.
+                none => self.ended(),
+            }
+        }
+
+        // stdio has no way to *probe* for a pending message: every read door blocks, so asking
+        // "is anything there?" costs the same as waiting forever if nothing is. Server→client
+        // messages therefore reach the client where they actually arrive in practice — interleaved
+        // with a reply, which `McpClient.await_reply` handles — and this stays empty rather than
+        // pretending to poll.
+        fn poll(max: int): Result<List<string>, AiError> {
+            empty: List<string> = []
+            return Ok(empty)
+        }
+
+        // Close stdin first: EOF on stdin is how the MCP stdio transport asks a server to exit.
+        // Then reap, and kill whatever is still there. **No unbounded wait** — a synchronous wait
+        // cannot be bounded (see `with_deadline`), and a server that ignores EOF would otherwise
+        // hang the caller's `close`.
+        fn shutdown(): void {
+            match self.child {
+                some(p) => {
+                    p.close_stdin()
+                    nap(20)
+                    self.reap()
+                    if self.running {
+                        p.kill()
+                        self.running = false
+                    }
+                },
+                none => {},
+            }
+            if self.beacon != "" {
+                fs.remove(self.beacon)
+                self.beacon = ""
+            }
+            self.child = none
+            return
+        }
+    }
+}
+
+// Where a PATH lookup lives, so `start` never hands `os.spawn` a name it cannot
+// resolve. A command containing a separator is taken literally; anything else is looked up in
+// `PATH`, in order, exactly as a shell would.
+pub fn resolve_command(command: string): string {
+    if command.contains("/") {
+        return if fs.exists(command) then command else ""
+    }
+    for dir in (env.get("PATH") ?? "").split(":") {
+        candidate = "${dir}/${command}"
+        if dir != "" && fs.exists(candidate) {
+            return candidate
+        }
+    }
+    return ""
+}
+
+fn temp_dir(): string {
+    return env.get("TMPDIR") ?? "/tmp"
+}
+
+// --- The deadline watchdog --------------------------------------------------------------------------
+
+// One bounded read, packaged so `map_bounded` can drive it — the same bridge `run_sync` uses to
+// reach an `async` loop from a synchronous door.
+struct ReadJob {
+    child: os.Process
+    deadline_ms: int
+    beacon: string
+    token: string
+}
+
+struct ReadOut {
+    line: ?string = none
+    timed_out: bool = false
+}
+
+// The watchdog, which runs in **its own isolate** because that is the only thing that runs beside a
+// blocked `read_line` (measured — see `Stdio.with_deadline`).
+//
+// It polls the beacon rather than sleeping the whole deadline for two reasons: a parked isolate
+// cannot be cancelled, so the beacon is the only disarm available; and polling means the join at the
+// end of the `concurrent` block costs one slice rather than the whole deadline.
+//
+// Only `Send` values cross the boundary — the `Process` handle cannot, which is why the kill goes
+// through `kill(1)` by pid.
+async fn deadline_watch(pid: int, ms: int, beacon: string, token: string): int {
+    slice = 5
+    mut waited = 0
+    mut fired = 0
+    mut watching = true
+    while watching {
+        sleep(slice).await
+        waited = waited + slice
+        if !armed(beacon, token) {
+            watching = false
+        } else if waited >= ms {
+            os.exec("kill", ["-KILL", "${pid}"])
+            fired = 1
+            watching = false
+        }
+    }
+    return fired
+}
+
+fn armed(beacon: string, token: string): bool {
+    return fs.exists(beacon) && fs.read(beacon) == token
+}
+
+async fn guarded(j: ReadJob): ReadOut {
+    mut line: ?string = none
+    mut fired = 0
+    concurrent {
+        h = isolate deadline_watch(j.child.pid(), j.deadline_ms, j.beacon, j.token)
+        line = j.child.read_line()
+        // Disarm before joining: the watchdog sees this on its next poll and returns without
+        // killing a server that answered in time.
+        fs.write(j.beacon, "done")
+        fired = match h.join() {
+            Ok(v) => v,
+            Err(_) => 0,
+        }
+    }
+    return ReadOut { line: line, timed_out: fired == 1 }
+}
+
+fn read_guarded(j: ReadJob): ReadOut {
+    return map_bounded([j], 1, guarded)[0]
+}
+
+// A real pause from synchronous code. `time.sleep` advances a *logical* clock and returns at once,
+// so the only real timer is `task.sleep`, which needs an async context — `map_bounded` is the bridge
+// there too.
+struct Nap {
+    ms: int
+}
+
+async fn napping(n: Nap): int {
+    sleep(n.ms).await
+    return 0
+}
+
+fn nap(ms: int): void {
+    napped = map_bounded([Nap { ms: ms }], 1, napping)
+    return
+}
+
+// --- Sampling ---------------------------------------------------------------------------------------
+
+// A server asking the client to call a model.
+//
+// The seam is deliberately raw JSON in and raw JSON out: a `sampling/createMessage` request carries
+// model preferences, a system prompt, and an intent this package has no opinion about, and a typed
+// surface here would be a second, worse copy of `ModelRequest`. What the client owns is the
+// *policy* — whether sampling is on at all, and how many times.
+pub trait Sampler {
+    // The request's `params` as JSON text; the JSON-RPC `result` object as JSON text.
+    fn sample(params: string): Result<string, AiError>
+}
+
+// The default. A client that was given no sampler advertises no `sampling` capability, so a
+// well-behaved server never asks — and one that asks anyway is answered rather than ignored, since
+// an ignored request is a server that waits forever.
+pub struct NoSampling {
+    impl Sampler {
+        fn sample(params: string): Result<string, AiError> {
+            return Err(AiError.Mcp(
+                server: "",
+                code: "sampling",
+                message: "sampling is off — it hands a subprocess your API key, so turning it on is `McpClient.connect_sampling(transport, sampler, budget)`",
+            ))
+        }
+    }
+}
+
+// --- The client ---------------------------------------------------------------------------------------
+
+// An MCP session, and a `ToolSource`.
+//
+// A `class` because it is a session: an id counter, a cached tool list, a sampling budget, and a
+// transport that has state of its own. Like every other `dyn` slot in this package that makes it
+// `!Send` — build it per worker, ship the config (DESIGN §2.3).
+pub class McpClient {
+    mut transport: dyn Transport
+    mut server: string
+    mut server_version: string
+    mut protocol_revision: string
+    mut caps: Capabilities
+    mut cached: List<ToolSpec>
+    mut listed: bool
+    mut next_id: int
+    mut sampler: dyn Sampler
+    mut sampling_on: bool
+    mut sampling_budget: int
+    mut sampling_used: int
+    mut notifications: int
+    mut closed: bool
+
+    // Connect, negotiate, and list. `connect` is the whole handshake — `initialize`, the
+    // capability exchange, `notifications/initialized`, and the first `tools/list` — so an agent
+    // that has a client has a usable one, and a server that is broken says so here rather than at
+    // the first model call.
+    fn connect(t: dyn Transport): Result<McpClient, AiError> {
+        return McpClient.begin(t, NoSampling {}, false, 0)
+    }
+
+    // Connect with sampling **on**, bounded by `budget` calls for the session.
+    //
+    // Explicit and budgeted because it hands a subprocess your API key: the capability is advertised
+    // only on this path, every request is counted, and the one past the budget is refused with a
+    // JSON-RPC error rather than quietly served.
+    fn connect_sampling(t: dyn Transport, s: dyn Sampler, budget: int): Result<McpClient, AiError> {
+        return McpClient.begin(t, s, true, budget)
+    }
+
+    // A client that never connected to anything, and knows it. It exists for the unreachable branch
+    // of an unwrap-or-fail test helper — a `match` arm cannot both fail an assertion and produce a
+    // value, and a `class`'s fields are private, so the fallback has to be built in here.
+    fn unstarted(): McpClient {
+        return McpClient {
+            transport: Stdio.new("true", []),
+            server: "unstarted",
+            server_version: "",
+            protocol_revision: "",
+            caps: Capabilities {},
+            cached: [],
+            listed: false,
+            next_id: 0,
+            sampler: NoSampling {},
+            sampling_on: false,
+            sampling_budget: 0,
+            sampling_used: 0,
+            notifications: 0,
+            closed: true,
+        }
+    }
+
+    fn begin(t: dyn Transport, s: dyn Sampler, sampling: bool, budget: int): Result<McpClient, AiError> {
+        c = McpClient {
+            transport: t,
+            server: t.label(),
+            server_version: "",
+            protocol_revision: "",
+            caps: Capabilities {},
+            cached: [],
+            listed: false,
+            next_id: 0,
+            sampler: s,
+            sampling_on: sampling,
+            sampling_budget: budget,
+            sampling_used: 0,
+            notifications: 0,
+            closed: false,
+        }
+        c.handshake()?
+        return Ok(c)
+    }
+
+    // --- Identity ------------------------------------------------------------------------------
+
+    // The server's own name, once it has said one — `mcp:memory` rather than `mcp:npx`, which is
+    // what makes a collision message name something a reader recognizes.
+    fn server_name(): string {
+        return self.server
+    }
+
+    fn server_info(): string {
+        return "${self.server} ${self.server_version}"
+    }
+
+    // What the server answered `initialize` with, which need not be what we asked for.
+    fn protocol(): string {
+        return self.protocol_revision
+    }
+
+    fn capabilities(): Capabilities {
+        return self.caps
+    }
+
+    // How many notifications the server has sent. Worth having: `notifications/tools/list_changed`
+    // silently invalidating a cache is exactly the kind of thing a test should be able to see.
+    fn notification_count(): int {
+        return self.notifications
+    }
+
+    fn is_closed(): bool {
+        return self.closed
+    }
+
+    // --- The session ---------------------------------------------------------------------------
+
+    fn take_id(): int {
+        self.next_id = self.next_id + 1
+        return self.next_id
+    }
+
+    fn handshake(): Result<void, AiError> {
+        self.transport.start()?
+        reply = self.exchange("initialize", initialize_params(self.sampling_on))?
+        self.protocol_revision = provider.str_at(reply, "protocolVersion")
+        if self.protocol_revision == "" {
+            return Err(AiError.Mcp(
+                server: self.server,
+                code: "protocol",
+                message: "`initialize` answered without a `protocolVersion`, so this is not an MCP server",
+            ))
+        }
+        self.caps = capabilities_of(provider.obj_at(reply, "capabilities"))
+        info = provider.obj_at(reply, "serverInfo")
+        named = provider.str_at(info, "name")
+        if named != "" {
+            self.server = "mcp:${named}"
+        }
+        self.server_version = provider.str_at(info, "version")
+        // The server is not fully initialized until it has been told the handshake completed.
+        self.transport.send_doc(notification_doc("notifications/initialized", empty_object()))?
+        if self.caps.tools {
+            self.refresh_tools()?
+        }
+        return Ok()
+    }
+
+    // One request, one reply. Everything below `handshake` goes through here, so the id
+    // correlation, the inbound-message handling, and the read budget exist exactly once.
+    fn exchange(method: string, params: Map<string, dyn>): Result<Map<string, dyn>, AiError> {
+        if self.closed {
+            return Err(AiError.Mcp(
+                server: self.server,
+                code: "closed",
+                message: "this session is closed — `${method}` has nowhere to go",
+            ))
+        }
+        id = self.take_id()
+        self.transport.send_doc(request_doc(id, method, params))?
+        return self.await_reply(id, method)
+    }
+
+    // Read until the reply with our id turns up, handling everything else on the way.
+    //
+    // A server may legitimately interleave notifications and its own requests with a reply, so this
+    // cannot be "read one document". It is bounded all the same: `read_budget` intervening
+    // documents, then the exchange fails rather than looping forever.
+    fn await_reply(id: int, method: string): Result<Map<string, dyn>, AiError> {
+        mut left = read_budget()
+        mut answer = unsettled(self.budget_spent(method))
+        mut waiting = true
+        while waiting && left > 0 {
+            left = left - 1
+            match self.transport.next_doc() {
+                Err(e) => {
+                    answer = unsettled(e)
+                    waiting = false
+                },
+                Ok(arrived) => {
+                    match arrived {
+                        none => {
+                            answer = unsettled(self.stopped(method))
+                            waiting = false
+                        },
+                        some(text) => {
+                            match self.step(text, id, method) {
+                                Err(e) => {
+                                    answer = unsettled(e)
+                                    waiting = false
+                                },
+                                Ok(reply) => {
+                                    match reply {
+                                        some(result) => {
+                                            answer = settled(result)
+                                            waiting = false
+                                        },
+                                        none => {},
+                                    }
+                                },
+                            }
+                        },
+                    }
+                },
+            }
+        }
+        return answer
+    }
+
+    // The transport ran dry mid-exchange: an HTTP response with no reply in it, or a stdio channel
+    // that ended. Either way the request has no answer coming.
+    fn stopped(method: string): AiError {
+        return AiError.Mcp(
+            server: self.server,
+            code: "eof",
+            message: "the server stopped answering before it answered `${method}`",
+        )
+    }
+
+    // What an exchange that never got its reply says. The starting value of `await_reply`'s
+    // accumulator, so the budget running out is a real answer rather than a fallthrough.
+    fn budget_spent(method: string): AiError {
+        return AiError.Mcp(
+            server: self.server,
+            code: "read_budget",
+            message: "the server sent ${read_budget()} messages without answering `${method}`",
+        )
+    }
+
+    // One inbound document: the reply we are waiting for (`some`), or something else that has now
+    // been handled (`none`).
+    fn step(text: string, id: int, method: string): Result<?Map<string, dyn>, AiError> {
+        doc = parse_doc(text, "`${method}` reply")?
+        if is_reply_to(doc, id) {
+            return match result_of(doc, self.server, method) {
+                Ok(result) => Ok(some(result)),
+                Err(e) => Err(e),
+            }
+        }
+        self.inbound(doc)?
+        return Ok(none)
+    }
+
+    // A document that is not our reply: a notification, a server→client request, or a reply to an
+    // id we are no longer waiting for.
+    fn inbound(doc: Map<string, dyn>): Result<void, AiError> {
+        method = provider.str_at(doc, "method")
+        if method == "" {
+            // A stale reply — an exchange that timed out and one that the server answered late.
+            // Dropping it is right; the id it answers is nobody's now.
+            return Ok()
+        }
+        if !doc.has("id") {
+            self.notifications = self.notifications + 1
+            if method == "notifications/tools/list_changed" {
+                // Do not fetch here: `specs()` is where a list is needed, and refetching inside
+                // someone else's exchange would nest a request inside a request.
+                self.listed = false
+            }
+            return Ok()
+        }
+        return self.answer_request(doc, method)
+    }
+
+    // **Every server→client request is answered**, including the ones this client does not
+    // implement. An ignored request is a server blocked forever on a reply that is not coming,
+    // which looks from the outside exactly like a hung agent.
+    fn answer_request(doc: Map<string, dyn>, method: string): Result<void, AiError> {
+        id = doc.get("id") ?? 0
+        if method != "sampling/createMessage" {
+            // -32601 is JSON-RPC's "method not found", which is the honest answer: this client
+            // never advertised the capability behind it.
+            return self.transport.send_doc(error_doc(id, -32601, "para/ai does not implement `${method}`"))
+        }
+        if !self.sampling_on {
+            return self.transport.send_doc(error_doc(
+                id,
+                -32601,
+                "this client did not advertise the `sampling` capability — turn it on with `connect_sampling`",
+            ))
+        }
+        if self.sampling_used >= self.sampling_budget {
+            return self.transport.send_doc(error_doc(
+                id,
+                -32000,
+                "the sampling budget of ${self.sampling_budget} call(s) for this session is spent",
+            ))
+        }
+        self.sampling_used = self.sampling_used + 1
+        params = json.stringify(provider.obj_at(doc, "params"))
+        return match self.sampler.sample(params) {
+            Ok(result) => self.reply_sampled(id, result),
+            // The sampler's own failure is the server's answer, not the session's end: a model call
+            // that failed is something the server can react to.
+            Err(e) => self.transport.send_doc(error_doc(id, -32000, "${e}")),
+        }
+    }
+
+    fn reply_sampled(id: dyn, result: string): Result<void, AiError> {
+        parsed = parse_doc(result, "sampling result")?
+        return self.transport.send_doc(result_doc(id, parsed))
+    }
+
+    // How many sampling requests this session has served.
+    fn sampling_calls(): int {
+        return self.sampling_used
+    }
+
+    // --- Tools -----------------------------------------------------------------------------------
+
+    // `tools/list`, following `nextCursor` to the end. A server that paginates its tools and a
+    // client that reads one page is an agent quietly missing half its vocabulary.
+    fn refresh_tools(): Result<void, AiError> {
+        mut out: List<ToolSpec> = []
+        mut cursor = ""
+        mut more = true
+        while more {
+            mut params: Map<string, dyn> = {}
+            if cursor != "" {
+                params = params.set("cursor", cursor)
+            }
+            page = self.exchange("tools/list", params)?
+            for raw in provider.list_at(page, "tools") {
+                out = out ~ [tool_spec_of(object_or_empty(raw))]
+            }
+            cursor = provider.str_at(page, "nextCursor")
+            more = cursor != ""
+        }
+        self.cached = out
+        self.listed = true
+        return Ok()
+    }
+
+    // --- Resources --------------------------------------------------------------------------------
+
+    // Every resource the server offers, paginated to the end.
+    //
+    // **Not injected into anything.** DESIGN §7 is explicit: what to do with a resource is the
+    // caller's decision, because auto-injection is how context windows quietly fill up.
+    fn resources(): Result<List<Resource>, AiError> {
+        self.require(self.caps.resources, "resources")?
+        mut out: List<Resource> = []
+        mut cursor = ""
+        mut more = true
+        while more {
+            mut params: Map<string, dyn> = {}
+            if cursor != "" {
+                params = params.set("cursor", cursor)
+            }
+            page = self.exchange("resources/list", params)?
+            for raw in provider.list_at(page, "resources") {
+                o = object_or_empty(raw)
+                out = out ~ [Resource {
+                    uri: provider.str_at(o, "uri"),
+                    name: provider.str_at(o, "name"),
+                    title: provider.str_at(o, "title"),
+                    description: provider.str_at(o, "description"),
+                    mime: provider.str_at(o, "mimeType"),
+                }]
+            }
+            cursor = provider.str_at(page, "nextCursor")
+            more = cursor != ""
+        }
+        return Ok(out)
+    }
+
+    // One resource's contents. A resource may answer with several parts (a directory-ish URI, a
+    // document and its attachments), so this is a list rather than a string.
+    fn read(uri: string): Result<List<ResourceContent>, AiError> {
+        self.require(self.caps.resources, "resources")?
+        params: Map<string, dyn> = {"uri": uri}
+        reply = self.exchange("resources/read", params)?
+        mut out: List<ResourceContent> = []
+        for raw in provider.list_at(reply, "contents") {
+            o = object_or_empty(raw)
+            out = out ~ [ResourceContent {
+                uri: provider.str_at(o, "uri"),
+                mime: provider.str_at(o, "mimeType"),
+                text: provider.str_at(o, "text"),
+                blob: provider.str_at(o, "blob"),
+            }]
+        }
+        return Ok(out)
+    }
+
+    // --- Prompts -----------------------------------------------------------------------------------
+
+    fn prompts(): Result<List<PromptSpec>, AiError> {
+        self.require(self.caps.prompts, "prompts")?
+        mut out: List<PromptSpec> = []
+        mut cursor = ""
+        mut more = true
+        while more {
+            mut params: Map<string, dyn> = {}
+            if cursor != "" {
+                params = params.set("cursor", cursor)
+            }
+            page = self.exchange("prompts/list", params)?
+            for raw in provider.list_at(page, "prompts") {
+                out = out ~ [prompt_spec_of(object_or_empty(raw))]
+            }
+            cursor = provider.str_at(page, "nextCursor")
+            more = cursor != ""
+        }
+        return Ok(out)
+    }
+
+    // A server-supplied prompt as an ordinary conversation prefix — which is the whole point:
+    // `Conversation { messages: client.prompt("review", args)? }` and the rest of the package does
+    // not know the difference.
+    fn prompt(name: string, args: Map<string, string> = {}): Result<List<Message>, AiError> {
+        self.require(self.caps.prompts, "prompts")?
+        params: Map<string, dyn> = {"arguments": args, "name": name}
+        reply = self.exchange("prompts/get", params)?
+        mut out: List<Message> = []
+        for raw in provider.list_at(reply, "messages") {
+            out = out ~ [prompt_message(object_or_empty(raw), self.server)?]
+        }
+        return Ok(out)
+    }
+
+    // --- Housekeeping ---------------------------------------------------------------------------
+
+    fn require(has: bool, capability: string): Result<void, AiError> {
+        if has {
+            return Ok()
+        }
+        return Err(AiError.Mcp(
+            server: self.server,
+            code: "capability",
+            message: "the server advertises no `${capability}` capability, so asking it for one would be asking a question it never said it could answer",
+        ))
+    }
+
+    // A liveness check that costs one round trip. Useful before a long task, and the smallest
+    // possible test that a session is still there.
+    fn ping(): Result<void, AiError> {
+        self.exchange("ping", empty_object())?
+        return Ok()
+    }
+
+    // Drain up to `max` server→client messages that arrived outside a reply, and handle them.
+    //
+    // Caller-driven rather than a background reader, and that is forced rather than chosen:
+    // structured concurrency has no detached tasks — a `concurrent` block joins everything it
+    // spawned at its closing brace — so there is nowhere for a listener to live between calls.
+    fn listen(max: int): Result<int, AiError> {
+        docs = self.transport.poll(max)?
+        mut seen = 0
+        for text in docs {
+            doc = parse_doc(text, "server message")?
+            self.inbound(doc)?
+            seen = seen + 1
+        }
+        return Ok(seen)
+    }
+
+    // Release the server. Idempotent, and safe on a session that already died.
+    fn close(): void {
+        self.transport.shutdown()
+        self.closed = true
+        return
+    }
+
+    // Inline for the `dyn`-coercion reason the transports' impls are; see `Stdio`.
+    impl ToolSource {
+        // `mcp:memory` once the server has introduced itself, which is what a `Toolbox` collision
+        // message prints — "declared by both `local` and `mcp:memory`" is a sentence a reader can
+        // act on.
+        fn source_name(): string {
+            return self.server
+        }
+
+        fn tool_type(): string {
+            return "mcp"
+        }
+
+        // The cached list from `connect`, refetched only when the server said it changed. A
+        // `Toolbox` asks for this at construction, and a network round trip per construction would
+        // make attaching a source a surprising cost.
+        fn specs(): Result<List<ToolSpec>, AiError> {
+            self.require(self.caps.tools, "tools")?
+            if !self.listed {
+                self.refresh_tools()?
+            }
+            return Ok(self.cached)
+        }
+
+        // One `tools/call`.
+        //
+        // **The same path a local tool takes.** `dispatch` turns the `Err` below into
+        // `ToolResult(is_error: true)` exactly as it does for a local tool's `Err`, so a failing MCP
+        // tool is a turn the model can react to rather than an outage — and the phase-5 approval
+        // guard, which attaches above `Toolbox.call`, covers both without knowing about either.
+        fn call(name: string, args: string): Result<string, AiError> {
+            arguments = arguments_of(name, args)?
+            params: Map<string, dyn> = {"arguments": arguments, "name": name}
+            return match self.exchange("tools/call", params) {
+                Ok(result) => tool_result(name, result),
+                // A protocol-level refusal (an unknown tool, a bad argument) is the *tool's*
+                // failure as far as the model is concerned, so it is reported as one.
+                Err(e) => Err(tool_failure(name, e)),
+            }
+        }
+    }
+}
+
+// --- Reply decoding ---------------------------------------------------------------------------------
+
+// The two constructors `await_reply`'s accumulator is written through.
+//
+// They exist for a toolchain bug rather than for clarity: assigning a bare `Ok(v)`/`Err(e)` to an
+// **already annotated** `mut answer: Result<T, E>` is E0023 "cannot infer the type of `answer`",
+// anywhere in the body — the declaration's annotation is not consulted for the assignment's expected
+// type. Assigning through a function whose *declared return type* is that `Result` types fine, so
+// these two are the workaround. `?T` with `some(...)` is unaffected, which is why nothing else in
+// the package has met it. Minimized and filed; see AGENTS.md.
+fn settled(result: Map<string, dyn>): Result<Map<string, dyn>, AiError> {
+    return Ok(result)
+}
+
+fn unsettled(e: AiError): Result<Map<string, dyn>, AiError> {
+    return Err(e)
+}
+
+fn is_reply_to(doc: Map<string, dyn>, id: int): bool {
+    if !doc.has("id") || doc.has("method") {
+        return false
+    }
+    return provider.int_at(doc, "id") == id
+}
+
+// The `result` of a reply, or the server's `error` as a typed failure.
+fn result_of(doc: Map<string, dyn>, server: string, method: string): Result<Map<string, dyn>, AiError> {
+    if doc.has("error") {
+        err = provider.obj_at(doc, "error")
+        code = provider.int_at(err, "code")
+        return Err(AiError.Mcp(
+            server: server,
+            code: "protocol",
+            message: "`${method}` failed with JSON-RPC error ${code}: ${provider.str_at(err, "message")}",
+        ))
+    }
+    if !doc.has("result") {
+        return Err(AiError.Mcp(
+            server: server,
+            code: "protocol",
+            message: "`${method}` answered with neither `result` nor `error`",
+        ))
+    }
+    return Ok(provider.obj_at(doc, "result"))
+}
+
+fn object_or_empty(v: dyn): Map<string, dyn> {
+    return v.as<Map<string, dyn>>() ?? empty_object()
+}
+
+// One `tools/list` entry as a `ToolSpec` — the same value a local `#[Tool]` derives, which is what
+// makes the two indistinguishable downstream.
+//
+// `inputSchema` is passed through **verbatim**: it is already a JSON Schema, it is the server's to
+// define, and re-deriving it would be inventing a schema for a function this process cannot see. A
+// server that sends none gets the empty object schema, which is what "no arguments" means.
+fn tool_spec_of(o: Map<string, dyn>): ToolSpec {
+    mut schema = "{\"type\":\"object\"}"
+    if o.has("inputSchema") {
+        schema = json.stringify(provider.obj_at(o, "inputSchema"))
+    }
+    described = provider.str_at(o, "description")
+    return ToolSpec {
+        name: provider.str_at(o, "name"),
+        description: if described == "" then provider.str_at(o, "title") else described,
+        parameters: schema,
+    }
+}
+
+fn prompt_spec_of(o: Map<string, dyn>): PromptSpec {
+    mut args: List<PromptArg> = []
+    for raw in provider.list_at(o, "arguments") {
+        a = object_or_empty(raw)
+        args = args ~ [PromptArg {
+            name: provider.str_at(a, "name"),
+            description: provider.str_at(a, "description"),
+            required: (a.get("required") ?? false).as<bool>() ?? false,
+        }]
+    }
+    return PromptSpec {
+        name: provider.str_at(o, "name"),
+        title: provider.str_at(o, "title"),
+        description: provider.str_at(o, "description"),
+        arguments: args,
+    }
+}
+
+// One prompt message as a `Message`.
+//
+// A non-text content block is **refused, loudly**: this package has no base64 decoder, so an image
+// or audio block cannot become a `Part.Image` without inventing its bytes, and dropping it would
+// silently change what the prompt says. The message names the door that does work.
+fn prompt_message(o: Map<string, dyn>, server: string): Result<Message, AiError> {
+    role = match provider.str_at(o, "role") {
+        "assistant" => Role.Assistant,
+        _ => Role.User,
+    }
+    content = provider.obj_at(o, "content")
+    kind = provider.str_at(content, "type")
+    if kind == "text" {
+        return Ok(Message { role: role, parts: [Part.Text(text: provider.str_at(content, "text"))] })
+    }
+    if kind == "resource" {
+        embedded = provider.obj_at(content, "resource")
+        text = provider.str_at(embedded, "text")
+        if text != "" {
+            return Ok(Message { role: role, parts: [Part.Text(text: text)] })
+        }
+    }
+    return Err(AiError.Mcp(
+        server: server,
+        code: "protocol",
+        message: "a `${kind}` prompt content block needs base64 decoding, which this package has no decoder for — read it with `client.read(uri)` and attach it yourself",
+    ))
+}
+
+// A tool call's raw argument blob as the JSON value the server expects under `arguments`.
+fn arguments_of(name: string, args: string): Result<dyn, AiError> {
+    trimmed = args.trim()
+    if trimmed == "" {
+        return Ok(empty_object())
+    }
+    return match json.try_parse(trimmed) {
+        Ok(v) => Ok(v),
+        // The *model's* JSON was malformed, so the model is who needs to be told — the same
+        // re-labeling `tools.parse_arguments` does for a local call.
+        Err(e) => Err(AiError.Tool(name: name, message: "arguments are not valid JSON: ${e.message()}")),
+    }
+}
+
+// A `tools/call` result as the string the model reads.
+//
+// `isError: true` is the server saying the *tool* failed, which is a turn: it comes back as an
+// `Err` and `dispatch` makes it a `ToolResult(is_error: true)` carrying the server's own text.
+fn tool_result(name: string, result: Map<string, dyn>): Result<string, AiError> {
+    failed = (result.get("isError") ?? false).as<bool>() ?? false
+    text = content_text(provider.list_at(result, "content"))
+    if failed {
+        return Err(AiError.Tool(name: name, message: if text == "" then "the tool reported an error" else text))
+    }
+    if text != "" {
+        return Ok(text)
+    }
+    // A tool with an `outputSchema` may answer structurally and leave `content` empty.
+    if result.has("structuredContent") {
+        return Ok(json.stringify(provider.obj_at(result, "structuredContent")))
+    }
+    return Ok("")
+}
+
+// Content blocks as one string.
+//
+// Text is text. Anything else — an image, an audio clip, an embedded resource — is passed through as
+// its **own JSON**, because `ToolSource.call` hands the model a string and inventing a description
+// of a block this package did not decode would be worse than showing what arrived.
+fn content_text(items: List<dyn>): string {
+    mut parts: List<string> = []
+    for raw in items {
+        o = object_or_empty(raw)
+        if provider.str_at(o, "type") == "text" {
+            parts = parts ~ [provider.str_at(o, "text")]
+        } else {
+            parts = parts ~ [json.stringify(o)]
+        }
+    }
+    return parts.join("\n")
+}
+
+// A session-level failure, re-labeled as the tool's when it happened inside a tool call. The model
+// gets one vocabulary — "this tool did not work" — and the server's own words after it.
+fn tool_failure(name: string, e: AiError): AiError {
+    return match e {
+        AiError.Tool(named, message) => e,
+        _ => AiError.Tool(name: name, message: "${e}"),
+    }
+}
+
+// --- The suite's own MCP server --------------------------------------------------------------------
+//
+// **Hermetic by construction.** These tests spawn a real subprocess, speak real JSON-RPC to it over
+// real pipes, and depend on no published MCP server, no npm install, and no network — the server is
+// a POSIX shell script this file writes to a temp path and runs. That is the whole point: an MCP
+// client whose round trip is only ever mocked is an MCP client nobody has proved can talk.
+//
+// It lives at module level rather than in the `@test` block for the same reason `tools.noe`'s
+// refusal probes do: the helpers that use it have to `assert` *and* return a value, which a `match`
+// arm cannot do. Nothing here is `pub` and nothing here is a `#[Tool]`, so none of it is reachable
+// from a consuming program.
+//
+// Written in **raw strings** (`'…'`), so the script's own `"`, `$`, and `\` are literal and the file
+// reads like the shell script it is. Ids and arguments are pulled out with `tr`/`grep`/`cut` rather
+// than `sed` — no backslash escapes to double, and every one of them is POSIX.
+
+fn fixture_lines(): List<string> {
+    return [
+        'mode="$1"',
+        'pages=0',
+        '# A self-destruct, so a test that fails before `close()` leaks a server for 30 seconds and',
+        '# not for the life of the machine. Its own stdio goes to /dev/null: inheriting the real',
+        '# stdout would hold the pipe open long after the server itself had gone.',
+        '( sleep 30; kill $$ ) </dev/null >/dev/null 2>&1 &',
+        'idof() { printf "%s\n" "$1" | tr "," "\n" | grep "\"id\":" | head -1 | tr -dc "0-9"; }',
+        'argof() { printf "%s\n" "$2" | tr "," "\n" | grep "\"$1\":" | tail -1 | awk -F\" \'{print $(NF-1)}\'; }',
+        'while IFS= read -r line; do',
+        '  id=$(idof "$line")',
+        '  case "$line" in',
+        '    *notifications/initialized*) ;;',
+        '    *initialize*)',
+        '      caps=\'"tools":{"listChanged":true},"resources":{},"prompts":{}\'',
+        '      if [ "$mode" = notools ]; then caps=\'"resources":{}\'; fi',
+        '      printf \'{"jsonrpc":"2.0","id":%s,"result":{"capabilities":{%s},"protocolVersion":"2025-06-18","serverInfo":{"name":"probe","version":"9.9"}}}\n\' "$id" "$caps"',
+        '      ;;',
+        '    *\'"method":"tools/list"\'*)',
+        '      pages=$((pages+1))',
+        '      if [ "$mode" = paged ] && [ "$pages" = 1 ]; then',
+        '        printf \'{"jsonrpc":"2.0","id":%s,"result":{"nextCursor":"page2","tools":[{"description":"Echo the text back","inputSchema":{"properties":{"text":{"type":"string"}},"required":["text"],"type":"object"},"name":"echo"}]}}\n\' "$id"',
+        '      elif [ "$mode" = paged ]; then',
+        '        printf \'{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"description":"Always fails","inputSchema":{"type":"object"},"name":"boom"}]}}\n\' "$id"',
+        '      elif [ "$mode" = changed ] && [ "$pages" -gt 1 ]; then',
+        '        printf \'{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"description":"Echo the text back","inputSchema":{"type":"object"},"name":"echo"},{"description":"New since the notification","inputSchema":{"type":"object"},"name":"fresh"}]}}\n\' "$id"',
+        '      else',
+        '        printf \'{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"description":"Echo the text back","inputSchema":{"properties":{"text":{"type":"string"}},"required":["text"],"type":"object"},"name":"echo"},{"description":"Always fails","inputSchema":{"type":"object"},"name":"boom"},{"description":"Answers structurally","inputSchema":{"type":"object"},"name":"structured"}]}}\n\' "$id"',
+        '      fi',
+        '      ;;',
+        '    *\'"method":"tools/call"\'*)',
+        '      tool=$(argof name "$line")',
+        '      if [ "$mode" = crash ]; then exit 3; fi',
+        '      if [ "$mode" = hang ]; then continue; fi',
+        '      if [ "$mode" = chatty ]; then',
+        '        i=0',
+        '        while [ "$i" -lt 70 ]; do',
+        '          printf \'{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info"}}\n\'',
+        '          i=$((i+1))',
+        '        done',
+        '        continue',
+        '      fi',
+        '      if [ "$mode" = sample ]; then',
+        '        printf \'{"jsonrpc":"2.0","id":"s-1","method":"sampling/createMessage","params":{"maxTokens":16,"messages":[]}}\n\'',
+        '        IFS= read -r answer',
+        '        got=$(printf "%s" "$answer" | tr -d \'"\\\\\' | cut -c1-160)',
+        '        printf \'{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"the client said %s"}]}}\n\' "$id" "$got"',
+        '        continue',
+        '      fi',
+        '      if [ "$mode" = changed ]; then',
+        '        printf \'{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}\n\'',
+        '      fi',
+        '      case "$tool" in',
+        '        boom) printf \'{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"the tool exploded"}],"isError":true}}\n\' "$id" ;;',
+        '        structured) printf \'{"jsonrpc":"2.0","id":%s,"result":{"content":[],"structuredContent":{"ok":true}}}\n\' "$id" ;;',
+        '        echo) printf \'{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"echo: %s"}]}}\n\' "$id" "$(argof text "$line")" ;;',
+        '        *) printf \'{"jsonrpc":"2.0","id":%s,"error":{"code":-32602,"message":"no tool named %s"}}\n\' "$id" "$tool" ;;',
+        '      esac',
+        '      ;;',
+        '    *\'"method":"resources/list"\'*)',
+        '      printf \'{"jsonrpc":"2.0","id":%s,"result":{"resources":[{"description":"What the agent learned","mimeType":"text/plain","name":"notes","uri":"memo://notes"}]}}\n\' "$id"',
+        '      ;;',
+        '    *\'"method":"resources/read"\'*)',
+        '      printf \'{"jsonrpc":"2.0","id":%s,"result":{"contents":[{"mimeType":"text/plain","text":"the kettle is in the cupboard","uri":"memo://notes"}]}}\n\' "$id"',
+        '      ;;',
+        '    *\'"method":"prompts/list"\'*)',
+        '      printf \'{"jsonrpc":"2.0","id":%s,"result":{"prompts":[{"arguments":[{"name":"topic","required":true}],"description":"Summarize a topic","name":"summarize"}]}}\n\' "$id"',
+        '      ;;',
+        '    *\'"method":"prompts/get"\'*)',
+        '      topic=$(argof topic "$line")',
+        '      if [ "$mode" = image ]; then',
+        '        printf \'{"jsonrpc":"2.0","id":%s,"result":{"messages":[{"content":{"data":"aGk=","mimeType":"image/png","type":"image"},"role":"user"}]}}\n\' "$id"',
+        '      else',
+        '        printf \'{"jsonrpc":"2.0","id":%s,"result":{"messages":[{"content":{"text":"You summarize things.","type":"text"},"role":"assistant"},{"content":{"text":"Summarize %s","type":"text"},"role":"user"}]}}\n\' "$id" "$topic"',
+        '      fi',
+        '      ;;',
+        '    *\'"method":"ping"\'*)',
+        '      printf \'{"jsonrpc":"2.0","id":%s,"result":{}}\n\' "$id"',
+        '      ;;',
+        '    *)',
+        '      printf \'{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"no such method"}}\n\' "$id"',
+        '      ;;',
+        '  esac',
+        'done',
+    ]
+}
+
+// Write the fixture server to its own temp path. A fresh path per call, because `noeta test` runs
+// tests on four threads and two of them writing one file is a race that would show up as a
+// mysterious protocol error.
+fn fixture_server(): string {
+    path = "${temp_dir()}/para-ai-mcp-fixture-${uuid()}.sh"
+    fs.write(path, fixture_lines().join("\n") ~ "\n")
+    return path
+}
+
+// A client over the fixture server in `mode`, or a loud failure.
+//
+// Unwrap-or-fail, kept out of the `@test` block for the reason `tools.noe`'s helpers are: a `match`
+// arm cannot both fail an assertion and produce a value.
+fn probe_client(mode: string): McpClient {
+    match McpClient.connect(Stdio.new("sh", [fixture_server(), mode])) {
+        Ok(c) => {
+            return c
+        },
+        Err(e) => {
+            assert(false, "connect failed: ${e}")
+        },
+    }
+    return McpClient.unstarted()
+}
+
