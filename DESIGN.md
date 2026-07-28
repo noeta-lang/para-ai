@@ -453,6 +453,23 @@ for spec in field_specs_of::<Extraction>() {
 
 What remains genuinely missing is smaller and is in §6: there is no runtime reflection over an **enum's variants** (no `variants_of` mirroring `field_specs_of`), and `params_of` reports a declared enum as `Type.Named`, never `Type.Enum`. So an enum-typed tool parameter or output field is refused with a message naming the missing primitive rather than half-derived. That is the real ask, and it is one primitive, not a directive.
 
+> **And that last paragraph was half right, which is worth as much as the correction above it.** `variants_of` shipped for phase 5 and closed the *schema* half completely — a declared enum derives `{"enum": […]}`, with a backed enum's backings rather than its case names. It did not close the *construction* half, and nothing in this section noticed there were two: no runtime door builds an enum **value** from JSON. All four were measured at `lang` `3aabcd22` — `@derive(Deserialize<Json>)` on a struct with an enum-typed field is E0050 at check time, `construct` takes structs and classes only, `json.decode_typed` needs the recipe that derive would have registered, and `Enum.from` takes a *case name* and aborts on an unknown one. So the refusal stayed and only its reason changed. "One primitive, not a directive" was the right shape of answer and the wrong count.
+
+---
+
+### 8.6 What phase 5 built, and where it diverges
+
+Built as specified: the schema derived from a type's declared fields recursively, one walk shared with §6's tool schemas, `Validate` running at the decode door with its path-carrying message reused as the repair prompt, bounded repair defaulting to 1 with a span event per attempt, and a refusal that is `AiError.Refused` and never a `JsonError`. `Mock` scripts a refusal, a malformed body, a validation failure and a repair round trip with no key and no socket.
+
+Struct-typed **tool parameters**, which §6 also refused, now work end to end on the same walk: the nested object schema derives, every field is coerced, and `construct` builds the value. Enum-typed ones stay refused, one layer lower — at dispatch rather than at schema, with a message naming the missing constructor rather than the primitive that has shipped.
+
+Four divergences, each forced and each measured:
+
+- **`extract` is a top-level function, not `agent.extract::<T>(conv)`.** A generic *method* cannot forward its type parameter into a call-site-typed position — `json.try_parse::<T>` inside one is E0058, "call-site-typed forwarding is supported in top-level generic functions only" — so §8.1's spelling cannot exist in any form. A top-level `fn extract<T>` can forward, but a turbofish must supply *every* type parameter (a partial one is E0058 too), so the provider is erased behind a `dyn Structured` seam to leave exactly one parameter to name: `extract::<Extraction>(agent, conv, out)`.
+- **The schema arrives as a value, because a generic body cannot ask what `T` is called.** `type_name::<T>()` over a type parameter is E0058 as well, and the diagnostic's own advice is to reflect where the type is concrete and pass the result in — which is `Output.of(type_name::<Extraction>())`. The cost is the type named twice at the call site, once to type the value and once to key the schema. Filed upstream; it is the one of the four a small toolchain change could close, since a name is all it asks for.
+- **`extract` is synchronous.** `Structured.ask_json` is held as `dyn`, like `ToolSource.call`, and that keeps the repair loop callable from a plain `fn` — which is what keeps its tests real, since an `async fn` in a `@test` block is not driven on a released toolchain and every assertion in one is vacuous. An async door would be a second copy of the same loop.
+- **Anthropic's structured answer is a tool call, and the run loop has to know.** A forced-tool reply carries `stop_reason: tool_use`, indistinguishable at that point from the model asking for a real tool; dispatching it would look up a tool no `ToolSource` declares and spin the loop for an answer that had already arrived. One line withholds it, and `structured_json` reads the call's arguments. Google needed the other kind of care: `responseSchema` is an OpenAPI 3.0 subset rather than JSON Schema, so the derived schema is *translated* — types upper-cased, `additionalProperties` dropped where it means "closed" and refused by name where it means "typed map", and a `dyn` field refused because that dialect has no "any value".
+
 ---
 
 ## 9. Guardrails
@@ -490,6 +507,19 @@ Two properties worth naming:
 
 - **A guard is an ordinary Noeta value.** None is privileged by the framework — the para/api middleware principle. `Judge` and `ToolAllowlist` are the same kind of thing.
 - **Every non-`Allow` verdict is a span event and a metric**, so "the guardrails are configured" and "the guardrails are firing" are distinguishable without reading logs. This is the same distinction `Cache.hits()` draws in para/api.
+
+### 9.1 What phase 5 built, and where it diverges
+
+Built as specified: one trait, four stages, registration order with the first non-`Allow` winning, the three `on_deny` policies, and all nine standard guards. `Approval` attaches above `Toolbox.call` and is decided **per call** rather than per turn, which is what makes one mechanism cover local and MCP tools alike — phase 6 left the hook here deliberately and needed no dispatch of its own. `Recall` closes §7's memory story and is a `Verdict.Rewrite` and nothing else. `Judge` is forty lines over the same trait `ToolAllowlist` uses, which is the claim this section makes about the design.
+
+Four divergences:
+
+- **A `Rewrite` stops the walk, exactly as a `Deny` does.** §9 says "`Rewrite` replaces the content and continues", which is true of the *run* and ambiguous about the remaining guards. Continuing past a rewrite would have the guards after it judge content the caller never wrote, and chained rewrites make "registration order" mean something nobody chose. A caller who wants two rewrites composed writes one guard that does both.
+- **`Feedback` at `Stage.Input` is `Stop`.** The policy needs somebody to give feedback *to*, and at that stage nothing has been sent. `Replace` is the policy with a real answer there — it ends the run with the canned reply, which is the "I can't help with that" every product ships.
+- **A span, not a span event.** `std.tracing` exposes `span`, `with_span`, `span_from` and `current_context` but no `current_span`, so a module handed no span cannot add an event to the open one. A short child span is opened instead: context propagation nests it in the same place, it carries its attributes natively, and every trace UI shows it. Filed upstream.
+- **Two counters, not one.** §12's table names `para.ai.guard.denials`, and §9 asks for a metric on *every* non-`Allow` verdict. Counting a rewrite under a series called "denials" would make the one number anybody alerts on wrong, so `para.ai.guard.rewrites` is a second, honestly named counter. Both are keyed by stage and guard name only — a denial *reason* is unbounded text and lives on the span. `Run.verdicts` records both for one run, which is what makes the distinction testable without a metrics backend.
+
+One thing §9 does not say, stated so nobody assumes it: **`Redact.new` is infallible**, because `regex.compile` aborts on an invalid pattern and has no recoverable twin. That is tolerable for a pattern written as program text and not for one read from configuration; the fix is upstream and filed, and a regex validator in this package would be a second, worse `regex.compile`.
 
 ---
 
@@ -897,7 +927,7 @@ Each phase is independently useful and independently shippable.
 2. **Tools.** `#[Tool]`/`#[Arg]`, `params_of` → schema, coercion, `invoke` dispatch, the trust-boundary role, bounded concurrent dispatch.
 3. **Streaming.** ~~The native frame reader (SSE + NDJSON)~~ (it went to `std.http` — U-3), `StreamDecoder`, the `Event` channel. Non-streaming becomes a fold over it. **Built**, with the divergences in §11.1.
 4. **`OpenAiCompat` + Google, then OpenRouter and Ollama on top.** Should be pure codec work by now; if it is not, the seam in phase 1 was drawn wrong and this is where we find out. OpenRouter and Ollama arriving as *configurations* rather than files is the pass condition for phase 1's design — and Ollama unlocks keyless integration tests in CI for everything after this point. **Built, and the pass condition held**; the divergences are in §2.1.1.
-5. **Structured responses + guardrails.** `extract::<T>`, `Validate` at the door, bounded repair, the `Guard` trait and standard guards.
+5. **Structured responses + guardrails.** `extract::<T>`, `Validate` at the door, bounded repair, the `Guard` trait and standard guards. **Built**, with the divergences in §8.6 and §9.1.
 6. **MCP.** stdio first (no native code), then streamable HTTP. Memory example lands here. **Built**, with the divergences in §7.1.
 7. **AG-UI.** The SSE responder, the aether integration, the event-sequence test harness. **Built**, with the divergences in §11.2.
 8. **`@prompt` tier + cache breakpoints.** Last, because it is the one piece nothing else depends on — and the one most worth getting right rather than early. **Built**, with the divergences in §14.1.

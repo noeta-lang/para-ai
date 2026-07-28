@@ -33,7 +33,7 @@ use std.{env, json}
 use para.ai.{AiError, Message, Part, Role}
 use para.ai.provider
 use para.ai.provider.{Delta, ModelReply, ModelRequest, Provider, StopReason, StreamDecoder, Usage, Wire}
-use para.ai.tools.{ToolSpec}
+use para.ai.tools.{Output, ToolSpec}
 
 // How a request proves who is asking.
 //
@@ -494,6 +494,33 @@ fn encode_tools(vendor: string, specs: List<ToolSpec>): Result<List<dyn>, AiErro
     return Ok(out)
 }
 
+// Structured output, the OpenAI way: `response_format` with a named JSON Schema and `strict: true`.
+//
+// `strict` is the whole reason to prefer this over `json_object` mode: it makes the vendor
+// *constrain decoding* to the schema rather than merely asking for JSON, so what comes back matches
+// or the request fails — which turns the repair loop from routine into an exception. It is also why
+// `additionalProperties: false` matters on every object: strict mode requires it, and the
+// derivation emits it anyway, because a closed object is the honest reading of a declared struct.
+//
+// The reply is ordinary assistant text on this family, not a tool call.
+fn encode_output(vendor: string, out: Output): Result<Map<string, dyn>, AiError> {
+    mut schema: dyn = 0
+    match provider.parse_value(out.schema, "output schema `${out.name}`") {
+        Ok(s) => {
+            schema = s
+        },
+        Err(e) => {
+            return Err(refuse(vendor, "${e}"))
+        },
+    }
+    mut named: Map<string, dyn> = {"name": out.name, "strict": true, "schema": schema}
+    if out.description != "" {
+        named = named.set("description", out.description)
+    }
+    fmt: Map<string, dyn> = {"type": "json_schema", "json_schema": named}
+    return Ok(fmt)
+}
+
 // --- Decoding -------------------------------------------------------------------------------------
 
 fn decode_stop(raw: string): StopReason {
@@ -839,6 +866,12 @@ impl Provider for OpenAiCompat {
         if req.tools.len() > 0 {
             body = body.set("tools", encode_tools(self.vendor, req.tools)?)
         }
+        match req.output {
+            some(out) => {
+                body = body.set("response_format", encode_output(self.vendor, out)?)
+            },
+            none => {},
+        }
         if req.stream {
             body = body.set("stream", true)
             // Without this the stream reports no tokens at all, and a run whose usage is silently
@@ -1170,6 +1203,30 @@ fn captured_ollama_compat_reply(): string {
         assert(wire.method == "post")
         assert(wire.body == "{\"max_completion_tokens\":64,\"messages\":[{\"content\":\"Answer in Swedish.\",\"role\":\"system\"},{\"content\":\"Say hello.\",\"role\":\"user\"}],\"model\":\"gpt-4o\",\"stop\":[\"\\n\\n\"],\"temperature\":0.0}",
             "exact request body, got: ${wire.body}")
+    }
+
+    // Structured output, this family's way: `response_format` with a named schema and `strict`.
+    // `strict` is what makes the vendor constrain decoding rather than merely ask for JSON, which is
+    // the difference between a repair loop that is routine and one that is an exception.
+    fn a_requested_output_shape_becomes_a_strict_response_format(): void {
+        req = ModelRequest {
+            model: "m",
+            messages: [Message.user("read this")],
+            output: some(Output {
+                name: "Extraction",
+                target: "app.Extraction",
+                schema: "{\"additionalProperties\":false,\"properties\":{\"company\":{\"type\":\"string\"}},\"required\":[\"company\"],\"type\":\"object\"}",
+            }),
+        }
+        wire = encode_or_fail(OpenAi.new("k"), req)
+        assert(wire.body.contains("\"response_format\":{\"json_schema\":{\"name\":\"Extraction\",\"schema\":{\"additionalProperties\":false,\"properties\":{\"company\":{\"type\":\"string\"}},\"required\":[\"company\"],\"type\":\"object\"},\"strict\":true},\"type\":\"json_schema\"}"),
+            wire.body)
+    }
+
+    // No shape asked for, no key. A `response_format` nobody requested changes what the model does.
+    fn encode_omits_response_format_when_no_shape_was_asked_for(): void {
+        req = ModelRequest { model: "m", messages: [Message.user("hi")] }
+        assert(!encode_or_fail(OpenAi.new("k"), req).body.contains("response_format"))
     }
 
     // Unlike Anthropic, `system` is a message role here — the turn stays in `messages` and is not

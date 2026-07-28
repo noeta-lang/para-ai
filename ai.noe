@@ -37,7 +37,15 @@ use para.ai.provider.{Delta, ModelRequest, ModelReply, Provider, StopReason, Str
 // declares the block syntax exists.
 use para.ai.prompt.{Prompt, Resolved}
 use para.ai.tools
-use para.ai.tools.{Toolbox, ToolSource}
+use para.ai.tools.{Output, Toolbox, ToolSource}
+// The guard vocabulary. `decide` comes in **by name** rather than through a whole-module
+// `use para.ai.guard`: a whole-module import binds its last segment as a local, and `guard` is the
+// field `Fired` and `Denial` both want (E0020, the same collision `provider` has in this file).
+use para.ai.guard.{Fired, Guard, GuardCtx, OnDeny, Stage, Verdict, decide}
+// The typed decode `extract` bottoms out in. `json.try_parse::<T>` is the recoverable door **and**
+// the one that runs `Validate` — see `extract` for why that matters more than it looks.
+use std.json
+use std.json.JsonError
 
 // --- The data model -------------------------------------------------------------------------------
 //
@@ -249,6 +257,16 @@ pub struct Run {
     pub usage: Usage = Usage {}
     pub turns: int = 0
     pub stop: StopReason = StopReason.EndTurn
+    // Every non-`Allow` guard verdict this run produced, in the order they fired.
+    //
+    // **This is what makes "the guardrails are firing" observable without a metrics backend** —
+    // `para.ai.guard.denials` and `para.ai.guard.rewrites` answer it in aggregate, and this answers
+    // it for one run, which is what a test and a debugging session both need. The same distinction
+    // `Cache.hits()` draws in para/api, and the reason DESIGN §9 names it.
+    //
+    // Defaulted, so nothing that builds a `Run` today changes. A run stopped *by* a guard returns
+    // `AiError.Guard` instead and carries the stage, the guard and the reason there.
+    pub verdicts: List<Fired> = []
 
     // The assistant's answer as plain text, or `""` if the run produced no assistant turn.
     fn text(): string {
@@ -277,7 +295,6 @@ pub struct Run {
 // from a vendor is an answer — decoded into `Provider(status, code, message)` with the vendor's own
 // typed error body, so `code == "rate_limit_error"` is matchable and nobody has to regex a message.
 //
-// `Guard(stage, guard, reason)` joins this enum in phase 5, with the type it names.
 @derive(Error)
 pub enum AiError {
     // The request never produced a response — the network broke.
@@ -316,8 +333,12 @@ pub enum AiError {
     // opts into, reported as `Guard(...)`; this is the loop's own hard rail, which is always on.
     MaxTurns(turns: int)
     // The conversation does not fit the budget and no context strategy was configured to fit it.
-    // Constructed from phase 5.
     ContextOverflow(needed: int, budget: int)
+    // A guard denied, and the run's `on_deny` policy said the run ends (DESIGN §9). `guard` is the
+    // guard's own low-cardinality name, so it is safe as a metric attribute and recognizable in a
+    // message; `reason` is the guard's own words, which under `OnDeny.Feedback` would have been the
+    // correction turn instead.
+    Guard(stage: Stage, guard: string, reason: string)
     // The run was cancelled at a suspension point.
     Cancelled
 
@@ -333,6 +354,7 @@ pub enum AiError {
                 AiError.Mcp(server, code, message) => "mcp server `${server}` failed (${code}): ${message}",
                 AiError.MaxTurns(turns) => "the run reached its ${turns}-turn limit with the model still asking for tools — raise `AgentConfig.max_turns` if the task genuinely needs more",
                 AiError.ContextOverflow(needed, budget) => "context overflow: ${needed} tokens needed, budget is ${budget} — configure a context strategy",
+                AiError.Guard(stage, guard, reason) => "the `${guard}` guard denied at ${stage}: ${reason}",
                 AiError.Cancelled => "cancelled",
             }
         }
@@ -418,6 +440,15 @@ pub struct AgentConfig {
     // inside the cache's TTL — that is the one shape where a cache *write* (Anthropic prices it at
     // 1.25× input) is a real cost with no return.
     pub cache: bool = true
+    // What the run does when a guard denies (DESIGN §9).
+    //
+    // On the **config** rather than on the agent, where the guards themselves live, and the split is
+    // the `Send` line: a `dyn Guard` cannot cross to a worker but a policy is a plain value, so the
+    // thing you ship carries the decision and the thing you build locally carries the machinery.
+    //
+    // `Stop` by default. A guard that fired and was silently worked around is not a guard, and a
+    // default that quietly continues would make every guardrail advisory unless its author noticed.
+    pub on_deny: OnDeny = OnDeny.Stop
 
     fn new(model: string): AgentConfig {
         return AgentConfig { model: model }
@@ -506,6 +537,12 @@ pub struct AgentConfig {
     // a vendor that caches implicitly keeps doing so; only the explicit marker goes away.
     fn uncached(): AgentConfig {
         return AgentConfig { ...self, cache: false }
+    }
+
+    // What a denied run does. `OnDeny.Stop` is the default; `Feedback(max)` hands the reason back to
+    // the model, and `Replace(parts)` swaps in a canned reply.
+    fn denying(policy: OnDeny): AgentConfig {
+        return AgentConfig { ...self, on_deny: policy }
     }
 }
 
@@ -751,6 +788,402 @@ fn operation_duration_histogram(): dyn {
     return metrics.histogram("gen_ai.client.operation.duration")
 }
 
+// --- Guardrails, where they attach to the loop ------------------------------------------------------
+//
+// The trait, the verdicts, the stages and the nine standard guards are all in `para.ai.guard`, which
+// knows nothing about the run loop. What is here is the other half: the four points a guard is
+// consulted at, and what `AgentConfig.on_deny` does with a `Deny` at each of them.
+
+// One denial, flattened out of a `Decision` so the loop can carry it without re-matching.
+@derive(Equatable, Display)
+struct Denial {
+    stage: Stage
+    guard: string
+    reason: string
+}
+
+// One stage's outcome: the content to carry on with — rewritten, or exactly what went in — plus the
+// verdicts that fired and the denial that stopped the stage, if one did.
+@derive(Equatable, Display)
+struct Gated {
+    parts: List<Part>
+    fired: List<Fired> = []
+    denial: ?Denial = none
+}
+
+// The tool calls that survived `Stage.ToolCall`, and the results standing in for the ones that did
+// not. Two lists rather than one because only the first is dispatched, and the canned results have
+// to land in the same tool turn as the real ones — a `ToolCall` separated from its `ToolResult` is
+// a conversation every vendor rejects (DESIGN §10).
+@derive(Equatable, Display)
+struct Approved {
+    approved: List<Part>
+    canned: List<Part>
+}
+
+// Consult one stage and normalize the answer. The single place a `Verdict` is turned into something
+// the loop acts on, so no stage can interpret one differently from another.
+fn gate(guards: List<dyn Guard>, stage: Stage, ctx: GuardCtx): Gated {
+    d = decide(guards, stage, ctx)
+    return match d.verdict {
+        Verdict.Allow => Gated { parts: ctx.parts },
+        Verdict.Rewrite(parts) => Gated {
+            parts: parts,
+            fired: [Fired { stage: stage, guard: d.guard, verdict: d.verdict }],
+        },
+        Verdict.Deny(reason) => Gated {
+            parts: ctx.parts,
+            fired: [Fired { stage: stage, guard: d.guard, verdict: d.verdict }],
+            denial: some(Denial { stage: stage, guard: d.guard, reason: reason }),
+        },
+    }
+}
+
+fn guard_error(d: Denial): AiError {
+    return AiError.Guard(stage: d.stage, guard: d.guard, reason: d.reason)
+}
+
+// What a denied **input** turn produces. `Replace` is the one policy with a real answer here — the
+// canned reply, returned as a successful run — because nothing has been sent yet and there is
+// nobody to give feedback to. `Feedback` therefore reads as `Stop`, which the `OnDeny` doc states.
+fn input_denied(policy: OnDeny, conv: Conversation, d: Denial, fired: List<Fired>, turn: int): Result<Run, AiError> {
+    return match policy {
+        OnDeny.Replace(parts) => Ok(Run {
+            messages: conv.with(Message { role: Role.Assistant, parts: parts }).messages,
+            turns: turn,
+            stop: StopReason.EndTurn,
+            verdicts: fired,
+        }),
+        _ => Err(guard_error(d)),
+    }
+}
+
+// The conversation with its trailing turn of `role` rewritten. A guard rewrote the content, and the
+// content has to reach the model — writing it back into the message it came from is what makes
+// `Recall`'s prepended memories part of the turn rather than an addition nobody carries.
+fn with_rewritten_tail(conv: Conversation, role: Role, parts: List<Part>): Conversation {
+    at = last_index_of_role(conv, role)
+    if at < 0 {
+        return conv
+    }
+    before = conv.messages[at]
+    if before.parts == parts {
+        return conv
+    }
+    return Conversation { messages: conv.messages.set(at, Message { ...before, parts: parts }) }
+}
+
+fn last_index_of_role(conv: Conversation, role: Role): int {
+    mut at = -1
+    for (i, m) in conv.messages.enumerate() {
+        if m.role == role {
+            at = i
+        }
+    }
+    return at
+}
+
+// The `GuardCtx` for each stage. Built here rather than by each guard, so every guard sees the same
+// shape and a new stage cannot quietly show one of them less than another.
+fn input_ctx(conv: Conversation, run_id: string): GuardCtx {
+    at = last_index_of_role(conv, Role.User)
+    empty: List<Part> = []
+    return GuardCtx {
+        stage: Stage.Input,
+        run_id: run_id,
+        turn: 0,
+        parts: if at < 0 then empty else conv.messages[at].parts,
+        conversation: conv,
+    }
+}
+
+fn turn_ctx(stage: Stage, conv: Conversation, run_id: string, turn: int, usage: Usage, parts: List<Part>): GuardCtx {
+    return GuardCtx {
+        stage: stage,
+        run_id: run_id,
+        turn: turn,
+        parts: parts,
+        conversation: conv,
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+    }
+}
+
+fn call_ctx(conv: Conversation, run_id: string, turn: int, usage: Usage, call: Part): GuardCtx {
+    (name, args) = call_parts(call)
+    return GuardCtx {
+        stage: Stage.ToolCall,
+        run_id: run_id,
+        turn: turn,
+        parts: [call],
+        conversation: conv,
+        tool: name,
+        args: args,
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+    }
+}
+
+fn call_parts(call: Part): (string, string) {
+    return match call {
+        Part.ToolCall(id, name, args) => (name, args),
+        _ => ("", ""),
+    }
+}
+
+// A refused call, as the failed tool result the model reads. It keeps the call's own id, because a
+// result that does not address its call is a conversation every vendor rejects.
+fn refusal_result(call: Part, reason: string): Part {
+    return match call {
+        Part.ToolCall(id, name, args) => Part.ToolResult(id: id, content: reason, is_error: true),
+        _ => Part.ToolResult(id: "", content: reason, is_error: true),
+    }
+}
+
+// Every tool result in a turn, marked failed and carrying one reason. What a denied `ToolResult`
+// stage produces under a policy that continues: the model is told its tool's answer was withheld,
+// which it can act on, rather than being handed content a guard rejected.
+fn errored(results: List<Part>, reason: string): List<Part> {
+    mut out: List<Part> = []
+    for p in results {
+        out = out ~ [match p {
+            Part.ToolResult(id, content, is_error) => Part.ToolResult(id: id, content: reason, is_error: true),
+            _ => p,
+        }]
+    }
+    return out
+}
+
+fn text_of(parts: List<Part>): string {
+    mut out = ""
+    for p in parts {
+        out = out ~ match p {
+            Part.Text(t) => t,
+            _ => "",
+        }
+    }
+    return out
+}
+
+// --- Structured responses -------------------------------------------------------------------------
+//
+// DESIGN §8: ask for a type, get a type.
+//
+//     @derive(Deserialize<Json>)
+//     struct Extraction {
+//         company: string
+//         confidence: float
+//
+//         impl Validate {
+//             fn validate(): Result<void, string> {
+//                 if self.confidence < 0.0 || self.confidence > 1.0 {
+//                     return Err("confidence out of range: ${self.confidence}")
+//                 }
+//                 return Ok()
+//             }
+//         }
+//     }
+//
+//     out = Output.of(type_name::<Extraction>())?
+//     e   = extract::<Extraction>(agent, conv, out)?
+//
+// **The best output guardrail is already in the language, and para/ai does not implement it.**
+// `json.try_parse::<T>` runs `Validate` automatically, bottom-up, at the decode door — so a
+// structured reply is validated before this package ever sees the value, and the failure arrives as
+// a path-carrying `JsonError` reading `items[2]: confidence out of range: 1.4`. That message is
+// also an excellent repair prompt, which is exactly what `extract` does with it.
+
+// One structured model call — the provider-erased seam `extract` drives. `Agent<P>` implements it
+// inline; the comment on that impl says why the erasure is load-bearing rather than tidy.
+pub trait Structured {
+    // Ask for one document in `out`'s shape, and hand back its raw JSON text.
+    //
+    // Synchronous, like `ToolSource.call` and for the same reason: it is held as `dyn`. That also
+    // makes `extract` callable from a plain `fn`, which is what keeps its tests real — an `async fn`
+    // in a `@test` block is never driven on a released toolchain, so an async extraction's
+    // assertions would be vacuous exactly where they matter most.
+    fn ask_json(conv: Conversation, out: Output): Result<string, AiError>
+}
+
+// Ask for a value of type `T`, and get one — or a typed error saying why not.
+//
+// **A top-level function rather than `agent.extract::<T>(conv)`**, which DESIGN §8.1 sketches and no
+// spelling of this language can provide: a generic method cannot forward its parameter into
+// `json.try_parse::<T>` (E0058, measured), and a turbofish must name every parameter of the function
+// it instantiates, so the provider is erased behind `dyn Structured` to leave exactly one. The
+// argument order still reads left to right as "extract this, from that agent, over this
+// conversation, in this shape".
+//
+// **Bounded repair** (§8.3). On a decode or validation failure the `JsonError`'s own message goes
+// back as a correction turn and the call is made again, `repair` times, defaulting to 1. One repair
+// fixes the overwhelming majority of real failures; an unbounded loop against a model that has
+// misunderstood the schema is a way to spend money. Every attempt is a span event, so a run that
+// repaired shows it in the trace instead of hiding it in latency.
+//
+// **A refusal is not a decode failure** (§8.4). `StopReason.Refusal` has already become
+// `AiError.Refused` inside the run loop, and it comes back out of here unchanged and unretried —
+// repairing a refusal would spend the budget arguing with a model that declined on purpose, and
+// reporting it as a `JsonError` would send the reader to debug a schema that is fine.
+//
+// **A repair that gives up returns a typed error, not a half-built value** (§10's rule, which
+// applies here too). The last failure is reported with its path intact.
+pub fn extract<T>(a: dyn Structured, conv: Conversation, out: Output, repair: int = 1): Result<T, AiError> {
+    budget = at_least(repair, 0)
+    span = tracing.span("extract ${out.name}")
+    span.set_attribute("gen_ai.operation.name", "extract")
+    span.set_attribute("para.ai.output.type", out.target)
+    span.set_attribute("para.ai.output.repair_budget", budget)
+
+    mut so_far = conv
+    mut attempt = 0
+    mut outcome: Result<T, AiError> = no_attempt(out)
+    mut settled = false
+    while !settled && attempt <= budget {
+        if attempt > 0 {
+            // The trace is where a repair belongs. A run that quietly costs two model calls instead
+            // of one is a cost nobody can see until the invoice arrives.
+            span.add_event("para.ai.output.repair")
+        }
+        match a.ask_json(so_far, out) {
+            Ok(text) => {
+                // The one decode, and the one place `Validate` runs. Nothing in this package
+                // inspects the document first: a pre-check would be a second, weaker copy of a
+                // validation the language already performs completely.
+                match json.try_parse::<T>(text) {
+                    Ok(value) => {
+                        outcome = decoded(value)
+                        settled = true
+                    },
+                    Err(e) => {
+                        outcome = undecoded::<T>(out, e)
+                        so_far = so_far.assistant(text).user(correction(e))
+                    },
+                }
+            },
+            Err(e) => {
+                // A refusal, a transport failure, a vendor error: none of them is a malformed
+                // document, and none of them is repaired by telling the model its JSON was wrong.
+                outcome = failed::<T>(e)
+                settled = true
+            },
+        }
+        attempt = attempt + 1
+    }
+    span.set_attribute("para.ai.output.attempts", attempt)
+    match outcome {
+        Ok(v) => {},
+        Err(e) => {
+            span.record_error("${e}")
+        },
+    }
+    span.end()
+    return outcome
+}
+
+// The three `Result` constructors `extract` assigns through.
+//
+// Written as functions with declared return types because a bare `Ok(v)`/`Err(e)` assigned to an
+// already-annotated `mut` is E0023 — the declaration's annotation is not consulted for the
+// assignment's expected type, and the diagnostic's help suggests the annotation that is already
+// there. The same workaround `mcp.noe` uses, and for the same reason (AGENTS.md).
+//
+// The two **return-only** ones are called `failed::<T>(e)` rather than `failed(e)`, and the
+// turbofish is required rather than decorative: expected-type seeding fills a return-only parameter
+// from an *annotation* (`no_attempt(out)` in the initializer infers fine) but not from a
+// **reassignment**, which reports `cannot assign Result<dyn, AiError> to outcome`. Forwarding the
+// enclosing `T` into a user generic's turbofish is what closes it — a capability the name-keyed
+// reflection turbofishes deliberately do not have, and the difference is worth knowing.
+fn decoded<T>(v: T): Result<T, AiError> {
+    return Ok(v)
+}
+
+fn failed<T>(e: AiError): Result<T, AiError> {
+    return Err(e)
+}
+
+// A decode or validation failure, with the path the language handed us kept intact. `path` is what
+// makes `items[2].confidence` a location rather than a paragraph, and flattening it into the message
+// would throw away the only part a program can branch on.
+fn undecoded<T>(out: Output, e: JsonError): Result<T, AiError> {
+    return Err(AiError.Decode(path: e.path(), message: "`${out.target}`: ${e.message()}"))
+}
+
+fn no_attempt<T>(out: Output): Result<T, AiError> {
+    return Err(AiError.Decode(
+        path: "",
+        message: "`${out.target}`: no extraction attempt was made — the repair budget was negative",
+    ))
+}
+
+// The correction turn a failed decode becomes.
+//
+// It is the `JsonError`'s own message and nothing else, because that message is already the best
+// prompt available: `Validate` runs bottom-up at the door, so a nested failure arrives as
+// `items[2]: confidence out of range: 1.4` — the field, its path, and the invariant it broke, in the
+// words the type's author wrote. Paraphrasing it here would lose the path and add nothing.
+fn correction(e: JsonError): string {
+    return "That did not decode: ${e.message()}. Answer again with the same schema, correcting exactly that."
+}
+
+// The document a structured run produced, from wherever this vendor put it.
+//
+// Two places, because the vendors genuinely differ: OpenAI, Google and Ollama constrain the ordinary
+// assistant text, while Anthropic forces a tool and the document arrives as that call's arguments.
+// The tool call is checked first and by name, so an agent that also has real tools cannot have one
+// of *their* calls mistaken for the answer.
+fn structured_json(run: Run, out: Output): Result<string, AiError> {
+    last = run.conversation().last()
+    match last {
+        some(m) => {
+            for p in m.parts {
+                match p {
+                    Part.ToolCall(id, name, args) => {
+                        if name == out.name {
+                            return Ok(args)
+                        }
+                    },
+                    _ => {},
+                }
+            }
+            text = m.text().trim()
+            if text != "" {
+                return Ok(text)
+            }
+        },
+        none => {},
+    }
+    // Empty is its own failure, and a different one from malformed. A vendor that answered with
+    // nothing at all did not produce a document with a bad field in it, and reporting it as a
+    // decode failure would send the reader looking for a schema mistake.
+    return Err(AiError.Decode(
+        path: "",
+        message: "`${out.target}`: the reply carried no `${out.name}` tool call and no text — the model was asked for a structured answer and produced nothing to decode",
+    ))
+}
+
+// The tool calls the loop should actually dispatch: every one that is not this run's output tool.
+fn dispatchable_calls(calls: List<Part>, output: ?Output): List<Part> {
+    name = match output {
+        some(out) => out.name,
+        none => "",
+    }
+    if name == "" {
+        return calls
+    }
+    mut out: List<Part> = []
+    for p in calls {
+        match p {
+            Part.ToolCall(id, called, args) => {
+                if called != name {
+                    out = out ~ [p]
+                }
+            },
+            _ => {},
+        }
+    }
+    return out
+}
+
 // --- The agent ------------------------------------------------------------------------------------
 
 // An agent: a configuration, a provider codec, and the transport chain to send through.
@@ -775,6 +1208,21 @@ pub struct Agent<P: Provider> {
     // `Streamer`. Defaults to the real client; `frames` swaps in a scripted replay.
     pub transport: dyn Streamer
     pub toolbox: Toolbox = Toolbox.new()
+    // The shape this agent's next reply must take, when one was asked for.
+    //
+    // On the `Agent` rather than on `AgentConfig` because it is a **per-call** decision, not a
+    // standing one: the same agent answers `run_sync` with prose and `extract` with a document, and
+    // a config field would make "which of my agents is the structured one" a thing to keep track of.
+    // `expecting` returns a new agent, so nothing is mutated and a structured call cannot leak into
+    // the next ordinary one.
+    pub output: ?Output = none
+    // The guards this agent consults, in registration order (DESIGN §9).
+    //
+    // A `List<dyn Guard>` for the same reason the toolbox holds `List<dyn ToolSource>`: a guard is
+    // an ordinary Noeta value and none is privileged, so the only thing they have in common is the
+    // trait. It also means an agent with guards is `!Send`, which is the trade `dyn` always is —
+    // ship the `AgentConfig`, build the agent per worker.
+    pub guards: List<dyn Guard> = []
 
     // An agent over the default transport: a plain client wrapped in `Retry`, which honors a
     // vendor's `Retry-After` and backs off on 429/502/503/504. `retry(0)` on the client is
@@ -813,6 +1261,80 @@ pub struct Agent<P: Provider> {
         return Agent { ...self, toolbox: box }
     }
 
+    // The same agent, asked to answer in a declared shape. `extract` uses this; a caller who wants
+    // the raw document rather than a typed value can use it directly and read `Run.text()`.
+    fn expecting(out: Output): Agent<P> {
+        return Agent { ...self, output: some(out) }
+    }
+
+    // Register a guard. Chains, and the **order is the order they are consulted in** — the first
+    // non-`Allow` verdict wins, so a cheap structural check belongs before an expensive judgement.
+    //
+    // On the `Agent` rather than on `AgentConfig` for the same reason the toolbox is: a `dyn Guard`
+    // is not `Send`, and `AgentConfig` is the value you ship to a worker. Build the guards per
+    // worker; ship the config, which carries the `on_deny` *policy* because a policy is a plain
+    // value.
+    fn with(g: dyn Guard): Agent<P> {
+        return Agent { ...self, guards: self.guards ~ [g] }
+    }
+
+    // Consult `Stage.ToolCall` for each requested call, keeping the approved ones and turning a
+    // denied one into a failed tool result — unless the policy says the run is over.
+    //
+    // Per call rather than per turn, because that is the granularity approval happens at: a model
+    // that asks for `search` and `rm` in one turn should get its search.
+    fn gate_calls(calls: List<Part>, conv: Conversation, run_id: string, turn: int, usage: Usage): (Approved, ?Denial, List<Fired>) {
+        mut approved: List<Part> = []
+        mut canned: List<Part> = []
+        mut fired: List<Fired> = []
+        if self.guards.len() == 0 {
+            return (Approved { approved: calls, canned: canned }, none, fired)
+        }
+        for c in calls {
+            asked = gate(self.guards, Stage.ToolCall, call_ctx(conv, run_id, turn, usage, c))
+            fired = fired ~ asked.fired
+            match asked.denial {
+                some(d) => {
+                    match self.config.on_deny {
+                        // A denied call is a failed tool turn — "a failing tool is a turn, not an
+                        // outage", and a model told it may not use a tool will pick another.
+                        OnDeny.Feedback(max) => {
+                            canned = canned ~ [refusal_result(c, d.reason)]
+                        },
+                        OnDeny.Replace(parts) => {
+                            canned = canned ~ [refusal_result(c, text_of(parts))]
+                        },
+                        OnDeny.Stop => {
+                            return (Approved { approved: approved, canned: canned }, some(d), fired)
+                        },
+                    }
+                },
+                none => {
+                    approved = approved ~ asked.parts
+                },
+            }
+        }
+        return (Approved { approved: approved, canned: canned }, none, fired)
+    }
+
+    // One structured model call, erased over the provider.
+    //
+    // **The erasure is what makes `extract::<T>` writable at all**, and the reason is measured
+    // rather than aesthetic. A generic *method* cannot forward its type parameter into a
+    // call-site-typed position — `json.try_parse::<T>` inside one is E0058, "call-site-typed
+    // forwarding is supported in top-level generic functions only" — so DESIGN §8.1's
+    // `agent.extract::<Extraction>(conv)` cannot exist in any form. A top-level `fn extract<T>` can
+    // forward, but a turbofish must supply *every* type parameter (a partial one is E0058), so an
+    // `extract<T, P: Provider>` would have to be written `extract::<Extraction, Anthropic>(…)`.
+    // Erasing the provider behind this trait leaves exactly one parameter to name, which is the one
+    // the caller actually cares about. See §8.1's divergence note.
+    impl Structured {
+        fn ask_json(conv: Conversation, out: Output): Result<string, AiError> {
+            run = drive_sync(self.expecting(out), conv)?
+            return structured_json(run, out)
+        }
+    }
+
     // The neutral request for a conversation, with the config's system prompt prepended.
     //
     // **This is where the cache breakpoint is placed.** The system prompt arrives already split at
@@ -836,6 +1358,7 @@ pub struct Agent<P: Provider> {
             model: self.config.model,
             messages: msgs,
             tools: self.toolbox.specs(),
+            output: self.output,
             max_tokens: self.config.max_tokens,
             temperature: self.config.temperature,
             stop: self.config.stop,
@@ -1105,7 +1628,7 @@ pub struct Agent<P: Provider> {
         root.set_attribute("para.ai.run.id", id)
 
         sink.emit(Event.RunStarted(run_id: id, thread_id: thread_id)).await
-        outcome: Result<Run, AiError> = self.turns(conv, sink, streamed).await
+        outcome: Result<Run, AiError> = self.turns(conv, sink, streamed, id).await
         match outcome {
             Ok(run) => {
                 root.set_attribute("gen_ai.usage.input_tokens", run.usage.input_tokens)
@@ -1152,10 +1675,37 @@ pub struct Agent<P: Provider> {
     //     agent with no toolbox, or a model naming a tool in a reply that carries no call block,
     //     hands the requested calls back in `Run.messages` — which is exactly what phase 1 did, and
     //     the only behavior that cannot spin.
-    async fn turns(conv: Conversation, sink: dyn EventSink, streamed: bool): Result<Run, AiError> {
+    // The four guard stages hang off this loop, one at each point where content crosses a boundary
+    // (DESIGN §9): `Input` once on the trailing user turn, `Output` on each reply, `ToolCall` on
+    // each requested call before dispatch, and `ToolResult` on what dispatch produced. A run with no
+    // guards registered takes the same path it always did — `gate` is not even consulted.
+    async fn turns(conv: Conversation, sink: dyn EventSink, streamed: bool, run_id: string): Result<Run, AiError> {
         mut so_far = conv
         mut usage = Usage {}
         mut turn = 0
+        mut fired: List<Fired> = []
+        mut corrections = 0
+
+        // **`Input` runs once, not once per turn.** The stage is about what the *user* sent, and a
+        // tool loop's later turns are the model talking to itself — re-running `Recall` on each of
+        // them would prepend the same memories four times and re-running `Blocklist` would judge
+        // text the user never wrote.
+        if self.guards.len() > 0 {
+            entry = gate(self.guards, Stage.Input, input_ctx(so_far, run_id))
+            fired = fired ~ entry.fired
+            match entry.denial {
+                some(d) => {
+                    // Nothing has been sent, so there is nobody to give feedback to: `Feedback`
+                    // degenerates to `Stop` here, and `Replace` is the policy with a real answer —
+                    // the canned "I can't help with that" every product ships.
+                    return input_denied(self.config.on_deny, so_far, d, fired, turn)
+                },
+                none => {
+                    so_far = with_rewritten_tail(so_far, Role.User, entry.parts)
+                },
+            }
+        }
+
         while turn < self.config.max_turns {
             reply = self.call(self.request(so_far, streamed), sink).await?
             turn = turn + 1
@@ -1163,19 +1713,111 @@ pub struct Agent<P: Provider> {
             if reply.stop == StopReason.Refusal {
                 return Err(AiError.Refused(reason: refusal_text(reply)))
             }
-            so_far = so_far.with(Message { role: Role.Assistant, parts: reply.parts })
-            calls = tool_calls_of(reply.parts)
-            if reply.stop != StopReason.ToolUse || calls.len() == 0 || self.toolbox.is_empty() {
-                return Ok(Run {
-                    messages: so_far.messages,
-                    usage: usage,
-                    turns: turn,
-                    stop: reply.stop,
-                })
+
+            mut parts = reply.parts
+            // Named `feedback` rather than `correction`: the module-level `correction(e)` builds the
+            // *structured-output* repair turn, and a local of that name shadows it (E0007 at the
+            // first use, which is a confusing place to read about a name collision).
+            mut feedback = ""
+            if self.guards.len() > 0 {
+                judged = gate(self.guards, Stage.Output, turn_ctx(Stage.Output, so_far, run_id, turn, usage, parts))
+                fired = fired ~ judged.fired
+                match judged.denial {
+                    some(d) => {
+                        match self.config.on_deny {
+                            OnDeny.Feedback(max) => {
+                                if corrections >= max {
+                                    return Err(guard_error(d))
+                                }
+                                corrections = corrections + 1
+                                feedback = d.reason
+                            },
+                            OnDeny.Replace(canned) => {
+                                return Ok(Run {
+                                    messages: so_far.with(Message { role: Role.Assistant, parts: canned }).messages,
+                                    usage: usage,
+                                    turns: turn,
+                                    stop: reply.stop,
+                                    verdicts: fired,
+                                })
+                            },
+                            OnDeny.Stop => {
+                                return Err(guard_error(d))
+                            },
+                        }
+                    },
+                    none => {
+                        parts = judged.parts
+                    },
+                }
             }
-            results = tools.dispatch(self.toolbox, calls, self.config.tool_concurrency)
-            emit_results(results, sink).await
-            so_far = so_far.with(Message { role: Role.Tool, parts: results })
+
+            so_far = so_far.with(Message { role: Role.Assistant, parts: parts })
+
+            // A denied answer that is being fed back: the reason becomes a user turn and the model
+            // tries again. Written as an `if`/`else` rather than a `continue` — the run loop keeps a
+            // `mut` accumulator per iteration, and an early-exit edge over one of those is the shape
+            // AGENTS.md records as a live workaround in `encode_messages`.
+            if feedback != "" {
+                so_far = so_far.user(feedback)
+            } else {
+                // **The output tool is an answer, not a call.** Anthropic has no `response_format`,
+                // so a structured request goes out as a forced tool and the document comes back as a
+                // `tool_use` block with `stop_reason: tool_use` — indistinguishable, at this point,
+                // from the model asking for a real tool. Dispatching it would look up a tool no
+                // `ToolSource` declares, feed the model "unknown tool", and spin the loop for a
+                // reply that already arrived. Withholding it here finishes the run with the document
+                // in `Run.messages`, where `structured_json` reads it.
+                calls = dispatchable_calls(tool_calls_of(parts), self.output)
+                if reply.stop != StopReason.ToolUse || calls.len() == 0 || self.toolbox.is_empty() {
+                    return Ok(Run {
+                        messages: so_far.messages,
+                        usage: usage,
+                        turns: turn,
+                        stop: reply.stop,
+                        verdicts: fired,
+                    })
+                }
+                // **`ToolCall` sits above `Toolbox.call`, which is what makes one mechanism cover
+                // local and MCP tools alike** (DESIGN §7.1). By the time a call reaches here it is an
+                // ordinary tool call whatever source declared it, so `Approval` needed no MCP hook.
+                (allowed, refused, call_fired) = self.gate_calls(calls, so_far, run_id, turn, usage)
+                fired = fired ~ call_fired
+                match refused {
+                    some(d) => {
+                        return Err(guard_error(d))
+                    },
+                    none => {},
+                }
+                dispatched = tools.dispatch(self.toolbox, allowed.approved, self.config.tool_concurrency)
+                mut results = allowed.canned ~ dispatched
+                if self.guards.len() > 0 {
+                    seen = gate(self.guards, Stage.ToolResult, turn_ctx(Stage.ToolResult, so_far, run_id, turn, usage, results))
+                    fired = fired ~ seen.fired
+                    match seen.denial {
+                        some(d) => {
+                            match self.config.on_deny {
+                                // A denied result is a failed tool turn, which is exactly the shape
+                                // the model already knows how to recover from.
+                                OnDeny.Feedback(max) => {
+                                    results = errored(results, d.reason)
+                                },
+                                OnDeny.Replace(canned) => {
+                                    results = errored(results, text_of(canned))
+                                },
+                                OnDeny.Stop => {
+                                    return Err(guard_error(d))
+                                },
+                            }
+                        },
+                        none => {
+                            results = seen.parts
+                        },
+                    }
+                }
+                emit_results(results, sink).await
+                so_far = so_far.with(Message { role: Role.Tool, parts: results })
+            }
         }
         return Err(AiError.MaxTurns(turns: self.config.max_turns))
     }
@@ -1232,7 +1874,12 @@ async fn run_job<P: Provider>(j: RunJob<P>): Result<Run, AiError> {
 // one-element list it is precisely "run this future here and give me the answer". Spelling that as
 // a concurrency combinator rather than as a `block_on` is a std gap, not a design choice — and the
 // alternative was a second, synchronous copy of the run loop, which is where the bugs would live.
-fn drive_sync<P: Provider>(agent: Agent<P>, conv: Conversation): Result<Run, AiError> {
+//
+// **Public**, because it is the synchronous door onto a whole `Run` and there is no other:
+// `run_sync` flattens the answer to a string, so a caller who wants the usage, the turn count or
+// `Run.verdicts` from synchronous code has nowhere else to go. `Structured.ask_json` is the first
+// caller inside this package to need exactly that.
+pub fn drive_sync<P: Provider>(agent: Agent<P>, conv: Conversation): Result<Run, AiError> {
     return map_bounded([RunJob { agent: agent, conv: conv }], 1, run_job)[0]
 }
 
@@ -1292,6 +1939,10 @@ fn error_type(e: AiError): string {
         AiError.Mcp(server, code, m) => if code == "" then "mcp" else "mcp_${code}",
         AiError.MaxTurns(turns) => "max_turns",
         AiError.ContextOverflow(needed, budget) => "context_overflow",
+        // The class, not the guard's name: a guard is an ordinary value and a caller may register
+        // as many as they like, so the *name* is unbounded and belongs in the span event (which
+        // carries it) rather than in a metric attribute.
+        AiError.Guard(stage, guard, reason) => "guard",
         AiError.Cancelled => "cancelled",
     }
 }

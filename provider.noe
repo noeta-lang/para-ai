@@ -29,7 +29,7 @@ namespace para.ai.provider
 use std.json
 use std.http.{Frame}
 use para.ai.{Message, Part, AiError}
-use para.ai.tools.{ToolSpec}
+use para.ai.tools.{Output, ToolSpec}
 
 // --- The wire ------------------------------------------------------------------------------------
 
@@ -108,12 +108,24 @@ pub struct Wire {
 //
 // `tools` is what the model is allowed to ask for; a codec that receives an empty list sends no
 // tools key at all, because "no tools" and "an empty tools array" are not the same request to every
-// vendor. Phase 5 adds `output` — defaulted, so adding it breaks no caller.
+// vendor.
 @derive(Equatable, Display)
 pub struct ModelRequest {
     pub model: string
     pub messages: List<Message>
     pub tools: List<ToolSpec> = []
+    // The shape the reply must take, when the caller asked for one (DESIGN §8).
+    //
+    // **Defaulted, so adding it broke no caller** — and every codec that honors it does so in its
+    // own vendor's spelling, because there is no neutral one: Anthropic forces a single tool,
+    // OpenAI takes `response_format: json_schema` with `strict`, Google takes `responseSchema`
+    // alongside a `responseMimeType`, and Ollama takes a bare `format`. Four spellings of one
+    // request is exactly what the codec seam exists for.
+    //
+    // A codec with **no** structured-output mode must refuse at `encode` rather than send the
+    // request unconstrained. A caller who asked for a schema and silently got prose learns about it
+    // as a decode failure with no path, which is the worst place to find out.
+    pub output: ?Output = none
     pub max_tokens: ?int = none
     pub temperature: ?float = none
     pub stop: List<string> = []
