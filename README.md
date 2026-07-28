@@ -12,7 +12,8 @@ The split that decides everything else: **a provider is a codec, not a client.**
 | --- | --- |
 | `para.ai` | `Agent`, `AgentConfig`, `Conversation`, `Run`, `Message`, `Part`, `Role`, `AiError` — the data model, the run loop, and the errors; plus `Event`, `EventSink`, `Frames`, and `Streamer` — the streaming surface |
 | `para.ai.provider` | `Provider`, `StreamDecoder`, `ModelRequest`, `ModelReply`, `Delta`, `Usage`, `StopReason`, `Wire`, `Framing` — the codec seam and the delta accumulator |
-| `para.ai.tools` | `Tool`, `Arg`, `ToolSpec`, `ToolSource`, `Local`, `Toolbox`, `dispatch` — the signature-is-the-spec pipeline |
+| `para.ai.tools` | `Tool`, `Arg`, `ToolSpec`, `ToolSource`, `Local`, `Toolbox`, `dispatch` — the signature-is-the-spec pipeline — plus `Output` and `schema_for`, the structured-output door onto the same schema walk |
+| `para.ai.guard` | `Guard`, `Stage`, `Verdict`, `GuardCtx`, `OnDeny`, `Fired`, `decide`, and nine standard guards — `ToolAllowlist`, `Approval`, `MaxTurns`, `TokenBudget`, `Redact`, `Blocklist`, `SchemaGuard`, `Recall`, `Judge` |
 | `para.ai.prompt` | `render`, `Prompt`, `Resolved` — the `@prompt` expression tier, and the stable/volatile split a prompt cache is placed from |
 | `para.ai.mcp` | `McpClient`, `Stdio`, `Http`, `Transport`, `Events`, `Sampler`, `Capabilities`, `Resource`, `PromptSpec` — the MCP client, and `impl ToolSource for McpClient` |
 | `para.ai.providers.anthropic` | `Anthropic` — the Anthropic Messages API codec |
@@ -240,13 +241,18 @@ The coercion layer is load-bearing here rather than a convenience. `invoke` vali
 | `Map<string, T>` | `{"type":"object","additionalProperties":…}` |
 | `?T` | `T`'s schema, and absent from `required` |
 | `A\|B` | `{"anyOf":[…]}` |
+| a declared **struct** or **class** | a nested `{"type":"object", …, "additionalProperties":false}`, recursively, to any depth |
+| a declared **enum** | `{"type":"string","enum":[…]}` — its *backings* when it is a backed enum, its case names when it is not |
 
-Every remaining variant is a **loud, actionable message** naming the parameter, the type, and what to write instead — never an empty schema. `bytes`, `void`, `Result`, a function type, a `dyn Trait`, a `Map` not keyed by `string`, and the fixed-width numerics (`i32`, `f32`, `f64` in container position — their packed storage cannot be built from JSON) are all refused, and the refusal reaches you at `Toolbox` construction rather than at the first model call.
+Every remaining variant is a **loud, actionable message** naming the parameter, the type, and what to write instead — never an empty schema. `bytes`, `void`, `Result`, a function type, a `dyn Trait`, a `Map` not keyed by `string`, and the fixed-width numerics (`i32`, `f32`, `f64` in container position — their packed storage cannot be built from JSON) are all refused, and the refusal reaches you at `Toolbox` construction rather than at the first model call. So is a **recursive** type, by name and with the cycle printed: a JSON Schema for a cycle needs `$ref`, which no vendor's strict mode accepts uniformly.
 
-Two nominal shapes get their own messages, because they are different gaps with different fixes:
+The nominal rows are asked as a **pair**, and that is the whole trick. `field_specs_of` answers an enum with the empty list — and a field-less struct with the empty list too, so through that query alone an enum is *indistinguishable from an empty struct*, and a walk that recursed on fields would emit `{"type":"object","properties":{}}` for an enum and be silently wrong. `variants_of` is the other half: fields present means a struct, variants present means an enum, and both empty is the one honest "nothing is known about this name".
 
-- **A struct or class parameter** — a nested-object schema is [DESIGN.md](DESIGN.md) §8.5's slice, closed by `@schema`. Declare its fields as separate parameters in the meantime.
-- **An enum parameter** — an enum's variants are not reflectable at runtime (there is no `variants_of` to mirror `field_specs_of`), so the `{"enum": […]}` §6 sketches cannot be derived today. Declare the parameter `string` and name the accepted values in `#[Arg(help: …)]` — which is what §6's own example does.
+One nominal shape is still refused, and the reason is narrower than it used to be:
+
+- **An enum-typed parameter.** Its `{"enum": […]}` schema derives perfectly well now — what is missing is a way to *build* the value. Four doors, all measured: `@derive(Deserialize<Json>)` on a struct with an enum-typed field is a check-time error, `construct` takes structs and classes only, `json.decode_typed` needs the recipe that derive would have registered, and `Enum.from` takes a case name and aborts on an unknown one. Deriving the schema and failing at dispatch would teach a model to send arguments the function cannot accept, so the refusal stays. Declare the parameter `string` and name the accepted values in `#[Arg(help: …)]`.
+
+**A struct-typed parameter works end to end**, and every field is coerced before the value is built: `construct` validates a field's presence and its *scalar* type only, so a raw object handed to a struct-typed field would otherwise be stored as-is and abort at the first field read. The coercion layer is the type check, and nothing reaches the builder around it.
 
 ### `ToolSource` and `Toolbox`
 
@@ -298,6 +304,79 @@ Three properties are decisions:
 - **`AgentConfig.max_turns` (default 8) is a hard rail, and exceeding it is `AiError.MaxTurns`** rather than a truncated `Ok`. A run that stops mid-loop has an assistant turn whose last word was a tool call nobody answered; handing that back as an answer is the silent-truncation failure §10 refuses for context strategies, for the same reason. (The `MaxTurns` *guard* of phase 5 is a different thing at a different layer — a policy a caller opts into, reported as `Guard(...)`. This is the loop's own rail, always on.)
 
 An agent with **no** toolbox that receives a tool-use stop finishes the run and hands the requested calls back in `Run.messages`, exactly as phase 1 did. That is the only behavior that cannot spin.
+
+## Structured responses: ask for a type, get a type
+
+```noeta
+use para.ai.{extract}
+use para.ai.tools.{Output}
+
+@derive(Deserialize<Json>)
+struct Extraction {
+    company: string
+    confidence: float
+
+    impl Validate {
+        fn validate(): Result<void, string> {
+            if self.confidence < 0.0 || self.confidence > 1.0 {
+                return Err("confidence out of range: ${self.confidence}")
+            }
+            return Ok()
+        }
+    }
+}
+
+out = Output.of(type_name::<Extraction>())?
+e   = extract::<Extraction>(agent, conv, out)?
+```
+
+The schema is **derived from the declaration** by the same walk the table above describes — there is nothing to write and nothing to keep in sync. Each codec then spells it its own vendor's way: Anthropic a forced single tool (`tool_choice` naming it, with the document arriving as that call's arguments), OpenAI `response_format: json_schema` with `strict`, Google `responseSchema` alongside `responseMimeType`, Ollama a bare `format`.
+
+### The best output guardrail is already in the language
+
+`json.try_parse::<T>` runs `Validate` **automatically, bottom-up, at the decode door**. para/ai does not call it and could not do it better: a nested failure arrives as `items[2]: confidence out of range: 1.4` — the field, its path, and the invariant in the words its author wrote.
+
+What para/ai does is notice that this is also an excellent repair prompt. On a decode or validation failure the message goes back as a correction turn and the call is made again, `repair: int = 1` by default, one span event per attempt. One repair fixes the overwhelming majority of real failures; an unbounded loop against a model that has misunderstood the schema is a way to spend money. A budget that runs out returns **the last typed failure with its path**, never a half-built value.
+
+A **refusal is not a decode failure**: `StopReason.Refusal` is `AiError.Refused` and is never repaired. Conflating them makes "the model declined" look like "your schema is wrong", which sends you to debug the wrong thing.
+
+### Why `extract` is a function and names the type twice
+
+`agent.extract::<Extraction>(conv)` would be nicer and the language cannot express it. A generic *method* cannot forward its type parameter into `json.try_parse::<T>` (E0058, "call-site-typed forwarding is supported in top-level generic functions only"), and a turbofish must supply *every* parameter of what it instantiates — so the provider is erased behind a `dyn Structured` seam to leave exactly one to name. And `type_name::<T>()` over a type parameter is E0058 too, which is why the schema is reflected at the call site and passed in; the diagnostic's own advice is to do exactly that. Both are filed upstream.
+
+## Guardrails: one trait, four stages, no privileged guard
+
+```noeta
+use para.ai.guard.{Approval, Approve, Blocklist, OnDeny, Recall}
+
+agent = Agent.from(cfg.denying(OnDeny.Feedback(max: 2)), provider)
+    .tools(mem)?
+    .with(Blocklist.new(["ignore previous instructions"]))
+    .with(Recall.new(mem, "search", 5))
+    .with(Approval.new(Approve.Allowlist(names: ["search", "read"])))
+```
+
+A guard sees content at one of four points — `Input`, `Output`, `ToolCall`, `ToolResult` — and answers `Allow`, `Deny(reason)` or `Rewrite(parts)`. Guards run in **registration order** and the **first non-`Allow` wins**, so put the cheap structural checks before the expensive judgement.
+
+`Deny` is handled by the run's policy, which is explicit rather than something to guess at:
+
+| `on_deny` | behavior |
+| --- | --- |
+| `Stop` (default) | the run ends with `AiError.Guard(stage, guard, reason)` |
+| `Feedback(max)` | the reason goes back as a correction — a user turn at `Output`, a failed `ToolResult` at the two tool stages — up to `max` times |
+| `Replace(parts)` | the denied content is swapped for a canned reply |
+
+At `Stage.Input` there is nobody to give feedback to, so `Feedback` reads as `Stop` there and `Replace` is the policy with a real answer: it ends the run with the canned reply.
+
+**`Rewrite` is why redaction, memory injection and prompt hardening are one mechanism rather than three features.** `Redact` replaces text with the secrets removed, `Recall` prepends what a memory server remembered, and a hardening guard wraps a user turn in a delimiter block — the same verdict three times, and none of them needed a hook of its own.
+
+**No guard is privileged by the framework.** `Judge` calls a cheap model over a `dyn Asking` that `Agent` implements; `ToolAllowlist` compares two strings; to the run loop they are the same kind of value. That is the para/api middleware principle, and it is what makes the trait worth having.
+
+Ships with `ToolAllowlist`, `Approval` (`Auto` / `Deny` / `Allowlist(names)` / `Ask(callback)` — the callback sees the arguments, because approving `delete` without seeing what it will delete is not approval), `MaxTurns`, `TokenBudget`, `Redact(pattern, replacement)`, `Blocklist`, `SchemaGuard`, `Recall`, and `Judge`.
+
+**Approval attaches above `Toolbox.call`**, per call rather than per turn, which is what makes one mechanism cover local `#[Tool]` functions and MCP tools alike — a model that asks for one approved tool and one denied one gets its approved answer, and both results land in the same tool turn.
+
+Every non-`Allow` verdict is a span carrying its reason, a counter (`para.ai.guard.denials`, `para.ai.guard.rewrites`, keyed by stage and guard name only — a reason is unbounded text), and an entry in `Run.verdicts`. "The guardrails are configured" and "the guardrails are firing" have to be distinguishable without reading logs, which is the distinction `Cache.hits()` draws in para/api.
 
 ## MCP: a server's tools are just tools
 
@@ -753,7 +832,7 @@ Three commitments:
 
 ## What the run loop does today
 
-`run(conv)` calls the model, and keeps calling while the model asks for tools — see [The loop](#the-loop) above for the shape and the three decisions in it. The guard stages and the context strategy attach to the same loop in phase 5.
+`run(conv)` calls the model, and keeps calling while the model asks for tools — see [The loop](#the-loop) above for the shape and the three decisions in it. The four guard stages hang off the same loop; the context strategy is the one step still to come.
 
 `run`, `run_into`, and `stream` are `async`; `run_sync` is not. That is deliberate in both directions: streaming makes the loop genuinely async, while `run_sync(text) -> Result<string, AiError>` stays synchronous because a plain string-in/string-out entry point is what makes a framework testable from an ordinary `fn`. There is still only **one** loop — `run_sync` drives the async one to completion rather than duplicating it, and a second, synchronous copy is exactly where a divergence would live.
 
@@ -764,10 +843,11 @@ Three commitments:
 - [`examples/memory/`](examples/memory) — **memory as an MCP server**: a sixty-line POSIX-shell memory server the example spawns over stdio, an agent whose entire tool vocabulary came from that subprocess, and a fact that survives between runs because it left the process. Declares no `#[Tool]` of its own, and a test asserts that from the trust-boundary index. Hermetic, no key, no npm install.
 - [`examples/prompt_cache/`](examples/prompt_cache) — a `@prompt` system prompt with a stable preamble and a per-customer tail: the exact statics/holes decomposition, a recall that proves reading the cache prefix never evaluated it, and the encoded Anthropic body with `cache_control` on the stable block and nowhere else. Hermetic, no key.
 
+- [`examples/structured/`](examples/structured) — **`extract::<T>` end to end**: a struct with a `Validate` invariant, the exact JSON Schema derived from its five field declarations, a first answer that breaks the invariant and a second that is accepted after the invariant's own message goes back as the correction, and a guard that denies an input before any model call. Hermetic, no key.
 - [`examples/agui/`](examples/agui) — **an AG-UI server**: `server.sse` behind a plain `(Request) -> Response` router, the endpoint as one line, and a hermetic `@test` block asserting the exact frame sequence of a tool-calling run and of a failing one through `agui.stream_sync`. No port, no key.
 - [`examples/providers/`](examples/providers) — five vendors, three codec families, one program: the runtime-selection `match` at six arms, the whole run loop driven over each real codec from a captured vendor body (buffered through `para/api`'s `Mock`, streamed through `Replay`) — and **two live checks against a local Ollama**, which skip when none is running and are made un-skippable in CI by `OLLAMA_REQUIRED=1`.
 
-The design's other examples (`chat-cli`, `structured`) arrive with the phases they exercise; `agui-server` is `examples/agui` above; `local-ollama` is folded into `examples/providers` above, since the example that selects a provider at runtime is already the one that has an Ollama to talk to.
+The design's remaining example (`chat-cli`) arrives with the phase it exercises; `structured` is `examples/structured` above and `agui-server` is `examples/agui`; `local-ollama` is folded into `examples/providers` above, since the example that selects a provider at runtime is already the one that has an Ollama to talk to.
 
 ## Requirements
 
