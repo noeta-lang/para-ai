@@ -2,7 +2,7 @@
 
 An agent harness for Noeta: model calls, tool calling, MCP, structured responses, guardrails, rolling context, streaming (AG-UI over SSE), and OpenTelemetry — in the shape the rest of the `para` suite already has.
 
-Status: **phases 1, 2, 3 and 8 are built and merged** — the codec seam, Anthropic, Mock, the run loop with tool calling, GenAI telemetry, streaming, and the `@prompt` tier with automatic cache breakpoints. Phases 4, 5, 6 and 7 are in flight or queued. Every toolchain prerequisite this document named has landed (§17); the questions are settled or corrected in place.
+Status: **phases 1, 2, 3, 6 and 8 are built and merged** — the codec seam, Anthropic, Mock, the run loop with tool calling, GenAI telemetry, streaming, the MCP client over stdio and streamable HTTP, and the `@prompt` tier with automatic cache breakpoints. Phases 4, 5 and 7 are in flight or queued. Every toolchain prerequisite this document named has landed (§17); the questions are settled or corrected in place.
 
 ---
 
@@ -359,6 +359,20 @@ agent = Agent.from(cfg).tools(mem).with(Recall.new(mem, top_k: 5))
 ```
 
 `Recall` is an *input guard* (§9) with `Verdict.Rewrite`: before each user turn it calls the memory server's search tool and prepends the hits as a pinned context block. So recall is a guard, storage is a tool, and para/ai owns neither. The agent can also just be told to call the memory tools itself — that is the zero-configuration path and it works with no `Recall` at all.
+
+---
+
+### 7.1 What phase 6 built, and where it diverges
+
+Built as designed: `McpClient` over two transports, `connect` performing the whole handshake, `impl ToolSource for McpClient`, resources that are never auto-injected, prompts as a `List<Message>`, sampling through a seam that is off by default, and the memory example. Five divergences, each forced or earned:
+
+- **The transport seam moves whole documents, not requests.** `Transport` is `start`/`send_doc`/`next_doc`/`poll`/`negotiated`/`shutdown`, and **all** the protocol — id correlation, the read budget, inbound notifications, answering a server→client request — lives once in `McpClient`. The sketch implied a transport per protocol; that would have been two copies of the correlation logic, which is exactly where stdio and HTTP would drift apart.
+- **The server→client channel is its own seam, and it hands back documents.** §7 named the "native `EventStream`", which became `std.http`'s `client.stream(req, Framing.Sse)` (U-3). A `FrameStream` cannot flow through the `para/api` onion (O-4), so the POST half is testable with a scripted middleware and the channel half is not — hence `Events`, which yields *documents*. Handing back frames would have put a second SSE decoder in this package, which §3 refuses on principle.
+- **Sampling is turned on at `connect`, not on the config.** §7 sketched `cfg.allow_sampling(model, budget)`, but `AgentConfig` is a `Send` value shipped to workers and the sampler is a `dyn` — and the capability has to be advertised in `initialize`, which happens at connect time. So it is `McpClient.connect_sampling(transport, sampler, budget)`. A client that advertises sampling and then refuses every request leaves the server waiting, so the two decisions belong in the same call.
+- **The wall-clock deadline is opt-in, and it kills the server.** The design did not name a timeout; building it found there is no cheap one. A blocked `Process.read_line` parks the whole scheduler, only an `isolate` runs beside it, `concurrent` is illegal in a synchronous `fn`, `ToolSource.call` must stay synchronous (it is `dyn`, and O-2), and a parked isolate cannot be cancelled — all measured, all in AGENTS.md. So `Stdio.with_deadline(ms)` is an isolate watchdog disarmed by a beacon file, terminal when it fires, and off by default; the crash path needs none of it, and the *always-on* bound is a read budget. HTTP needs none of it either: `client.timeout(ms)` already bounds a request.
+- **`listen(max)` is caller-driven, and over stdio it delivers nothing.** Structured concurrency has no detached tasks, so a background reader has nowhere to live between calls; and stdio has no non-blocking probe, so server→client messages are handled where they actually arrive — interleaved with a reply, which is where a sampling request turns up in practice.
+
+Two things the design asked for that turned out to need no new machinery: **approval** (§9's guard stage attaches above `Toolbox.call`, so an MCP call passes through it because it is an ordinary tool call — this module adds no dispatch of its own), and **`AiError.Mcp`**, which §13 had already reserved.
 
 ---
 
@@ -849,6 +863,6 @@ Each phase is independently useful and independently shippable.
 3. **Streaming.** ~~The native frame reader (SSE + NDJSON)~~ (it went to `std.http` — U-3), `StreamDecoder`, the `Event` channel. Non-streaming becomes a fold over it. **Built**, with the divergences in §11.1.
 4. **`OpenAiCompat` + Google, then OpenRouter and Ollama on top.** Should be pure codec work by now; if it is not, the seam in phase 1 was drawn wrong and this is where we find out. OpenRouter and Ollama arriving as *configurations* rather than files is the pass condition for phase 1's design — and Ollama unlocks keyless integration tests in CI for everything after this point.
 5. **Structured responses + guardrails.** `extract::<T>`, `Validate` at the door, bounded repair, the `Guard` trait and standard guards.
-6. **MCP.** stdio first (no native code), then streamable HTTP. Memory example lands here.
+6. **MCP.** stdio first (no native code), then streamable HTTP. Memory example lands here. **Built**, with the divergences in §7.1.
 7. **AG-UI.** The SSE responder, the aether integration, the event-sequence test harness.
 8. **`@prompt` tier + cache breakpoints.** Last, because it is the one piece nothing else depends on — and the one most worth getting right rather than early. **Built**, with the divergences in §14.1.

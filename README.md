@@ -4,7 +4,7 @@ An agent harness for Noeta: a **provider codec seam**, one run loop over `para/a
 
 The split that decides everything else: **a provider is a codec, not a client.** The thing that varies between model vendors is the wire format; auth headers, retries, timeouts, mocking, recording, and tracing are identical across all of them. So a `Provider` turns a neutral `ModelRequest` into a request description and a response body back into a neutral `ModelReply` — and never performs I/O. The transport is written once, over a `para.api.Api`, which means a 429 backoff is not para/ai code.
 
-> **Status: phases 1–3 and 8.** Core data model, the `Provider` seam, the Anthropic codec, the `Mock` provider, the run loop, errors, telemetry, **tool calling**, **streaming** (`StreamDecoder`, the neutral `Event` enum, `agent.stream(conv, tx)`, and a scripted `FrameStream` so a streaming test needs no socket) — and the **`@prompt` expression tier with automatic provider prompt caching**. AG-UI encoding and the SSE responder, MCP, guardrails, context strategies, structured output, and the OpenAI/Google/OpenRouter/Ollama codecs are later phases; [DESIGN.md](DESIGN.md) is the whole plan and §18 is the order. What is *not* here is not stubbed — it is absent, and the seams it will attach to are marked in the source.
+> **Status: phases 1–3, 6, and 8.** Core data model, the `Provider` seam, the Anthropic codec, the `Mock` provider, the run loop, errors, telemetry, **tool calling**, **streaming** (`StreamDecoder`, the neutral `Event` enum, `agent.stream(conv, tx)`, and a scripted `FrameStream` so a streaming test needs no socket), the **`@prompt` expression tier with automatic provider prompt caching**, and the **MCP client** (stdio and streamable HTTP, tools as a `ToolSource`, resources, prompts, and a sampling seam that is off by default). AG-UI encoding and the SSE responder, guardrails, context strategies, structured output, and the OpenAI/Google/OpenRouter/Ollama codecs are later phases; [DESIGN.md](DESIGN.md) is the whole plan and §18 is the order. What is *not* here is not stubbed — it is absent, and the seams it will attach to are marked in the source.
 
 ## What it provides
 
@@ -14,6 +14,7 @@ The split that decides everything else: **a provider is a codec, not a client.**
 | `para.ai.provider` | `Provider`, `StreamDecoder`, `ModelRequest`, `ModelReply`, `Delta`, `Usage`, `StopReason`, `Wire`, `Framing` — the codec seam and the delta accumulator |
 | `para.ai.tools` | `Tool`, `Arg`, `ToolSpec`, `ToolSource`, `Local`, `Toolbox`, `dispatch` — the signature-is-the-spec pipeline |
 | `para.ai.prompt` | `render`, `Prompt`, `Resolved` — the `@prompt` expression tier, and the stable/volatile split a prompt cache is placed from |
+| `para.ai.mcp` | `McpClient`, `Stdio`, `Http`, `Transport`, `Events`, `Sampler`, `Capabilities`, `Resource`, `PromptSpec` — the MCP client, and `impl ToolSource for McpClient` |
 | `para.ai.providers.anthropic` | `Anthropic` — the Anthropic Messages API codec |
 | `para.ai.mock` | `Mock`, `Scripted`, `ScriptedCall`, `Collector`, `ScriptedFrames`, `Replay` — the hermetic test double, codec *and* both transports |
 
@@ -245,7 +246,7 @@ Two nominal shapes get their own messages, because they are different gaps with 
 
 ### `ToolSource` and `Toolbox`
 
-Local `#[Tool]` functions and (from phase 6) an MCP server are the same thing to the agent:
+Local `#[Tool]` functions and an MCP server are the same thing to the agent:
 
 ```noeta
 pub trait ToolSource {
@@ -293,6 +294,90 @@ Three properties are decisions:
 - **`AgentConfig.max_turns` (default 8) is a hard rail, and exceeding it is `AiError.MaxTurns`** rather than a truncated `Ok`. A run that stops mid-loop has an assistant turn whose last word was a tool call nobody answered; handing that back as an answer is the silent-truncation failure §10 refuses for context strategies, for the same reason. (The `MaxTurns` *guard* of phase 5 is a different thing at a different layer — a policy a caller opts into, reported as `Guard(...)`. This is the loop's own rail, always on.)
 
 An agent with **no** toolbox that receives a tool-use stop finishes the run and hands the requested calls back in `Run.messages`, exactly as phase 1 did. That is the only behavior that cannot spin.
+
+## MCP: a server's tools are just tools
+
+`para.ai.mcp` is a **client**. The toolchain already ships an MCP *server* (`noeta mcp`), and this package has no interest in being a second one.
+
+```noeta
+use para.ai.mcp.{McpClient, Stdio}
+
+mem = McpClient.connect(Stdio.new("mcp-memory", ["--db", "./memory.db"]))?
+agent = Agent.from(cfg, provider).tools(mem)?
+```
+
+That is the whole integration. `McpClient` is a `ToolSource`, so a server's tools go into the same `Toolbox` as local `#[Tool]` functions, collide on the same names, dispatch through the same `dispatch`, and come back as the same `ToolResult` parts. **There is deliberately no MCP-only call path**: the phase-5 approval guard attaches above `Toolbox.call` and therefore covers a memory server's `remember` exactly as it covers a local `weather`, which it could not do if this module dispatched on its own.
+
+`connect` is the whole handshake — `initialize`, capability negotiation, `notifications/initialized`, and the first `tools/list` — so a client you hold is one an agent can use, and a broken server says so there rather than at the first model call.
+
+### Memory is a server, not a subsystem
+
+There is no `para.ai.memory`, and there will not be one. para/ai ships no store, no embedder, and no recall heuristic; it ships the client that talks to whichever one you point it at. Memory behind MCP is swappable, inspectable, and shared with every other agent you run — and [`examples/memory/`](examples/memory) makes that concrete with a memory server written in sixty lines of POSIX shell.
+
+The zero-configuration path is a system prompt and a `ToolSource`: tell the agent the memory tools exist and it calls them itself. Phase 5's `Recall` guard automates the recall half for callers who would rather not rely on the model remembering to look. Both use this same client.
+
+### Two transports
+
+| transport | request path | server→client channel |
+| --- | --- | --- |
+| `Stdio.new(cmd, args)` | one JSON document per line on the child's stdin | documents interleaved with a reply, on the same pipe |
+| `Http.new(url)` | POST through a `para.api.Api` | `Events.drain` over `client.stream(req, Framing.Sse)` |
+
+`Stdio` needs no native code at all: `os.spawn` gives a `Process` with `write`/`read_line`/`try_wait`/`kill`, and JSON-RPC framing over that is ordinary Noeta.
+
+`Http` speaks streamable HTTP. Its POST half rides the `para/api` onion exactly as the run loop's buffered model call does, so `Retry`, `Record`, and `Logging` are available to an MCP session for free — and a scripted middleware answers it in the tests with no socket. Its server→client half cannot ride that onion (a `FrameStream` structurally cannot, [DESIGN.md](DESIGN.md) O-4), so it comes through the `Events` seam, which hands back **documents** rather than frames: SSE framing belongs to `std.http`, and a second copy of that decoder here would be worse than the seam. `HttpEvents` reads the response head before consuming a frame, so a 405 ("this server has no such channel") is an empty answer and every other non-2xx is a typed failure — neither waits on a frame that is never coming.
+
+Three protocol details `Http` owns, because they are the difference between working against a real server and almost working: the **session id** (`Mcp-Session-Id`, carried on every later request, and a `404` once you hold one means `session_expired` — a reconnect, not a wrong URL); the **negotiated revision**, which goes back out as `MCP-Protocol-Version`; and a **POST answered with `text/event-stream`**, whose already-whole body is cut where it stands.
+
+The server→client channel is drained by `client.listen(max)` rather than by a background reader, and that is forced rather than chosen: structured concurrency has no detached tasks — a `concurrent` block joins everything it spawned at its closing brace — so there is nowhere for a listener to live between calls. Over stdio `listen` returns 0: every read door blocks, so there is no way to probe for a pending message, and server→client requests are handled where they actually arrive, interleaved with a reply.
+
+### What happens when a server crashes, hangs, or dies mid-call
+
+The lifecycle is decided rather than emergent, and every claim below is measured against the toolchain (the measurements are in the source, next to the mechanism they justify):
+
+| the server… | what happens |
+| --- | --- |
+| will not start | `AiError.Mcp(server, "spawn", …)`. `os.spawn` of a missing binary **aborts the process**, so `Stdio.start` resolves the command against `PATH` itself and refuses first. |
+| crashes | its stdout closes, which ends the blocked read at once — a crashed server unblocks the agent rather than hanging it. The exit status and its last stderr line come back in `AiError.Mcp(server, "server_exited", …)`. |
+| dies mid-call | that same path: the call in flight becomes a failed turn the model is told about. Every write is preceded by a `try_wait` liveness check, because `Process.write` to a dead child **aborts the process**. |
+| hangs (alive, silent) | bounded only if you asked for it: `Stdio.new(…).with_deadline(ms)` kills the server and fails the call with `AiError.Mcp(server, "timeout", …)`. See below. |
+| talks without answering | `read_budget` (64) intervening documents, then the exchange fails. No watchdog needed — the documents keep coming. |
+| is asked for something it never advertised | `AiError.Mcp(server, "capability", …)` naming the capability and the server, rather than an empty list that reads like "this server has nothing". |
+
+**Why the deadline is opt-in.** A blocked `Process.read_line` parks the whole scheduler — a sibling task `spawn`ed in the same isolate never runs while it is waiting (measured: a 300 ms watchdog fired only after a 5 s child exited), so a timeout cannot be a `race`. The one thing that *does* run beside it is a separate **isolate**, which needs a `concurrent` block, which is E0040 in a synchronous `fn` — and `ToolSource.call` is synchronous and must stay so, since it is held as `dyn` and `async` through `dyn` is unsound (DESIGN O-2). So the bounded read is driven through `map_bounded`, exactly as `run_sync` drives the run loop, and the watchdog lives in an isolate. A parked isolate cannot be cancelled either (`h.cancel()` reports `Err(Cancelled)` to the joiner and the isolate still runs to completion), so it is disarmed by a beacon file it polls, and the kill goes through `kill(1)` because the `Process` handle is not `Send`. That is a temp file, an isolate, and a POSIX dependency per call — worth it when a hang would otherwise be permanent, not worth it by default. Over HTTP none of this applies: `client.timeout(ms)` already bounds a request and a stream open, so `Http.new(url, timeout_ms)` is the whole story.
+
+### Resources, prompts, and sampling
+
+**Resources are never auto-injected.** `client.resources()` and `client.read(uri)` hand you the server's documents; putting one in the context is your decision, because auto-injection is how context windows quietly fill up.
+
+```noeta
+for r in client.resources()? {
+    io.outln("${r.uri} — ${r.description}")
+}
+contents = client.read("memo://notes")?      // List<ResourceContent>: uri, mime, text, blob
+```
+
+A binary resource's `blob` is base64 **exactly as the server sent it**, undecoded: this package has a base64 encoder and no decoder, and handing back invented bytes would be worse than handing back what arrived.
+
+**A prompt is an ordinary conversation prefix.** `client.prompt(name, args)` returns `List<Message>` — the same type `Conversation` holds — so a server-supplied prompt needs no special path:
+
+```noeta
+conv = Conversation { messages: client.prompt("review", {"file": "main.noe"})? }
+```
+
+A non-text prompt content block is refused by name rather than dropped, for the same base64 reason: a prompt quietly missing its image no longer says what the server wrote.
+
+**Sampling is off by default**, because it hands a subprocess your API key. `connect` advertises no `sampling` capability at all and answers such a request with JSON-RPC's "method not found" — *answers* it, rather than ignoring it, because an ignored request is a server waiting forever on a reply that is not coming. Turning it on is explicit and budgeted:
+
+```noeta
+client = McpClient.connect_sampling(Stdio.new("mcp-thing", []), MySampler {}, 5)?
+```
+
+`Sampler` is one method — the request's `params` as JSON text in, the JSON-RPC `result` as JSON text out — so a caller can answer it with an `Agent`, a cheap model, or a canned reply. Every request is counted against the budget and the one past it is refused with a JSON-RPC error rather than quietly served.
+
+### Testing MCP without a server
+
+The suite spawns a real subprocess and speaks real JSON-RPC to it over real pipes — the fixture *is* a POSIX shell script the test writes to a temp path — so nothing depends on a published MCP server, an npm install, or a network. The HTTP half is scripted through a `para.api` middleware, and the server→client channel through the `Events` seam. Wire format is asserted as exact bytes for `initialize` and `tools/call`, the way the codec fixtures assert request bodies.
 
 ## Writing a provider
 
@@ -503,6 +588,7 @@ pub enum AiError {
     Decode(path: string, message: string)             // a response body did not decode
     Refused(reason: string)                           // the model declined
     Tool(name: string, message: string)               // a tool could not be listed, or its schema not derived
+    Mcp(server: string, code: string, message: string)    // an MCP server failed as a server
     MaxTurns(turns: int)                              // the run exceeded AgentConfig.max_turns
     ContextOverflow(needed: int, budget: int)         // phase 5
     Cancelled
@@ -513,7 +599,9 @@ A language constraint shapes this: **a type carries at most one `From` impl** (a
 
 The `para/api` line holds: `Err` means the call failed, while an HTTP error *status* from a vendor is an answer. The same line runs through `Tool`: a tool that merely *fails* is not an `AiError` at all — it is a `ToolResult(is_error: true)` turn the model can recover from. `AiError.Tool` is for what the model cannot be asked to fix: an underivable schema, a name collision across sources, a source that could not be listed.
 
-`Guard(stage, guard, reason)` and `Mcp(server, code, message)` join the enum in phases 5 and 6, with the types they name.
+`AiError.Mcp` draws the same line one layer down. A *tool* that fails on an MCP server is `Tool(name, message)`, exactly as a local one is, so the model gets its recoverable turn either way; `Mcp(server, code, message)` is the server failing *as a server* — it would not start, it exited, it broke the protocol, it was asked for a capability it never advertised, or its session expired. `code` is drawn from a fixed set (`spawn`, `server_exited`, `eof`, `timeout`, `protocol`, `capability`, `http_status`, `session_expired`, `read_budget`, `closed`, `sampling`), so `error.type` stays a class rather than a message.
+
+`Guard(stage, guard, reason)` joins the enum in phase 5, with the types it names.
 
 ## Telemetry
 
@@ -555,9 +643,10 @@ Three commitments:
 
 - [`examples/ask/`](examples/ask) — one question, one answer: the runtime-provider `match`, the config/agent split, and a hermetic `@test` block over `Mock`.
 - [`examples/tools/`](examples/tools) — a full multi-turn tool loop: two `#[Tool]` functions, a scripted parallel tool turn, the exact derived JSON Schema, a failing tool that becomes a recoverable turn, and the `roles_of::<Semantic>()` query. Hermetic, no key.
+- [`examples/memory/`](examples/memory) — **memory as an MCP server**: a sixty-line POSIX-shell memory server the example spawns over stdio, an agent whose entire tool vocabulary came from that subprocess, and a fact that survives between runs because it left the process. Declares no `#[Tool]` of its own, and a test asserts that from the trust-boundary index. Hermetic, no key, no npm install.
 - [`examples/prompt_cache/`](examples/prompt_cache) — a `@prompt` system prompt with a stable preamble and a per-customer tail: the exact statics/holes decomposition, a recall that proves reading the cache prefix never evaluated it, and the encoded Anthropic body with `cache_control` on the stable block and nowhere else. Hermetic, no key.
 
-The design's other examples (`chat-cli`, `agui-server`, `mcp-memory`, `structured`, `local-ollama`) arrive with the phases they exercise.
+The design's other examples (`chat-cli`, `agui-server`, `structured`, `local-ollama`) arrive with the phases they exercise.
 
 ## Requirements
 
