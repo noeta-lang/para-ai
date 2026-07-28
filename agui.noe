@@ -1,0 +1,1104 @@
+// AG-UI: the encoding of a run's events, and the SSE responder that serves them.
+//
+// DESIGN §11. Phase 3 built the neutral `Event` enum, the `EventSink` seam, and a run loop that
+// emits into a `Sender<Event>`; this module is the other half — **an encoding and a transport, not
+// a second event model.** Nothing here decides what a run *means*; it decides what a run's meaning
+// looks like on an AG-UI wire.
+//
+// Three things are worth knowing before reading:
+//
+//   * **The encoding is a pure, total, variant-local mapping.** `encode(event, thread_id)` returns
+//     exactly one `Frame` for exactly one `Event`, with no accumulated state and no lookahead. That
+//     is not luck: §11 shaped the enum so this would be true, and the one place it needed care is
+//     recorded below (`REASONING_MESSAGE_CHUNK`). A mapping with no state is a mapping a test can
+//     check one row at a time, which is what the fixture table at the bottom does.
+//   * **A `RunError` is a frame, not a dropped connection**, and every stream ends with **exactly
+//     one** terminal `RUN_FINISHED` or `RUN_ERROR`. The run loop already guarantees the event; this
+//     module's job is not to lose it — so the responder drains the channel to exhaustion rather
+//     than stopping at the first failure, and the suite asserts the property from both ends.
+//   * **`respond` is written over `std.http.server.sse`.** It is the one-way twin of
+//     `server.websocket`: return it from a `fetch` handler and the response head goes out as
+//     `text/event-stream`, the connection is held open, and the handler pushes frames until it
+//     returns. No response is hand-rolled here and no header is set by hand.
+//
+// The whole consumer surface, in one aether controller:
+//
+//     #[Post("/agent")]
+//     fn chat(req: Request): Response {
+//         return agui.respond(agent, req)
+//     }
+//
+// **On the protocol version.** The shapes below are AG-UI's own, field for field: `data: {json}\n\n`
+// with camelCase keys and absent optionals omitted, which is what `ag_ui.encoder.EventEncoder`
+// emits. Two choices inside that are worth stating rather than leaving to be discovered:
+// `THINKING_*` is deprecated in favor of `REASONING_*`, so a thinking delta is encoded as the
+// latter; and `TOOL_CALL_RESULT` has no error field at all, so a failing tool's flag rides in
+// `rawEvent`, the protocol's own escape hatch. Both are in the table at `encode`.
+namespace para.ai.agui
+
+use std.http.client
+use std.http.server
+use std.http.{Frame, Request, Response, SseSink}
+use std.json
+use std.task.{map_bounded}
+use para.ai.{Agent, AgentConfig, AiError, Conversation, Event, Message, Part, Role}
+use para.ai.provider
+use para.ai.provider.{Provider, Usage}
+// The last four are the `@test` block's, and they are up here rather than in it because **a `use`
+// inside a tier block does not work for a package name**. Measured, both shapes: with
+// `use para.ai.mock.Mock` inside the block, `noeta check` is clean and `noeta test` reports
+// `cannot find para.ai.mock.Mock in this scope` at every use site; with `use para.ai.AgentConfig`
+// inside it, `noeta test` reports ``\`AgentConfig\` is not a module, namespace, or type in
+// `para.ai```. Same pass order as the `#[Skip]` note in AGENTS.md — a block-scoped `use` only
+// becomes top-level after tier activation, and by then the module graph has been resolved. A
+// whole-module `use std.http.client` inside the block *does* work, which is what makes this look
+// like it should.
+use para.ai.mock.Mock
+use para.ai.tools.{Arg, Local, Tool}
+
+// --- The input document ---------------------------------------------------------------------------
+
+// One entry of AG-UI's `context` — a description and a value the client wants the agent to have.
+//
+// Carried, never injected. Integrations disagree about what to do with these (the Strands one puts
+// them in agent state for tools to read; the LangGraph one exposes them under a `copilotkit` key),
+// so quietly prepending them to a system prompt would be this package inventing a policy on the
+// caller's behalf. `decode_input` hands them over; `respond_to`'s caller decides.
+@derive(Equatable, Display)
+pub struct Context {
+    pub description: string = ""
+    pub value: string = ""
+}
+
+// One tool the *client* declares in `RunAgentInput.tools` — a frontend tool, executed by the client
+// rather than here.
+//
+// Decoded and carried for the same reason `Context` is. Dispatching one is not an encoding problem:
+// it needs the run to stop, hand the call back, and resume from the client's answer, which is a
+// protocol turnaround rather than a frame. A caller who wants that reads these and drives the
+// conversation itself.
+@derive(Equatable, Display)
+pub struct ClientTool {
+    pub name: string = ""
+    pub description: string = ""
+    // The JSON Schema for the tool's parameters, as the text it arrived as — the same treatment
+    // `Part.ToolCall.args` gets, and for the same reason: nothing here interprets it.
+    pub parameters: string = "{}"
+}
+
+// AG-UI's `RunAgentInput`, decoded.
+//
+// A value struct, like everything else on this path (§2.3): it crosses into the session task that
+// serves the stream.
+//
+// `state` and `forwarded_props` stay **raw JSON text** rather than becoming a decoded tree. They
+// are `any` in the protocol — an application's own shape, which this package has no business
+// interpreting — and text is the representation that survives a round trip byte for byte.
+// `Event.StateSnapshot(json)` takes exactly the same form, so echoing state back is `Event`'s own
+// vocabulary and not a conversion.
+@derive(Equatable, Display)
+pub struct RunInput {
+    pub thread_id: string = ""
+    // The client's run id. Empty means the client sent none, and the run loop mints a uuid.
+    pub run_id: string = ""
+    pub messages: List<Message> = []
+    pub state: string = ""
+    pub forwarded_props: string = ""
+    pub context: List<Context> = []
+    pub tools: List<ClientTool> = []
+
+    // The conversation the run starts from.
+    fn conversation(): Conversation {
+        return Conversation { messages: self.messages }
+    }
+}
+
+// Decode a `RunAgentInput` body.
+//
+// `Err` for a body that is not one — a request that never became a run. That distinction is the
+// same one `para/api` draws between a transport failure and an answer, and it is why `respond`
+// answers a malformed body with `400` instead of opening a stream: AG-UI requires every stream to
+// open with `RUN_STARTED`, which carries a thread id and a run id, and a body that did not decode
+// has neither. Inventing two identifiers so that a broken request could have a well-formed stream
+// would be lying to the client about which run it is reading.
+pub fn decode_input(body: string): Result<RunInput, AiError> {
+    doc = provider.parse_object(body, "ag-ui RunAgentInput")?
+    empty: Map<string, dyn> = {}
+    mut msgs: List<Message> = []
+    for raw in provider.list_at(doc, "messages") {
+        msgs = msgs ~ decode_message(raw.as<Map<string, dyn>>() ?? empty)?
+    }
+    mut ctx: List<Context> = []
+    for raw in provider.list_at(doc, "context") {
+        c = raw.as<Map<string, dyn>>() ?? empty
+        ctx = ctx ~ [Context {
+            description: provider.str_at(c, "description"),
+            value: provider.str_at(c, "value"),
+        }]
+    }
+    mut client_tools: List<ClientTool> = []
+    for raw in provider.list_at(doc, "tools") {
+        t = raw.as<Map<string, dyn>>() ?? empty
+        client_tools = client_tools ~ [ClientTool {
+            name: provider.str_at(t, "name"),
+            description: provider.str_at(t, "description"),
+            parameters: raw_json_at(t, "parameters", "{}"),
+        }]
+    }
+    return Ok(RunInput {
+        thread_id: provider.str_at(doc, "threadId"),
+        run_id: provider.str_at(doc, "runId"),
+        messages: msgs,
+        state: raw_json_at(doc, "state", ""),
+        forwarded_props: raw_json_at(doc, "forwardedProps", ""),
+        context: ctx,
+        tools: client_tools,
+    })
+}
+
+// A member re-rendered as the JSON text it was, or `fallback` when it is absent.
+fn raw_json_at(doc: Map<string, dyn>, key: string, fallback: string): string {
+    match doc.get(key) {
+        some(v) => {
+            return json.stringify(v)
+        },
+        none => {},
+    }
+    return fallback
+}
+
+// One AG-UI message as the turns it means — a list, because `activity` is a UI progress message
+// rather than a turn of the conversation and decodes to none.
+//
+// The role mapping is the interesting part:
+//
+//   * `system` and `developer` both become `Role.System`. The distinction is an OpenAI-era naming
+//     change, not a second kind of instruction, and no vendor this package encodes for has two.
+//   * `reasoning` becomes an assistant turn carrying `Part.Thinking`, with the protocol's
+//     `encryptedValue` as the signature. That is a closer fit than it looks: an encrypted reasoning
+//     blob and Anthropic's thinking signature are the same idea — an opaque token the model needs
+//     back next turn — and `Part.Thinking` already round-trips its signature verbatim.
+//   * `tool` becomes `Role.Tool` with one `ToolResult`, addressed to the call it answers.
+fn decode_message(m: Map<string, dyn>): Result<List<Message>, AiError> {
+    role = provider.str_at(m, "role")
+    if role == "system" || role == "developer" {
+        return Ok([Message { role: Role.System, parts: [Part.Text(text: content_text(m)?)] }])
+    }
+    if role == "user" {
+        return Ok([Message {
+            role: Role.User,
+            parts: [Part.Text(text: content_text(m)?)],
+            name: optional_name(m),
+        }])
+    }
+    if role == "assistant" {
+        return Ok([Message { role: Role.Assistant, parts: assistant_parts(m)? }])
+    }
+    if role == "tool" {
+        return Ok([Message {
+            role: Role.Tool,
+            parts: [Part.ToolResult(
+                id: provider.str_at(m, "toolCallId"),
+                content: content_text(m)?,
+                is_error: provider.str_at(m, "error") != "",
+            )],
+        }])
+    }
+    if role == "reasoning" {
+        return Ok([Message {
+            role: Role.Assistant,
+            parts: [Part.Thinking(
+                text: content_text(m)?,
+                signature: provider.str_at(m, "encryptedValue"),
+            )],
+        }])
+    }
+    if role == "activity" {
+        // A rendering step the agent emitted for the UI on an earlier run. It is not something
+        // anybody said, so it is not a turn — and feeding one back to a model as if it were would
+        // put the agent's own progress spinner in its context.
+        return Ok([])
+    }
+    return Err(AiError.Decode(
+        path: "messages[].role",
+        message: "ag-ui: unknown message role `${role}`",
+    ))
+}
+
+// An assistant turn's parts: its prose, then every tool call it requested, in order.
+fn assistant_parts(m: Map<string, dyn>): Result<List<Part>, AiError> {
+    empty: Map<string, dyn> = {}
+    text = content_text(m)?
+    mut parts: List<Part> = []
+    if text != "" {
+        parts = [Part.Text(text: text)]
+    }
+    for raw in provider.list_at(m, "toolCalls") {
+        c = raw.as<Map<string, dyn>>() ?? empty
+        f = provider.obj_at(c, "function")
+        parts = parts ~ [Part.ToolCall(
+            id: provider.str_at(c, "id"),
+            name: provider.str_at(f, "name"),
+            args: provider.str_at(f, "arguments"),
+        )]
+    }
+    return Ok(parts)
+}
+
+// A message's `content`, which is a string on every role but `user`, where it may also be a list of
+// multimodal fragments.
+//
+// **A fragment that is not text is refused, loudly.** Dropping an image a user attached would send
+// the model a question about a picture it never saw, and answering it anyway is worse than saying
+// no — the same rule every codec in this package follows at `encode`. Carrying one properly needs a
+// base64 *decoder* (`provider.base64` only encodes) and a decision about `InputContentUrlSource`,
+// which is a feature rather than an encoding, and is not in phase 7.
+fn content_text(m: Map<string, dyn>): Result<string, AiError> {
+    empty_list: List<dyn> = []
+    empty_obj: Map<string, dyn> = {}
+    v = m.get("content") ?? ""
+    match v.as<string>() {
+        some(s) => {
+            return Ok(s)
+        },
+        none => {},
+    }
+    mut out = ""
+    for raw in (v.as<List<dyn>>() ?? empty_list) {
+        frag = raw.as<Map<string, dyn>>() ?? empty_obj
+        kind = provider.str_at(frag, "type")
+        if kind == "text" {
+            out = out ~ provider.str_at(frag, "text")
+        } else {
+            return Err(AiError.Decode(
+                path: "messages[].content[].type",
+                message: "ag-ui: this decoder carries text content only, and this message has a `${kind}` fragment — para/ai would otherwise answer about an attachment the model never received",
+            ))
+        }
+    }
+    return Ok(out)
+}
+
+// The optional speaker name some vendors accept on a user turn — a hint, absent unless sent.
+fn optional_name(m: Map<string, dyn>): ?string {
+    n = provider.str_at(m, "name")
+    return if n == "" then none else some(n)
+}
+
+// --- The encoding ---------------------------------------------------------------------------------
+
+// One `Event` as the AG-UI frame it is.
+//
+// **Pure, total, and variant-local**: one event in, one frame out, no state carried between calls.
+// The whole table:
+//
+// | `Event`                    | AG-UI                                                              |
+// | -------------------------- | ------------------------------------------------------------------ |
+// | `RunStarted`               | `RUN_STARTED` `{threadId, runId}`                                    |
+// | `TextStart`                | `TEXT_MESSAGE_START` `{messageId, role: "assistant"}`                |
+// | `TextDelta`                | `TEXT_MESSAGE_CONTENT` `{messageId, delta}`                          |
+// | `TextEnd`                  | `TEXT_MESSAGE_END` `{messageId}`                                     |
+// | `ThinkingDelta`            | `REASONING_MESSAGE_CHUNK` `{messageId, delta}`                       |
+// | `ToolCallStart`            | `TOOL_CALL_START` `{toolCallId, toolCallName}`                       |
+// | `ToolCallArgsDelta`        | `TOOL_CALL_ARGS` `{toolCallId, delta}`                               |
+// | `ToolCallEnd`              | `TOOL_CALL_END` `{toolCallId}`                                       |
+// | `ToolCallResult`           | `TOOL_CALL_RESULT` `{messageId, toolCallId, content, role: "tool"}`  |
+// | `StateSnapshot`            | `STATE_SNAPSHOT` `{snapshot}`                                        |
+// | `StateDelta`               | `STATE_DELTA` `{delta}` — JSON Patch, RFC 6902                       |
+// | `StepStarted`              | `STEP_STARTED` `{stepName}`                                          |
+// | `StepFinished`             | `STEP_FINISHED` `{stepName}`                                         |
+// | `RunFinished`              | `RUN_FINISHED` `{threadId, runId, result, outcome}`                  |
+// | `RunError`                 | `RUN_ERROR` `{message, code}`                                        |
+// | `Custom`                   | `CUSTOM` `{name, value}`                                             |
+//
+// Four rows are decisions rather than transcription:
+//
+//   * **`ThinkingDelta` is a `REASONING_MESSAGE_CHUNK`.** AG-UI's streaming reasoning message is
+//     bracketed — `REASONING_START`, `REASONING_MESSAGE_START`, content, `REASONING_MESSAGE_END`,
+//     `REASONING_END` — and §11's `ThinkingDelta` has no start or end, deliberately (see `closing`
+//     in `para.ai`: a thinking block gets a delta and nothing else). The `*_CHUNK` form exists for
+//     exactly this: "the first chunk with a `messageId` implicitly starts the message, and the next
+//     non-reasoning event implicitly closes it". So the bracket is the client's to synthesize, this
+//     stays a one-to-one mapping, and §11's enum needs no new variant. `THINKING_*` would have been
+//     the other spelling; it is deprecated in favor of `REASONING_*` and removed in AG-UI 1.0.
+//   * **A `ToolCallResult`'s `messageId` is its call id with `-result` appended.** AG-UI's event
+//     carries two ids — the tool *message* being created and the *call* it answers — where §11's
+//     event carries one. Deriving the first from the second keeps it stable and collision-free, and
+//     it is what the protocol's own Claude Agent SDK integration does.
+//   * **`is_error` rides in `rawEvent`.** `TOOL_CALL_RESULT` has no error field, so a failing tool
+//     and a succeeding one are otherwise identical on the wire. `rawEvent` is the protocol's
+//     documented escape hatch for a producer's own signal, and the flag is emitted only when it is
+//     true — a successful result gains nothing. The alternative in the wild is to rewrite `content`
+//     into `{"error": true, "content": …}`, which corrupts the payload the model actually saw.
+//   * **`RunFinished` carries its usage under `result`, and says `outcome: {"type": "success"}`.**
+//     `result` is `any` in the protocol and the run's token usage is the only thing §11's event
+//     carries besides the run id, so nesting it under a `usage` key leaves room for a real result
+//     later. `outcome` is optional and omitting it is documented as legacy back-compat, so a
+//     producer written now states it.
+//
+// `thread_id` is the one input that is not on the event. `RUN_FINISHED` requires a thread id and
+// `Event.RunFinished` does not carry one — see the module note in the README for why that is worth
+// knowing rather than worth fixing here.
+pub fn encode(e: Event, thread_id: string): Frame {
+    return match e {
+        Event.RunStarted(run_id, thread) => run_started(run_id, thread),
+        Event.TextStart(id) => text_start(id),
+        Event.TextDelta(id, delta) => text_delta(id, delta),
+        Event.TextEnd(id) => text_end(id),
+        Event.ThinkingDelta(id, delta) => reasoning_chunk(id, delta),
+        Event.ToolCallStart(id, name) => tool_start(id, name),
+        Event.ToolCallArgsDelta(id, delta) => tool_args(id, delta),
+        Event.ToolCallEnd(id) => tool_end(id),
+        Event.ToolCallResult(id, content, is_error) => tool_result(id, content, is_error),
+        Event.StateSnapshot(payload) => state_snapshot(payload),
+        Event.StateDelta(patch) => state_delta(patch),
+        Event.StepStarted(name) => step_started(name),
+        Event.StepFinished(name) => step_finished(name),
+        Event.RunFinished(run_id, usage) => run_finished(run_id, thread_id, usage),
+        Event.RunError(message, code) => run_error(message, code),
+        Event.Custom(name, payload) => custom(name, payload),
+    }
+}
+
+// A whole event list as its frames. The batch form of `encode`, for a caller holding a finished
+// run's events — a transcript fixture, a replay, a test.
+pub fn encode_all(events: List<Event>, thread_id: string): List<Frame> {
+    mut out: List<Frame> = []
+    for e in events {
+        out = out ~ [encode(e, thread_id)]
+    }
+    return out
+}
+
+// An AG-UI frame: the event document as `data`, and nothing else.
+//
+// No `event:` name, no `id:`, no `retry:` — that is the protocol's own encoding, and it is what
+// `ag_ui.encoder.EventEncoder` writes (`data: {json}\n\n`). A client reads the kind from the
+// document's `type` member, so naming the SSE event as well would be a second, redundant channel
+// for the same fact.
+fn frame_of(doc: Map<string, dyn>): Frame {
+    return Frame { event: "", data: json.stringify(doc), id: "", retry: none }
+}
+
+fn run_started(run_id: string, thread_id: string): Frame {
+    doc: Map<string, dyn> = {"type": "RUN_STARTED", "threadId": thread_id, "runId": run_id}
+    return frame_of(doc)
+}
+
+fn run_finished(run_id: string, thread_id: string, usage: Usage): Frame {
+    tokens: Map<string, dyn> = {
+        "inputTokens": usage.input_tokens,
+        "outputTokens": usage.output_tokens,
+        "cachedInputTokens": usage.cached_input_tokens,
+        "reasoningTokens": usage.reasoning_tokens,
+    }
+    result: Map<string, dyn> = {"usage": tokens}
+    outcome: Map<string, dyn> = {"type": "success"}
+    doc: Map<string, dyn> = {
+        "type": "RUN_FINISHED",
+        "threadId": thread_id,
+        "runId": run_id,
+        "result": result,
+        "outcome": outcome,
+    }
+    return frame_of(doc)
+}
+
+fn run_error(message: string, code: string): Frame {
+    mut doc: Map<string, dyn> = {"type": "RUN_ERROR", "message": message}
+    // `code` is optional, and an absent optional is omitted rather than sent as `""` — the protocol
+    // encodes with `exclude_none`, and a client that branches on the code should see nothing rather
+    // than an empty class.
+    if code != "" {
+        doc = doc.set("code", code)
+    }
+    return frame_of(doc)
+}
+
+fn text_start(id: string): Frame {
+    doc: Map<string, dyn> = {"type": "TEXT_MESSAGE_START", "messageId": id, "role": "assistant"}
+    return frame_of(doc)
+}
+
+fn text_delta(id: string, delta: string): Frame {
+    doc: Map<string, dyn> = {"type": "TEXT_MESSAGE_CONTENT", "messageId": id, "delta": delta}
+    return frame_of(doc)
+}
+
+fn text_end(id: string): Frame {
+    doc: Map<string, dyn> = {"type": "TEXT_MESSAGE_END", "messageId": id}
+    return frame_of(doc)
+}
+
+fn reasoning_chunk(id: string, delta: string): Frame {
+    doc: Map<string, dyn> = {"type": "REASONING_MESSAGE_CHUNK", "messageId": id, "delta": delta}
+    return frame_of(doc)
+}
+
+fn tool_start(id: string, name: string): Frame {
+    doc: Map<string, dyn> = {"type": "TOOL_CALL_START", "toolCallId": id, "toolCallName": name}
+    return frame_of(doc)
+}
+
+fn tool_args(id: string, delta: string): Frame {
+    doc: Map<string, dyn> = {"type": "TOOL_CALL_ARGS", "toolCallId": id, "delta": delta}
+    return frame_of(doc)
+}
+
+fn tool_end(id: string): Frame {
+    doc: Map<string, dyn> = {"type": "TOOL_CALL_END", "toolCallId": id}
+    return frame_of(doc)
+}
+
+fn tool_result(id: string, content: string, is_error: bool): Frame {
+    mut doc: Map<string, dyn> = {
+        "type": "TOOL_CALL_RESULT",
+        "messageId": id ~ "-result",
+        "toolCallId": id,
+        "content": content,
+        "role": "tool",
+    }
+    if is_error {
+        raw: Map<string, dyn> = {"isError": true}
+        doc = doc.set("rawEvent", raw)
+    }
+    return frame_of(doc)
+}
+
+fn state_snapshot(payload: string): Frame {
+    doc: Map<string, dyn> = {"type": "STATE_SNAPSHOT", "snapshot": value_of(payload)}
+    return frame_of(doc)
+}
+
+fn state_delta(patch: string): Frame {
+    doc: Map<string, dyn> = {"type": "STATE_DELTA", "delta": value_of(patch)}
+    return frame_of(doc)
+}
+
+fn step_started(name: string): Frame {
+    doc: Map<string, dyn> = {"type": "STEP_STARTED", "stepName": name}
+    return frame_of(doc)
+}
+
+fn step_finished(name: string): Frame {
+    doc: Map<string, dyn> = {"type": "STEP_FINISHED", "stepName": name}
+    return frame_of(doc)
+}
+
+fn custom(name: string, payload: string): Frame {
+    doc: Map<string, dyn> = {"type": "CUSTOM", "name": name, "value": value_of(payload)}
+    return frame_of(doc)
+}
+
+// A JSON payload carried in an `Event` as a string, as the value it denotes.
+//
+// **Total.** `StateSnapshot`, `StateDelta`, and `Custom` all carry JSON *text* — that is the only
+// shape a value type can carry across a channel without a decoded tree — and a consumer that puts
+// something else in one gets it back as a JSON string rather than a broken frame. Refusing here
+// would mean an encoder that can fail, which would put an error path between the run and its own
+// terminal event.
+fn value_of(text: string): dyn {
+    match provider.parse_value(text, "an event's json payload") {
+        Ok(v) => {
+            return v
+        },
+        Err(e) => {},
+    }
+    return text
+}
+
+// The bytes a frame goes out as, per the SSE grammar — `event:`, `id:`, `retry:`, then one `data:`
+// line per line of payload, then the blank line that dispatches it.
+//
+// This mirrors std's own encoder (`Frame::to_sse_wire`) rather than replacing it: `SseSink.send`
+// does the writing, and nothing in the serving path calls this. It exists so the framing is
+// assertable **as bytes** without a socket, which is the only way to catch a payload that would
+// have been cut in half by an embedded newline. An empty payload still emits one `data:` line — a
+// block with no data field dispatches no event at all on the receiving side.
+pub fn wire_of(f: Frame): string {
+    mut out = ""
+    if f.event != "" {
+        out = out ~ "event: " ~ f.event ~ "\n"
+    }
+    if f.id != "" {
+        out = out ~ "id: " ~ f.id ~ "\n"
+    }
+    match f.retry {
+        some(ms) => {
+            out = out ~ "retry: ${ms}\n"
+        },
+        none => {},
+    }
+    lines = if f.data == "" then [""] else f.data.split("\n")
+    for line in lines {
+        out = out ~ "data: " ~ line ~ "\n"
+    }
+    return out ~ "\n"
+}
+
+// --- Where frames go --------------------------------------------------------------------------------
+
+// The consumer of an encoded stream.
+//
+// One method, synchronous, because that is what `SseSink` is: a frame write is a short push onto an
+// already-open connection, driven to completion rather than awaited. The seam exists so that the
+// draining loop — the part that has to get "exactly one terminal frame" right — is the same code
+// whether it is writing to a socket or to a list in a `@test` block.
+pub trait FrameOut {
+    fn send(f: Frame): void
+}
+
+// The real thing: std's event-stream sink, held open by the serve loop for the life of the session.
+//
+// The `impl` is written **inline in the type body** rather than as a standalone `impl FrameOut for
+// Live` block, because a standalone one is invisible to `dyn` coercion from any entry but this
+// module's own — see AGENTS.md, and the five stream decoders that are written the same way.
+pub struct Live {
+    pub sink: SseSink
+
+    impl FrameOut {
+        fn send(f: Frame): void {
+            self.sink.send(f)
+        }
+    }
+}
+
+// The test collector: every frame, in order, and the bytes they would have been.
+//
+// `para.ai.mock.Collector` does this for the neutral `Event` stream; this does it one layer out, so
+// a test can assert on what an AG-UI client would actually have received. Between them, a streaming
+// bug has nowhere to hide: `Collector` catches a wrong event, `Tape` catches a wrong encoding of a
+// right one, and `Tape.wire()` catches a wrong framing of a right encoding.
+pub class Tape {
+    mut written: List<Frame>
+
+    fn new(): Tape {
+        return Tape { written: [] }
+    }
+
+    fn frames(): List<Frame> {
+        return self.written
+    }
+
+    fn count(): int {
+        return self.written.len()
+    }
+
+    // Every frame's `data` payload, in order — the JSON documents a client would have parsed.
+    fn payloads(): List<string> {
+        mut out: List<string> = []
+        for f in self.written {
+            out = out ~ [f.data]
+        }
+        return out
+    }
+
+    // The whole stream as the bytes it would have been on the wire.
+    fn wire(): string {
+        mut out = ""
+        for f in self.written {
+            out = out ~ wire_of(f)
+        }
+        return out
+    }
+
+    impl FrameOut {
+        fn send(f: Frame): void {
+            self.written = self.written ~ [f]
+        }
+    }
+}
+
+// --- The responder ----------------------------------------------------------------------------------
+
+// Serve an agent run over AG-UI, from the request to the closed stream.
+//
+// The whole of §11's consumer surface. Decode the body, open the native SSE response, spawn the
+// run, and drain its channel encoding each event as a frame.
+//
+// A body that is not a `RunAgentInput` is a `400` carrying the decode failure, not a stream — see
+// `decode_input` for why a request that never became a run gets no run stream. Everything that goes
+// wrong *after* that is a `RUN_ERROR` frame, because by then there is a run to report on.
+pub fn respond<P: Provider>(agent: Agent<P>, req: Request): Response {
+    return match decode_input(req.body()) {
+        Ok(input) => respond_to(agent, input),
+        Err(e) => bad_request(e),
+    }
+}
+
+// The same, for an input you decoded yourself.
+//
+// The door for a caller who wants to look at `state`, `forwarded_props`, or `context` before the
+// run starts — seed a conversation from them, authorize against them, or hand them to a tool. It is
+// also what makes `respond` two lines.
+pub fn respond_to<P: Provider>(agent: Agent<P>, input: RunInput): Response {
+    return server.sse(fn(sink) => stream_run(agent, input, Live { sink: sink }))
+}
+
+// The session: a channel between the run and the wire, and a reader that outlives the run.
+//
+// **The reader drains to exhaustion, and only the sender's close ends it.** That is what makes the
+// terminal frame unlosable: the run loop emits `RunFinished` or `RunError` as its last act on every
+// path out, so a reader that stopped at the first failure — or that the run could outrun — would
+// drop precisely the event a renderer cannot do without. `agent.stream` returns the run's own
+// `Result` and it is deliberately not propagated: the failure has already been reported to the
+// client as a frame, and turning it into a second, out-of-band failure would end the response in
+// the one way AG-UI says it must not.
+//
+// The channel is `agent.stream`'s, not a second event model — and `stream` rather than `run_into`
+// because a client reading an event stream has said it wants events as they happen, whatever
+// `AgentConfig.stream` was set to.
+async fn stream_run<P: Provider>(agent: Agent<P>, input: RunInput, out: dyn FrameOut): int {
+    (tx, rx) = channel::<Event>(16)
+    mut sent = 0
+    concurrent {
+        reader = spawn pump(rx, out, input.thread_id)
+        outcome = agent.stream(input.conversation(), tx, input.thread_id, input.run_id).await
+        tx.close()
+        sent = reader.await
+    }
+    return sent
+}
+
+// Encode every event that arrives, until the run's sender closes.
+async fn pump(rx: Receiver<Event>, out: dyn FrameOut, thread_id: string): int {
+    mut sent = 0
+    mut going = true
+    while going {
+        match rx.recv().await {
+            some(e) => {
+                out.send(encode(e, thread_id))
+                sent = sent + 1
+            },
+            none => {
+                going = false
+            },
+        }
+    }
+    return sent
+}
+
+// Run an AG-UI stream to completion from synchronous code, handing every frame to `out`.
+//
+// The synchronous door `respond` needs a socket for — a CLI that renders AG-UI frames, a fixture
+// that records a transcript, and the reason a run's exact frame sequence is a `@test` block with no
+// server in it. It drives the *same* future `respond_to` serves, through `std.task.map_bounded` on
+// a one-element list, exactly as `para.ai`'s `run_sync` drives the run loop: a second, synchronous
+// copy of the drain is precisely where a divergence between the served stream and the tested one
+// would live.
+pub fn stream_sync<P: Provider>(agent: Agent<P>, input: RunInput, out: dyn FrameOut): int {
+    return map_bounded([StreamJob { agent: agent, input: input, out: out }], 1, stream_job)[0]
+}
+
+// One AG-UI session, packaged so `map_bounded` can drive it — the shape `RunJob` in `para.ai` uses,
+// and for the same reason: the combinator takes a plain async function, so everything the session
+// needs travels in the item.
+struct StreamJob<P: Provider> {
+    agent: Agent<P>
+    input: RunInput
+    out: dyn FrameOut
+}
+
+async fn stream_job<P: Provider>(j: StreamJob<P>): int {
+    return stream_run(j.agent, j.input, j.out).await
+}
+
+// A body that is not a `RunAgentInput`, answered as what it is.
+fn bad_request(e: AiError): Response {
+    doc: Map<string, dyn> = {"error": "${e}"}
+    return server.response(400, json.stringify(doc), {"content-type": "application/json"})
+}
+
+@test {
+    // The tool this suite's tool-call run dispatches, declared **inside the dev tier** so it is not
+    // discovered from a consuming application's reflection — see AGENTS.md and `mock.noe`, which
+    // says the same thing at length. `#[std.test.Skip]` inline, because a `use std.test.{Skip}`
+    // inside a `@test` block type-checks and silently does not skip.
+    #[std.test.Skip("a tool fixture for this module's suite, not a test")]
+    #[Tool(about: "Echo a string back, uppercased")]
+    fn agui_shout(#[Arg(help: "The text to shout")] text: string): string {
+        return text.upper()
+    }
+
+    #[std.test.Skip("a tool fixture for this module's suite, not a test")]
+    #[Tool(about: "Fail on purpose")]
+    fn agui_boom(#[Arg(help: "Ignored")] why: string): Result<string, string> {
+        return Err("no: ${why}")
+    }
+
+    // --- The mapping, one row at a time -------------------------------------------------------
+    //
+    // `json.stringify` emits map keys in sorted order, so an exact-bytes assertion is stable — and
+    // an exact one is the only kind that catches a key silently changing name, changing case, or
+    // moving a nesting level. Every variant of `Event` has a row here, which is what makes "the
+    // encoding is total" a claim the suite checks rather than one the prose makes.
+
+    fn a_run_start_names_the_thread_and_the_run(): void {
+        f = encode(Event.RunStarted(run_id: "r1", thread_id: "t1"), "ignored")
+        assert(f.data == "{\"runId\":\"r1\",\"threadId\":\"t1\",\"type\":\"RUN_STARTED\"}", f.data)
+        // The event's own thread id wins over the encoder's: a `RunStarted` already carries one.
+        assert(f.event == "" && f.id == "" && f.retry == none, "a bare data frame")
+    }
+
+    fn a_text_block_encodes_as_start_content_and_end(): void {
+        start = encode(Event.TextStart(id: "0"), "t1")
+        body = encode(Event.TextDelta(id: "0", delta: "hej"), "t1")
+        stop = encode(Event.TextEnd(id: "0"), "t1")
+        assert(start.data == "{\"messageId\":\"0\",\"role\":\"assistant\",\"type\":\"TEXT_MESSAGE_START\"}", start.data)
+        assert(body.data == "{\"delta\":\"hej\",\"messageId\":\"0\",\"type\":\"TEXT_MESSAGE_CONTENT\"}", body.data)
+        assert(stop.data == "{\"messageId\":\"0\",\"type\":\"TEXT_MESSAGE_END\"}", stop.data)
+    }
+
+    // A thinking delta has no start or end in `Event`'s vocabulary, and needs none in AG-UI's: the
+    // `*_CHUNK` form is self-delimiting, so the mapping stays one-to-one and stateless.
+    fn a_thinking_delta_is_a_self_delimiting_reasoning_chunk(): void {
+        f = encode(Event.ThinkingDelta(id: "2", delta: "let me think"), "t1")
+        assert(f.data == "{\"delta\":\"let me think\",\"messageId\":\"2\",\"type\":\"REASONING_MESSAGE_CHUNK\"}", f.data)
+    }
+
+    fn a_tool_call_encodes_as_start_args_and_end(): void {
+        start = encode(Event.ToolCallStart(id: "call_1", name: "agui_shout"), "t1")
+        args = encode(Event.ToolCallArgsDelta(id: "call_1", delta: "{\"text\":"), "t1")
+        stop = encode(Event.ToolCallEnd(id: "call_1"), "t1")
+        assert(start.data == "{\"toolCallId\":\"call_1\",\"toolCallName\":\"agui_shout\",\"type\":\"TOOL_CALL_START\"}", start.data)
+        assert(args.data == "{\"delta\":\"{\\\"text\\\":\",\"toolCallId\":\"call_1\",\"type\":\"TOOL_CALL_ARGS\"}", args.data)
+        assert(stop.data == "{\"toolCallId\":\"call_1\",\"type\":\"TOOL_CALL_END\"}", stop.data)
+    }
+
+    // Two ids where the event has one, and the error flag in `rawEvent` because the protocol's
+    // event has nowhere else to put it.
+    fn a_tool_result_derives_its_message_id_and_flags_a_failure(): void {
+        ok = encode(Event.ToolCallResult(id: "call_1", content: "HEJ", is_error: false), "t1")
+        assert(ok.data == "{\"content\":\"HEJ\",\"messageId\":\"call_1-result\",\"role\":\"tool\",\"toolCallId\":\"call_1\",\"type\":\"TOOL_CALL_RESULT\"}", ok.data)
+        bad = encode(Event.ToolCallResult(id: "call_2", content: "no: x", is_error: true), "t1")
+        assert(bad.data == "{\"content\":\"no: x\",\"messageId\":\"call_2-result\",\"rawEvent\":{\"isError\":true},\"role\":\"tool\",\"toolCallId\":\"call_2\",\"type\":\"TOOL_CALL_RESULT\"}", bad.data)
+    }
+
+    // The state events carry a *document*, not a string containing one — so the payload is parsed
+    // back out of `Event`'s string carriage and nested, rather than double-encoded.
+    fn state_events_carry_documents_rather_than_strings(): void {
+        snap = encode(Event.StateSnapshot(json: "{\"step\": 2, \"city\": \"Malmö\"}"), "t1")
+        assert(snap.data == "{\"snapshot\":{\"city\":\"Malmö\",\"step\":2},\"type\":\"STATE_SNAPSHOT\"}", snap.data)
+        patch = encode(Event.StateDelta(patch: "[{\"op\": \"replace\", \"path\": \"/step\", \"value\": 3}]"), "t1")
+        assert(patch.data == "{\"delta\":[{\"op\":\"replace\",\"path\":\"/step\",\"value\":3}],\"type\":\"STATE_DELTA\"}", patch.data)
+        tick = encode(Event.Custom(name: "tick", json: "{\"n\": 1}"), "t1")
+        assert(tick.data == "{\"name\":\"tick\",\"type\":\"CUSTOM\",\"value\":{\"n\":1}}", tick.data)
+    }
+
+    // And a payload that is not JSON at all is carried as the string it is. An encoder with a
+    // failure mode would put an error path between a run and its own terminal event.
+    fn a_payload_that_is_not_json_is_carried_as_a_string(): void {
+        f = encode(Event.Custom(name: "note", json: "not json"), "t1")
+        assert(f.data == "{\"name\":\"note\",\"type\":\"CUSTOM\",\"value\":\"not json\"}", f.data)
+    }
+
+    fn the_step_events_name_their_step(): void {
+        a = encode(Event.StepStarted(name: "retrieve"), "t1")
+        b = encode(Event.StepFinished(name: "retrieve"), "t1")
+        assert(a.data == "{\"stepName\":\"retrieve\",\"type\":\"STEP_STARTED\"}", a.data)
+        assert(b.data == "{\"stepName\":\"retrieve\",\"type\":\"STEP_FINISHED\"}", b.data)
+    }
+
+    // The terminal pair. `RUN_FINISHED` needs a thread id the event does not carry, so it comes
+    // from the encoder's argument — the one place the mapping is not variant-local.
+    fn the_terminal_events_carry_the_runs_result_and_its_failure_class(): void {
+        done = encode(Event.RunFinished(run_id: "r1", usage: Usage { input_tokens: 12, output_tokens: 3 }), "t1")
+        assert(done.data == "{\"outcome\":{\"type\":\"success\"},\"result\":{\"usage\":{\"cachedInputTokens\":0,\"inputTokens\":12,\"outputTokens\":3,\"reasoningTokens\":0}},\"runId\":\"r1\",\"threadId\":\"t1\",\"type\":\"RUN_FINISHED\"}", done.data)
+        bad = encode(Event.RunError(message: "provider error 400 invalid_request_error: no", code: "invalid_request_error"), "t1")
+        assert(bad.data == "{\"code\":\"invalid_request_error\",\"message\":\"provider error 400 invalid_request_error: no\",\"type\":\"RUN_ERROR\"}", bad.data)
+        // An absent code is absent, not empty.
+        bare = encode(Event.RunError(message: "something", code: ""), "t1")
+        assert(bare.data == "{\"message\":\"something\",\"type\":\"RUN_ERROR\"}", bare.data)
+    }
+
+    // --- The framing, as bytes -----------------------------------------------------------------
+
+    // What actually goes down the socket. An AG-UI frame is `data: {json}` and a blank line, which
+    // is what `ag_ui.encoder.EventEncoder` writes and what `Frame::to_sse_wire` produces for a
+    // frame with no event name, no id, and no retry.
+    fn a_frame_is_a_single_data_line_and_a_blank_one(): void {
+        f = encode(Event.TextEnd(id: "0"), "t1")
+        assert(wire_of(f) == "data: {\"messageId\":\"0\",\"type\":\"TEXT_MESSAGE_END\"}\n\n", wire_of(f))
+    }
+
+    // A payload can never contain a raw newline — `json.stringify` escapes one — so a frame is
+    // always a single `data:` line. This asserts the encoder's half of that, since a payload split
+    // across two `data:` lines would be reassembled by a client with the newline restored and a
+    // JSON document that had been cut in half in between.
+    fn a_multiline_answer_still_frames_as_one_data_line(): void {
+        f = encode(Event.TextDelta(id: "0", delta: "one\ntwo"), "t1")
+        assert(f.data == "{\"delta\":\"one\\ntwo\",\"messageId\":\"0\",\"type\":\"TEXT_MESSAGE_CONTENT\"}", f.data)
+        assert(wire_of(f).split("\n").len() == 3, "one data line, one blank, one trailing empty: ${wire_of(f)}")
+    }
+
+    // The general grammar, for the fields an AG-UI frame never sets — asserted so that this stays a
+    // mirror of std's encoder rather than a shortcut that happens to work for one shape.
+    fn the_wire_grammar_covers_every_frame_field(): void {
+        f = Frame { event: "ping", data: "a\nb", id: "7", retry: some(1500) }
+        assert(wire_of(f) == "event: ping\nid: 7\nretry: 1500\ndata: a\ndata: b\n\n", wire_of(f))
+        empty = Frame { event: "", data: "", id: "", retry: none }
+        assert(wire_of(empty) == "data: \n\n", "an empty payload still dispatches: ${wire_of(empty)}")
+    }
+
+    // --- Decoding the input ---------------------------------------------------------------------
+
+    fn a_run_agent_input_decodes_to_a_conversation(): void {
+        input = decoded_or_fail("{\"threadId\":\"t1\",\"runId\":\"r1\",\"state\":{\"step\":2},\"forwardedProps\":{\"locale\":\"sv\"},\"context\":[{\"description\":\"city\",\"value\":\"Malmö\"}],\"tools\":[{\"name\":\"pick\",\"description\":\"Pick one\",\"parameters\":{\"type\":\"object\"}}],\"messages\":[{\"id\":\"m0\",\"role\":\"system\",\"content\":\"Answer in Swedish.\"},{\"id\":\"m1\",\"role\":\"user\",\"content\":\"weather?\"}]}")
+        assert(input.thread_id == "t1")
+        assert(input.run_id == "r1")
+        assert(input.state == "{\"step\":2}", input.state)
+        assert(input.forwarded_props == "{\"locale\":\"sv\"}", input.forwarded_props)
+        assert(input.context == [Context { description: "city", value: "Malmö" }], "${input.context}")
+        assert(input.tools == [ClientTool { name: "pick", description: "Pick one", parameters: "{\"type\":\"object\"}" }], "${input.tools}")
+        assert(input.conversation().messages == [
+            Message { role: Role.System, parts: [Part.Text(text: "Answer in Swedish.")] },
+            Message { role: Role.User, parts: [Part.Text(text: "weather?")] },
+        ], "${input.messages}")
+    }
+
+    // A full history round trip: the assistant's tool call and the tool's answer come back as the
+    // `Part`s the run loop produced, so a second AG-UI request continues the conversation the first
+    // one ended rather than restarting it.
+    fn an_assistant_turn_and_its_tool_answer_survive_the_round_trip(): void {
+        input = decoded_or_fail("{\"threadId\":\"t1\",\"runId\":\"r2\",\"messages\":[{\"id\":\"m1\",\"role\":\"user\",\"content\":\"shout hej\"},{\"id\":\"m2\",\"role\":\"assistant\",\"content\":\"On it.\",\"toolCalls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"agui_shout\",\"arguments\":\"{\\\"text\\\":\\\"hej\\\"}\"}}]},{\"id\":\"m3\",\"role\":\"tool\",\"toolCallId\":\"call_1\",\"content\":\"HEJ\"}]}")
+        assert(input.messages == [
+            Message { role: Role.User, parts: [Part.Text(text: "shout hej")] },
+            Message { role: Role.Assistant, parts: [
+                Part.Text(text: "On it."),
+                Part.ToolCall(id: "call_1", name: "agui_shout", args: "{\"text\":\"hej\"}"),
+            ] },
+            Message { role: Role.Tool, parts: [Part.ToolResult(id: "call_1", content: "HEJ", is_error: false)] },
+        ], "${input.messages}")
+    }
+
+    // `developer` is `system` under another name; a `reasoning` turn keeps its encrypted blob in
+    // the place `Part.Thinking` already round-trips a signature; a failed tool answer keeps its
+    // flag; an `activity` message is not a turn at all.
+    fn the_remaining_roles_map_the_way_the_table_says(): void {
+        input = decoded_or_fail("{\"threadId\":\"t\",\"runId\":\"r\",\"messages\":[{\"id\":\"a\",\"role\":\"developer\",\"content\":\"Be terse.\"},{\"id\":\"b\",\"role\":\"reasoning\",\"content\":\"thinking out loud\",\"encryptedValue\":\"ErUBCkYIBBgC\"},{\"id\":\"c\",\"role\":\"activity\",\"activityType\":\"search\",\"content\":{\"query\":\"x\"}},{\"id\":\"d\",\"role\":\"tool\",\"toolCallId\":\"call_9\",\"content\":\"no\",\"error\":\"boom\"},{\"id\":\"e\",\"role\":\"user\",\"content\":\"go\",\"name\":\"ada\"}]}")
+        assert(input.messages == [
+            Message { role: Role.System, parts: [Part.Text(text: "Be terse.")] },
+            Message { role: Role.Assistant, parts: [Part.Thinking(text: "thinking out loud", signature: "ErUBCkYIBBgC")] },
+            Message { role: Role.Tool, parts: [Part.ToolResult(id: "call_9", content: "no", is_error: true)] },
+            Message { role: Role.User, parts: [Part.Text(text: "go")], name: some("ada") },
+        ], "${input.messages}")
+    }
+
+    // Multimodal user content: the text fragments join, and anything else is refused by name rather
+    // than dropped — a model answering about an image it never received is worse than a refusal.
+    fn multimodal_content_joins_its_text_and_refuses_the_rest(): void {
+        joined = decoded_or_fail("{\"threadId\":\"t\",\"runId\":\"r\",\"messages\":[{\"id\":\"m\",\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"look at \"},{\"type\":\"text\",\"text\":\"this\"}]}]}")
+        assert(joined.messages == [Message { role: Role.User, parts: [Part.Text(text: "look at this")] }], "${joined.messages}")
+        match decode_input("{\"threadId\":\"t\",\"runId\":\"r\",\"messages\":[{\"id\":\"m\",\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":{\"type\":\"url\",\"value\":\"https://x/y.png\"}}]}]}") {
+            Ok(v) => {
+                assert(false, "an image fragment must not decode away silently: ${v.messages}")
+            },
+            Err(e) => {
+                assert("${e}".contains("`image` fragment"), "${e}")
+            },
+        }
+    }
+
+    fn an_unknown_role_is_refused_by_name(): void {
+        match decode_input("{\"threadId\":\"t\",\"runId\":\"r\",\"messages\":[{\"id\":\"m\",\"role\":\"oracle\",\"content\":\"hi\"}]}") {
+            Ok(v) => {
+                assert(false, "unknown roles must not decode: ${v.messages}")
+            },
+            Err(e) => {
+                assert("${e}".contains("unknown message role `oracle`"), "${e}")
+            },
+        }
+    }
+
+    fn a_body_that_is_not_a_run_agent_input_is_refused(): void {
+        match decode_input("not json at all") {
+            Ok(v) => {
+                assert(false, "garbage must not decode: ${v}")
+            },
+            Err(e) => {
+                assert("${e}".contains("ag-ui RunAgentInput"), "${e}")
+            },
+        }
+    }
+
+    // The request half of `respond`, without a socket: a malformed body is a `400` naming the
+    // reason, never an event stream that lies about which run it belongs to.
+    fn a_malformed_body_is_a_bad_request_rather_than_a_stream(): void {
+        resp = respond(Mock.new().reply_text("never").agent(AgentConfig.new("test-model")), post_of("{\"nope\":"))
+        assert(resp.status() == 400, "${resp.status()}")
+        assert(resp.body().contains("ag-ui RunAgentInput"), resp.body())
+    }
+
+    // --- Whole runs, framed ------------------------------------------------------------------------
+    //
+    // Driven through `stream_sync`, which is the same future `respond_to` hands to `server.sse` —
+    // so these assert the served stream, not a paraphrase of it. Synchronous on purpose: a released
+    // toolchain never drives an `async fn` in a `@test` block, and an assertion that never runs is
+    // worse than no assertion.
+
+    // **The sequence that matters.** A tool call opens and closes its own block, its result arrives
+    // after the block closed and before the next one opens, and the whole stream ends with exactly
+    // one terminal frame — asserted as the AG-UI documents a client would have parsed.
+    fn a_tool_call_run_frames_the_exact_sequence(): void {
+        m = Mock.new()
+            .reply_tool("call_1", "agui_shout", "{\"text\": \"hej\"}")
+            .reply_text("It said HEJ.")
+        tape = Tape.new()
+        n = stream_sync(tool_agent_or_fail(m), input_of("t7", "r7", "shout hej"), tape)
+        assert(first(tape.payloads(), 8) == [
+            "{\"runId\":\"r7\",\"threadId\":\"t7\",\"type\":\"RUN_STARTED\"}",
+            "{\"toolCallId\":\"call_1\",\"toolCallName\":\"agui_shout\",\"type\":\"TOOL_CALL_START\"}",
+            "{\"delta\":\"{\\\"text\\\": \\\"hej\\\"}\",\"toolCallId\":\"call_1\",\"type\":\"TOOL_CALL_ARGS\"}",
+            "{\"toolCallId\":\"call_1\",\"type\":\"TOOL_CALL_END\"}",
+            // `agui_shout` really ran between these two frames.
+            "{\"content\":\"HEJ\",\"messageId\":\"call_1-result\",\"role\":\"tool\",\"toolCallId\":\"call_1\",\"type\":\"TOOL_CALL_RESULT\"}",
+            "{\"messageId\":\"0\",\"role\":\"assistant\",\"type\":\"TEXT_MESSAGE_START\"}",
+            "{\"delta\":\"It said HEJ.\",\"messageId\":\"0\",\"type\":\"TEXT_MESSAGE_CONTENT\"}",
+            "{\"messageId\":\"0\",\"type\":\"TEXT_MESSAGE_END\"}",
+        ], "${tape.payloads()}")
+        // The terminal frame carries a token count the mock synthesizes from the request bodies it
+        // happened to receive, so it is asserted for shape and identity rather than predicted.
+        last = tape.payloads()[8]
+        assert(is_kind(last, "RUN_FINISHED"), last)
+        assert(last.contains("\"threadId\":\"t7\"") && last.contains("\"runId\":\"r7\""), last)
+        assert(last.contains("\"outcome\":{\"type\":\"success\"}"), last)
+        assert(last.contains("\"result\":{\"usage\":{\"cachedInputTokens\":0,\"inputTokens\":"), last)
+        assert(n == 9, "every event became a frame: ${n}")
+        assert(terminals(tape) == 1, "exactly one terminal frame")
+        assert(m.call_count() == 2, "the ask, then the answer")
+    }
+
+    // **A failure is a frame.** The run fails at the vendor, and the client still gets a well-formed
+    // stream that opens with `RUN_STARTED` and closes with exactly one `RUN_ERROR` — not a dropped
+    // connection, and not a stream that merely stops.
+    fn a_failing_run_ends_with_a_run_error_frame(): void {
+        m = Mock.new().fail(400, "invalid_request_error", "no")
+        tape = Tape.new()
+        n = stream_sync(m.agent(AgentConfig.new("test-model")), input_of("t8", "r8", "go"), tape)
+        assert(tape.payloads() == [
+            "{\"runId\":\"r8\",\"threadId\":\"t8\",\"type\":\"RUN_STARTED\"}",
+            "{\"code\":\"invalid_request_error\",\"message\":\"provider error 400 invalid_request_error: no\",\"type\":\"RUN_ERROR\"}",
+        ], "${tape.payloads()}")
+        assert(n == 2, "${n}")
+        assert(terminals(tape) == 1, "exactly one terminal frame, and it is the error")
+        // And the bytes really are a stream a client can read: two frames, each `data:` and a blank
+        // line, with nothing between them.
+        assert(tape.wire() == "data: " ~ tape.payloads()[0] ~ "\n\ndata: " ~ tape.payloads()[1] ~ "\n\n", tape.wire())
+        // **The claim, stated as an equation.** What the responder wrote is exactly `encode_all`
+        // over the events the run emitted — no reordering, no synthesis, no dropped event. A
+        // failing run is where this is worth asserting: it is the shortest complete stream, and its
+        // terminal frame is the one an encoder is most likely to get wrong.
+        assert(tape.payloads() == payloads_of(encode_all([
+            Event.RunStarted(run_id: "r8", thread_id: "t8"),
+            Event.RunError(message: "provider error 400 invalid_request_error: no", code: "invalid_request_error"),
+        ], "t8")), "${tape.payloads()}")
+    }
+
+    // A tool that fails is a *turn*, not a failed run — so the stream carries a `TOOL_CALL_RESULT`
+    // flagged in `rawEvent` and still finishes normally. This is the one place the two failure
+    // shapes are next to each other, which is the point of asserting them together.
+    fn a_failing_tool_is_flagged_and_the_run_still_finishes(): void {
+        m = Mock.new()
+            .reply_tool("call_2", "agui_boom", "{\"why\": \"testing\"}")
+            .reply_text("That did not work.")
+        tape = Tape.new()
+        n = stream_sync(tool_agent_or_fail(m), input_of("t9", "r9", "break something"), tape)
+        assert(tape.payloads()[4] == "{\"content\":\"tool `agui_boom` failed: no: testing\",\"messageId\":\"call_2-result\",\"rawEvent\":{\"isError\":true},\"role\":\"tool\",\"toolCallId\":\"call_2\",\"type\":\"TOOL_CALL_RESULT\"}",
+            tape.payloads()[4])
+        assert(is_kind(tape.payloads()[n - 1], "RUN_FINISHED"), "${tape.payloads()}")
+        assert(terminals(tape) == 1, "exactly one terminal frame")
+    }
+
+    // An input with no run id gets one from the loop, and the *same* one in both terminal-bracket
+    // frames — which is what a client correlates on.
+    fn a_run_without_a_client_id_still_correlates_its_own_frames(): void {
+        m = Mock.new().reply_text("ok")
+        tape = Tape.new()
+        n = stream_sync(m.agent(AgentConfig.new("test-model")), RunInput { thread_id: "t10", messages: [Message.user("go")] }, tape)
+        opened = tape.payloads()[0]
+        closed = tape.payloads()[n - 1]
+        assert(is_kind(opened, "RUN_STARTED") && is_kind(closed, "RUN_FINISHED"), "${tape.payloads()}")
+        id = between(opened, "\"runId\":\"", "\"")
+        assert(id != "", "the loop minted one: ${opened}")
+        assert(closed.contains("\"runId\":\"" ~ id ~ "\""), "and closed with the same one: ${closed}")
+    }
+
+}
+
+// --- The suite's helpers --------------------------------------------------------------------------
+//
+// At module level rather than inside the `@test` block, because **every `fn` in a top-level `@test`
+// block is a test root**: the runner calls each with no arguments, so a helper that takes one fails
+// as a test rather than serving the tests. `mock.noe` puts its helpers here for the same reason.
+
+fn decoded_or_fail(body: string): RunInput {
+    return match decode_input(body) {
+        Ok(v) => v,
+        Err(e) => RunInput { thread_id: "DECODE FAILED: ${e}" },
+    }
+}
+
+fn tool_agent_or_fail(m: Mock): Agent<Mock> {
+    return match m.agent(AgentConfig.new("test-model")).tools(Local.new()) {
+        Ok(a) => a,
+        Err(e) => m.agent(AgentConfig.new("TOOLS FAILED: ${e}")),
+    }
+}
+
+fn input_of(thread_id: string, run_id: string, text: string): RunInput {
+    return RunInput { thread_id: thread_id, run_id: run_id, messages: [Message.user(text)] }
+}
+
+// A request the way a serve loop would have delivered one — the client's builder, with nothing
+// below it, so no socket exists even in principle.
+fn post_of(body: string): Request {
+    return client.new().prepare("post", "http://127.0.0.1/agent", body, {"content-type": "application/json"})
+}
+
+fn first(xs: List<string>, n: int): List<string> {
+    mut out: List<string> = []
+    for (i, x) in xs.enumerate() {
+        if i < n {
+            out = out ~ [x]
+        }
+    }
+    return out
+}
+
+fn payloads_of(frames: List<Frame>): List<string> {
+    mut out: List<string> = []
+    for f in frames {
+        out = out ~ [f.data]
+    }
+    return out
+}
+
+// Whether a frame's payload is of this AG-UI kind.
+//
+// A `contains` on the whole member rather than a read of the first `"type":` in the document,
+// because `RUN_FINISHED` nests one: its `outcome` is `{"type": "success"}`, and a reader that took
+// the first match would call every finished run a `success` frame. The kinds themselves are
+// distinct enough that the member spelling is unambiguous.
+fn is_kind(payload: string, kind: string): bool {
+    return payload.contains("\"type\":\"" ~ kind ~ "\"")
+}
+
+// How many terminal frames a stream carries. Exactly one is the AG-UI rule, and the property no
+// "did it finish" assertion can see.
+fn terminals(tape: Tape): int {
+    mut n = 0
+    for p in tape.payloads() {
+        if is_kind(p, "RUN_FINISHED") || is_kind(p, "RUN_ERROR") {
+            n = n + 1
+        }
+    }
+    return n
+}
+
+fn between(text: string, open: string, close: string): string {
+    parts = text.split(open)
+    if parts.len() < 2 {
+        return ""
+    }
+    return parts[1].split(close)[0]
+}
