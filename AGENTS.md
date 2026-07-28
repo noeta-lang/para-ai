@@ -18,6 +18,10 @@ Guidance for coding agents working in this repo — the standalone repo of the *
 
 DESIGN.md §16 sketches `providers/anthropic.noe`. The files are at the repo root instead, with the design's **namespaces** unchanged (`anthropic.noe` declares `namespace para.ai.providers.anthropic`). The reason is the module loader: a dependency package is walked recursively, but an entry file's sibling scan is **flat**, so a `.noe` file in a subdirectory can neither see its siblings one level up nor be linked when `noeta check`/`noeta test` runs it as an entry. That would make the package's own `@test` blocks unrunnable. Namespaces are declaration-based, so nothing about the public surface depends on the path — put new modules at the root and give them the namespace DESIGN.md names.
 
+## Toolchain floor
+
+> **This package needs three toolchain fixes that are not in `noeta 0.2.3`.** Two of them are hard blockers: a bounded generic type's methods could not call one another (`self.drive(…)` inside `Agent<P: Provider>` reported E0025 against the very declaration that states the bound), and an enum's `impl From<Source>` was shadowed by the built-in name-string `Enum.from(s)`, so `AiError`'s `From<HttpError>` type-checked and then aborted at runtime. The third closes a hole where `?` on an `Option` inside a non-`Option` function put a `none` in a slot the checker had promised held a `string`. Once they ship, raise `toolchain` in `noeta.toml` from `">=0.2"` to that release and delete this section.
+
 ## Build & test
 
 Pure Noeta — no cargo anywhere in this repo. But note:
