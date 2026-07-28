@@ -3,3 +3,7 @@ target/
 # locks ARE committed (see AGENTS.md).
 /noeta.lock
 .claude/
+
+# Example projects are demos, not package roots — their lockfiles
+# regenerate on every run and are not meant to be committed.
+examples/*/noeta.lock
