@@ -2,7 +2,7 @@
 
 An agent harness for Noeta: model calls, tool calling, MCP, structured responses, guardrails, rolling context, streaming (AG-UI over SSE), and OpenTelemetry — in the shape the rest of the `para` suite already has.
 
-Status: **phases 1 and 2 are built and merged** — the codec seam, Anthropic, Mock, the run loop with tool calling, and GenAI telemetry. Phases 3–8 remain design. Every toolchain prerequisite this document named has landed (§17); the questions are settled or corrected in place.
+Status: **phases 1, 2, and 3 are built and merged** — the codec seam, Anthropic, Mock, the run loop with tool calling, GenAI telemetry, and streaming. Phases 4–8 remain design. Every toolchain prerequisite this document named has landed (§17); the questions are settled or corrected in place.
 
 ---
 
@@ -534,6 +534,21 @@ fn chat(req: Request): Response {
 
 A CLI renderer and a test collector are the other two consumers, and they are both just `while rx.recv().await` loops. `para.ai.mock` ships the collector, so asserting on the exact event sequence of a run is a `@test` block with no server and no socket — the same testability bar `keyed_op_stream` sets in para/html.
 
+
+### 11.1 What phase 3 built, and where it diverges
+
+Built as specified: `StreamDecoder` with Anthropic's indexed protocol behind it, the `Event` enum exactly as §11 lists it, `Sender<Event>`, the run loop emitting into it, and a scripted `FrameStream` so a streaming test is as hermetic as a buffered one (§17's O-4 answer). The Anthropic decoder is proved against three verbatim published SSE transcripts replayed frame by frame — text, a tool call whose arguments arrive as six partial-JSON fragments, and extended thinking with its signature delta.
+
+Five divergences, each with its reason:
+
+- **`Event`, `EventSink`, `Frames`, and `Streamer` live in `para.ai`, not `para.ai.agui`.** §3's table puts `Event` with the AG-UI encoder. But the neutral event type is the *run loop's output*; AG-UI is one consumer of it, alongside a CLI renderer and the test collector. Putting it with its producer means phase 7 imports it rather than owning it, and nothing has to move when a second encoder appears.
+- **`Provider` gained `decode_deltas`, and `decode_reply` became a fold over it.** §2.1's sketch has the buffered door return a `ModelReply`. That would have given the two transports separate accumulators — the exact duplication §5 exists to prevent — so the buffered door now speaks the same delta vocabulary the streaming one does, and everything below them is one implementation.
+- **`Delta` gained `ModelDelta(model)`.** Anthropic names the served model in `message_start`, so the streaming path has to carry it somewhere. In the vocabulary, a delta list is a complete description of a reply and `StreamDecoder` stays the two methods §2.1 specifies; on the decoder, it would have been a third method and a side channel the buffered path did not need.
+- **Streaming is a flag, not the default.** §5 says "streaming is the primitive; non-streaming is a fold over it", and that holds for everything downstream of the deltas — one loop, one emitter, one accumulator, one tool loop. It cannot hold for the *transport*, because O-4 established that a `FrameStream` cannot flow through the para/api onion. `AgentConfig.stream` therefore defaults to `false`: the buffered path is the one `Retry`, `Cache`, `Record`, `Mock`, and `Logging` cover, and defaulting to streaming would take those away from every caller who never asked for it. `agent.stream(conv, out)` streams regardless.
+- **A streamed vendor error has no status.** `std.http`'s `FrameStream` exposes `recv` and `close` and nothing else, so a 429 streams its JSON error body and frames into nothing rather than becoming `AiError.Provider(429, "rate_limit_error", …)`. Each codec's `finish()` refuses the empty stream and names the reason it cannot say more. Closing this needs `FrameStream.status()` in std — the real host has the value at `send_head` and discards it — which is a `lang`-side ABI addition rather than a package change.
+
+`run_sync` stays synchronous over the now-async loop by driving it with `std.task.map_bounded` on a one-element list. That the only available spelling for "run this future to completion here" is a concurrency combinator is a std gap; the alternative was a second, synchronous copy of the run loop, which is precisely where a divergence between the two paths would have lived.
+
 ---
 
 ## 12. Telemetry
@@ -783,7 +798,7 @@ Each phase is independently useful and independently shippable.
 0. **The upstream slices (§17.1).** U-3 in `lang` gates phase 3 and phase 7 and removes para/ai's native crate entirely; U-1 gates phase 5; U-2 is independent and can land whenever. Phases 1, 2, and 4 need none of them, so package work and toolchain work run in parallel from day one.
 1. **Core + Anthropic + Mock, non-streaming.** Data model, `Provider` codec, run loop over `para/api`, `AiError`, `run_sync`, telemetry spans. Proves the codec seam with one provider.
 2. **Tools.** `#[Tool]`/`#[Arg]`, `params_of` → schema, coercion, `invoke` dispatch, the trust-boundary role, bounded concurrent dispatch.
-3. **Streaming.** The native frame reader (SSE + NDJSON), `StreamDecoder`, the `Event` channel. Non-streaming becomes a fold over it.
+3. **Streaming.** ~~The native frame reader (SSE + NDJSON)~~ (it went to `std.http` — U-3), `StreamDecoder`, the `Event` channel. Non-streaming becomes a fold over it. **Built**, with the divergences in §11.1.
 4. **`OpenAiCompat` + Google, then OpenRouter and Ollama on top.** Should be pure codec work by now; if it is not, the seam in phase 1 was drawn wrong and this is where we find out. OpenRouter and Ollama arriving as *configurations* rather than files is the pass condition for phase 1's design — and Ollama unlocks keyless integration tests in CI for everything after this point.
 5. **Structured responses + guardrails.** `extract::<T>`, `Validate` at the door, bounded repair, the `Guard` trait and standard guards.
 6. **MCP.** stdio first (no native code), then streamable HTTP. Memory example lands here.
