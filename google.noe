@@ -1,0 +1,1314 @@
+// `para.ai.providers.google` — the Gemini `generateContent` codec.
+//
+//     use para.ai.providers.google.Google
+//
+//     agent = Agent.from(AgentConfig.new("gemini-2.5-flash"), Google.from_env()?)
+//
+// Its own codec family, and the one that shares least with the other two. Six things about this wire
+// format are easy to get wrong, and all six are handled here:
+//
+//   * **The model is in the URL, not the body.** `POST /v1beta/models/{model}:generateContent`, and
+//     a streamed call is a *different method* on a different path (`:streamGenerateContent?alt=sse`)
+//     rather than a body flag.
+//   * **The assistant's role is `model`,** and there is no `assistant` anywhere.
+//   * **A function response is addressed by the call's *name*, not its id.** The neutral model
+//     carries a `ToolResult` by id, so this codec resolves the id back to the name of the
+//     `functionCall` that asked for it, walking the conversation it was handed. A result with no
+//     matching call is refused rather than sent under a guessed name.
+//   * **A function call's `finishReason` is `STOP`.** Gemini does not have a `tool_use` stop reason,
+//     so `StopReason.ToolUse` is derived from the presence of a `functionCall` part — a codec that
+//     trusted `finishReason` here would end every tool loop on its first turn.
+//   * **Thinking is a flag on a text part**, not a part type: `{"text":…,"thought":true}`, with the
+//     signature on `thoughtSignature`. Both are round-tripped verbatim, for the same reason
+//     Anthropic's signature is.
+//   * **Inline media is anything**, not just images. Gemini takes audio, video, and PDFs in the same
+//     `inlineData` envelope, so this codec accepts a `Part.File` that Anthropic's refuses.
+namespace para.ai.providers.google
+
+use std.http.{Frame}
+use std.{env, json}
+use para.ai.{AiError, Message, Part, Role}
+use para.ai.provider
+use para.ai.provider.{Delta, ModelReply, ModelRequest, Provider, StopReason, StreamDecoder, Usage, Wire}
+use para.ai.tools.{ToolSpec}
+
+// The Gemini Generative Language API, as a codec.
+//
+// `base_url` is a field rather than a constant so a gateway, a proxy, or a record/replay fixture
+// server is a constructor argument instead of a fork. `version` is the API surface: `v1beta` carries
+// thinking, thought signatures, and the current function-calling shape, which `v1` does not.
+@derive(Equatable, Display)
+pub struct Google {
+    pub key: string
+    pub base_url: string = "https://generativelanguage.googleapis.com"
+    pub version: string = "v1beta"
+
+    fn new(key: string): Google {
+        return Google { key: key }
+    }
+
+    fn at(base_url: string, key: string): Google {
+        return Google { key: key, base_url: base_url }
+    }
+
+    // Read the key from `GEMINI_API_KEY`, falling back to `GOOGLE_API_KEY` — the vendor's own tools
+    // read both, and a caller who exported the other one should not have to discover which.
+    fn from_env(): ?Google {
+        key = env.get("GEMINI_API_KEY") ?? (env.get("GOOGLE_API_KEY") ?? "")
+        if key == "" {
+            return none
+        }
+        return some(Google.new(key))
+    }
+}
+
+// --- Encoding -------------------------------------------------------------------------------------
+
+fn refuse(message: string): AiError {
+    return AiError.Encode(provider: "google", message: message)
+}
+
+// Gemini's assistant role is `model`, and a tool result rides a `user` turn — there is no `tool` role
+// and no `assistant`.
+fn wire_role(r: Role): string {
+    return match r {
+        Role.Assistant => "model",
+        _ => "user",
+    }
+}
+
+// What `inlineData` will carry. Wider than Anthropic's document block by a lot: Gemini takes audio,
+// video, PDFs, and plain text inline as well as images, so a `Part.File` this codec accepts is one
+// the Anthropic codec refuses. Anything outside the list is still refused rather than sent and
+// rejected server-side with no context.
+fn supported_media(mime: string): bool {
+    return mime.starts_with("image/") || mime.starts_with("audio/") || mime.starts_with("video/")
+        || mime.starts_with("text/") || mime == "application/pdf"
+}
+
+fn inline_data(mime: string, data: bytes): Map<string, dyn> {
+    blob: Map<string, dyn> = {"mimeType": mime, "data": provider.base64(data)}
+    return {"inlineData": blob}
+}
+
+fn encode_image(mime: string, data: bytes): Result<Map<string, dyn>, AiError> {
+    if !mime.starts_with("image/") {
+        return Err(refuse("an Image part needs an image/* media type, got `${mime}`"))
+    }
+    return Ok(inline_data(mime, data))
+}
+
+fn encode_file(mime: string, name: string, data: bytes): Result<Map<string, dyn>, AiError> {
+    if !supported_media(mime) {
+        return Err(refuse("cannot send `${name}` — Gemini's `inlineData` carries image/*, audio/*, video/*, text/*, and application/pdf, got `${mime}`"))
+    }
+    return Ok(inline_data(mime, data))
+}
+
+fn thought_part(text: string, signature: string): Map<string, dyn> {
+    mut p: Map<string, dyn> = {"text": text, "thought": true}
+    if signature != "" {
+        p = p.set("thoughtSignature", signature)
+    }
+    return p
+}
+
+// `args` is raw JSON text and Gemini wants a **map of named parameters**, so it is embedded as real
+// JSON — and a fragment that parses to anything but an object is refused, because `"args": [1,2]` is
+// a request the vendor will reject with a message that says nothing about which tool.
+fn function_call_block(name: string, input: dyn): Result<Map<string, dyn>, AiError> {
+    match input.as<Map<string, dyn>>() {
+        some(obj) => {
+            call: Map<string, dyn> = {"name": name, "args": obj}
+            return Ok({"functionCall": call})
+        },
+        none => {},
+    }
+    return Err(refuse("tool call `${name}` arguments must be a JSON object — Gemini's `functionCall.args` is a map of named parameters"))
+}
+
+fn encode_tool_call(name: string, args: string): Result<Map<string, dyn>, AiError> {
+    return match provider.parse_value(args, "tool call `${name}` arguments") {
+        Ok(input) => function_call_block(name, input),
+        // A decode failure on the way *out* is an encode failure — re-labeled so the error names the
+        // direction the caller was going.
+        Err(e) => Err(refuse("${e}")),
+    }
+}
+
+// **A function response is addressed by name.** The neutral `Part.ToolResult` carries the id of the
+// call it answers, because that is what every other vendor addresses; Gemini wants the name. So the
+// name is resolved from the `functionCall` parts already seen in this conversation, and a result
+// that answers no call in it is refused rather than sent under a guess — an unmatched
+// `functionResponse` makes the model answer a question nobody asked.
+//
+// Gemini's own `id` field is deliberately not sent. It is optional on both sides, absent from every
+// reply this codec has to decode, and emitting a synthesized one would break the name-and-order
+// matching the vendor documents for parallel calls.
+fn encode_tool_result(names: Map<string, string>, id: string, content: string, is_error: bool): Result<Map<string, dyn>, AiError> {
+    name = names.get(id) ?? ""
+    if name == "" {
+        return Err(refuse("cannot answer tool call `${id}` — Gemini addresses a function response by the *name* of the call it answers, and no `functionCall` with that id appears earlier in this conversation"))
+    }
+    mut payload: Map<string, dyn> = {"output": content}
+    if is_error {
+        payload = {"error": content}
+    }
+    resp: Map<string, dyn> = {"name": name, "response": payload}
+    return Ok({"functionResponse": resp})
+}
+
+fn encode_part(p: Part, names: Map<string, string>): Result<Map<string, dyn>, AiError> {
+    return match p {
+        Part.Text(text) => Ok({"text": text}),
+        Part.Image(mime, data) => encode_image(mime, data),
+        Part.File(mime, name, data) => encode_file(mime, name, data),
+        Part.ToolCall(id, name, args) => encode_tool_call(name, args),
+        Part.ToolResult(id, content, is_error) => encode_tool_result(names, id, content, is_error),
+        Part.Thinking(text, signature) => Ok(thought_part(text, signature)),
+    }
+}
+
+fn encode_parts(parts: List<Part>, names: Map<string, string>): Result<List<dyn>, AiError> {
+    mut out: List<dyn> = []
+    for p in parts {
+        out = out ~ [encode_part(p, names)?]
+    }
+    return Ok(out)
+}
+
+// Every tool call a turn makes, remembered by id, so the results that follow can be addressed by
+// name. Registered before the turn itself is encoded, because a model turn and the results answering
+// it are two different messages and only the first has the names.
+fn remember_calls(names: Map<string, string>, parts: List<Part>): Map<string, string> {
+    mut out = names
+    for p in parts {
+        match p {
+            Part.ToolCall(id, name, args) => {
+                out = out.set(id, name)
+            },
+            _ => {},
+        }
+    }
+    return out
+}
+
+fn merged_turn(previous: dyn, role: string, blocks: List<dyn>): Map<string, dyn> {
+    prev = previous.as<Map<string, dyn>>() ?? {}
+    empty: List<dyn> = []
+    before = (prev.get("parts") ?? empty).as<List<dyn>>() ?? empty
+    out: Map<string, dyn> = {"role": role, "parts": before ~ blocks}
+    return out
+}
+
+// Split a conversation into the top-level `systemInstruction` parts and the `contents` array.
+//
+// A system turn anywhere is hoisted, not just a leading one — some flows append a system reminder
+// mid-conversation, and leaving it in `contents` under a role Gemini does not have is a 400 far from
+// its cause. Adjacent turns of the same wire role are merged into one, for the reason Anthropic's
+// codec merges them: `Role.Tool` encodes as `user`, so a user question followed by a tool result
+// would otherwise be two consecutive `user` entries.
+//
+// **`Message.cache_breakpoint` is deliberately not read here.** Gemini's implicit context cache
+// matches the longest byte-identical prefix of a request automatically, with no marker — so the
+// correct handling of phase 8's hint is to ignore it, and "ignore" has to mean *byte-identical*: a
+// key invented to carry it would change the prefix and defeat the cache it was meant to serve.
+// (Gemini's *explicit* `cachedContent` is a different feature with its own lifecycle and its own
+// create/delete endpoints, so it belongs to a caller through `extra`, not to a marker on a turn.)
+// The saving is still reported: `usageMetadata.cachedContentTokenCount` reads into
+// `Usage.cached_input_tokens`.
+fn encode_contents(msgs: List<Message>): Result<(List<dyn>, List<dyn>), AiError> {
+    mut system: List<dyn> = []
+    mut turns: List<dyn> = []
+    mut last_role = ""
+    mut names: Map<string, string> = {}
+    for m in msgs {
+        names = remember_calls(names, m.parts)
+        blocks = encode_parts(m.parts, names)?
+        if m.role == Role.System {
+            system = system ~ blocks
+        } else if wire_role(m.role) == last_role && turns.len() > 0 {
+            at = turns.len() - 1
+            turns = turns.set(at, merged_turn(turns[at], last_role, blocks))
+        } else {
+            role = wire_role(m.role)
+            turn: Map<string, dyn> = {"role": role, "parts": blocks}
+            turns = turns ~ [turn]
+            last_role = role
+        }
+    }
+    return Ok((system, turns))
+}
+
+// Every tool the request offers, as the vendor's single `tools` entry.
+//
+// One entry holding all the declarations, not one entry each: `tools` is a list of *tool kinds*
+// here — function declarations, code execution, search grounding — rather than a list of functions.
+fn encode_tools(specs: List<ToolSpec>): Result<List<dyn>, AiError> {
+    mut decls: List<dyn> = []
+    for t in specs {
+        mut schema: dyn = 0
+        match provider.parse_value(t.parameters, "tool `${t.name}` schema") {
+            Ok(s) => {
+                schema = s
+            },
+            Err(e) => {
+                return Err(refuse("${e}"))
+            },
+        }
+        entry: Map<string, dyn> = {
+            "name": t.name,
+            "description": t.description,
+            "parameters": schema,
+        }
+        decls = decls ~ [entry]
+    }
+    kind: Map<string, dyn> = {"functionDeclarations": decls}
+    return Ok([kind])
+}
+
+// --- Decoding -------------------------------------------------------------------------------------
+
+// Gemini's finish reasons are an enum of shouted names, and four of the seven mean the model was
+// stopped by policy rather than by having finished — which is a refusal, not a clean end.
+fn decode_stop(raw: string): StopReason {
+    return match raw {
+        "STOP" => StopReason.EndTurn,
+        "" => StopReason.EndTurn,
+        "MAX_TOKENS" => StopReason.MaxTokens,
+        "SAFETY" => StopReason.Refusal,
+        "RECITATION" => StopReason.Refusal,
+        "BLOCKLIST" => StopReason.Refusal,
+        "PROHIBITED_CONTENT" => StopReason.Refusal,
+        "SPII" => StopReason.Refusal,
+        // `MALFORMED_FUNCTION_CALL`, `IMAGE_SAFETY`, `LANGUAGE`, and whatever the vendor adds next:
+        // kept verbatim rather than flattened into `EndTurn`, which would report a stopped
+        // generation as a complete one.
+        _ => StopReason.Other(raw: raw),
+    }
+}
+
+// `thoughtsTokenCount` is Gemini's reasoning bucket and it is **separate from** `candidatesTokenCount`
+// rather than a breakdown of it — the vendor's own `totalTokenCount` is the sum of all three. So
+// `Usage.total()`, which is input plus output, deliberately excludes it: it is a third number, and
+// pretending it is part of the output would double-count against every other provider's meaning.
+fn decode_usage(u: Map<string, dyn>): Usage {
+    return Usage {
+        input_tokens: provider.int_at(u, "promptTokenCount"),
+        output_tokens: provider.int_at(u, "candidatesTokenCount"),
+        cached_input_tokens: provider.int_at(u, "cachedContentTokenCount"),
+        reasoning_tokens: provider.int_at(u, "thoughtsTokenCount"),
+    }
+}
+
+fn any_usage(u: Usage): bool {
+    return u.input_tokens + u.output_tokens + u.cached_input_tokens + u.reasoning_tokens > 0
+}
+
+// The neutral delta ids this codec hands out, shared by both transports so one `fold` serves them. A
+// candidate's prose and its thinking are two blocks, so they need two ids; a function call gets a
+// running `call_n`, because Gemini's `functionCall` carries no id of its own in any reply this codec
+// has to decode.
+fn text_id(): string {
+    return "0"
+}
+
+fn thinking_id(): string {
+    return "0:thought"
+}
+
+fn is_thought(p: Map<string, dyn>): bool {
+    return (p.get("thought") ?? false).as<bool>() ?? false
+}
+
+// One candidate part as neutral deltas. `at` is the running count of function calls seen so far in
+// this reply, which is what names them; it comes back so the caller can advance it.
+fn decode_part(p: Map<string, dyn>, at: int): Result<(List<Delta>, int), AiError> {
+    if p.has("functionCall") {
+        call = provider.obj_at(p, "functionCall")
+        // The vendor's own id when there is one — newer replies carry it for parallel calls — and a
+        // stable synthesized one otherwise. Either way it is only ever a local correlation handle:
+        // `encode_tool_result` resolves it back to the name Gemini actually addresses.
+        given = provider.str_at(call, "id")
+        cid = if given == "" then "call_${at}" else given
+        return Ok(([
+            Delta.ToolCallStart(id: cid, name: provider.str_at(call, "name")),
+            Delta.ToolCallArgs(id: cid, fragment: json.stringify(call.get("args") ?? {})),
+        ], at + 1))
+    }
+    if p.has("text") {
+        text = provider.str_at(p, "text")
+        if is_thought(p) {
+            mut out: List<Delta> = [Delta.ThinkingDelta(id: thinking_id(), text: text)]
+            signature = provider.str_at(p, "thoughtSignature")
+            if signature != "" {
+                out = out ~ [Delta.ThinkingSignature(id: thinking_id(), signature: signature)]
+            }
+            return Ok((out, at))
+        }
+        return Ok(([Delta.TextDelta(id: text_id(), text: text)], at))
+    }
+    // Loud, not silent. An `inlineData` part in a *reply* is a generated image, and the neutral
+    // delta vocabulary has no increment that can carry one — so this is a real gap, named where it
+    // is, rather than a picture quietly dropped from an answer.
+    if p.has("inlineData") {
+        return Err(AiError.Decode(
+            path: "candidates[0].content.parts[${at}].inlineData",
+            message: "Gemini returned generated media, which a neutral `Delta` cannot carry — this codec reads text, thinking, and function calls",
+        ))
+    }
+    return Err(AiError.Decode(
+        path: "candidates[0].content.parts",
+        message: "unsupported Gemini content part `${json.stringify(p)}`",
+    ))
+}
+
+// `{"error":{"code":429,"message":…,"status":"RESOURCE_EXHAUSTED"}}` as a matchable
+// `AiError.Provider`. `status` is the canonical Google API error enum and is what a caller wants to
+// match on; the numeric `code` is the HTTP status again, so it is only a last resort.
+fn typed_error(status: int, doc: Map<string, dyn>): AiError {
+    inner = provider.obj_at(doc, "error")
+    code = provider.str_at(inner, "status")
+    n = provider.int_at(inner, "code")
+    return AiError.Provider(
+        status: status,
+        code: if code == "" then (if n == 0 then "" else "${n}") else code,
+        message: provider.str_at(inner, "message"),
+    )
+}
+
+// A candidate, as the deltas it means. Shared by both transports, which is what keeps their ids and
+// their stop reasons identical.
+//
+// **`ToolUse` is derived, not read.** Gemini has no `tool_use` finish reason: a turn that asks for a
+// function ends with `STOP` like any other. A codec that trusted `finishReason` here would end every
+// tool loop on its first turn, with the model's request unanswered and the run reported as complete.
+fn decode_candidate(candidate: Map<string, dyn>, at: int): Result<(List<Delta>, int), AiError> {
+    mut out: List<Delta> = []
+    mut calls = at
+    for p in provider.list_at(provider.obj_at(candidate, "content"), "parts") {
+        (more, advanced) = decode_part(p.as<Map<string, dyn>>() ?? {}, calls)?
+        out = out ~ more
+        calls = advanced
+    }
+    raw = provider.str_at(candidate, "finishReason")
+    if raw != "" {
+        asked_for_a_tool = calls > at && (raw == "STOP")
+        out = out ~ [Delta.Stop(reason: if asked_for_a_tool then StopReason.ToolUse else decode_stop(raw))]
+    }
+    return Ok((out, calls))
+}
+
+// A prompt Gemini declined to answer comes back with **no candidates at all** and a `promptFeedback`
+// naming the reason. That is a refusal, not an empty reply: the run loop turns `StopReason.Refusal`
+// into `AiError.Refused`, and the reason it reports is the vendor's own word for it.
+fn decode_block(doc: Map<string, dyn>): List<Delta> {
+    reason = provider.str_at(provider.obj_at(doc, "promptFeedback"), "blockReason")
+    if reason == "" {
+        return []
+    }
+    return [
+        Delta.TextDelta(id: text_id(), text: "the prompt was blocked: ${reason}"),
+        Delta.Stop(reason: StopReason.Refusal),
+    ]
+}
+
+// --- The streaming protocol -------------------------------------------------------------------
+//
+// `:streamGenerateContent?alt=sse` streams unnamed events whose payload is the **same document** a
+// buffered call returns, each carrying the slice of the candidate produced since the last one:
+//
+//     data: {"candidates":[{"content":{"parts":[{"text":"Hi"}],"role":"model"}}],
+//            "usageMetadata":{…},"modelVersion":"gemini-2.5-flash"}
+//     …
+//     data: {"candidates":[{"content":{"parts":[{"text":"!"}],"role":"model"},"finishReason":"STOP"}],
+//            "usageMetadata":{…},"modelVersion":"gemini-2.5-flash"}
+//
+// Two properties of that shape decide the decoder's design:
+//
+//   * **There is no terminator.** No `message_stop`, no `[DONE]` — the body simply ends. So
+//     `finish()` asks for a `finishReason`, which is the only thing in the protocol that says the
+//     generation is whole.
+//   * **Usage is cumulative and repeated on every chunk**, so the last one wins rather than
+//     accumulating. `merge_usage` does the right thing either way, since a later report that omits a
+//     field keeps the earlier value.
+//
+// The state it keeps is smaller than the other two decoders' because Gemini's chunks are
+// self-describing: a function call arrives whole in one part, so there is no index-to-id map — only
+// the running call counter that names them, and that has to be state because the count spans chunks.
+
+pub class GoogleStream {
+    mut usage: Usage
+    mut model: string
+    mut calls: int
+    mut opened: bool
+    mut stopped: bool
+
+    fn new(): GoogleStream {
+        return GoogleStream { usage: Usage {}, model: "", calls: 0, opened: false, stopped: false }
+    }
+
+    // **Inline, not a standalone `impl StreamDecoder for GoogleStream` block, and that is
+    // load-bearing.** Written standalone, the impl is invisible to `dyn` coercion whenever this
+    // module is not the entry, so `Google.decoder()` fails to check from a consuming package while
+    // this file's own suite passes. See AGENTS.md.
+    impl StreamDecoder {
+        fn push(frame: Frame): Result<List<Delta>, AiError> {
+            if frame.data == "" {
+                return Ok([])
+            }
+            doc = provider.parse_object(frame.data, "google stream chunk")?
+            // A vendor error inside an otherwise-successful 200 stream. There is no HTTP status to
+            // report and `0` says exactly that; `code` stays matchable, which is the point.
+            if doc.has("error") {
+                return Err(typed_error(0, doc))
+            }
+            self.opened = true
+            mut out: List<Delta> = []
+            served = provider.str_at(doc, "modelVersion")
+            if served != "" && self.model == "" {
+                self.model = served
+                out = out ~ [Delta.ModelDelta(model: served)]
+            }
+            blocked = decode_block(doc)
+            if blocked.len() > 0 {
+                self.stopped = true
+                return Ok(out ~ blocked)
+            }
+            for c in provider.list_at(doc, "candidates") {
+                candidate = c.as<Map<string, dyn>>() ?? {}
+                if provider.int_at(candidate, "index") != 0 {
+                    return Err(AiError.Decode(
+                        path: "candidates[].index",
+                        message: "the Gemini stream carried candidate ${provider.int_at(candidate, "index")} and a neutral reply holds one — request one candidate",
+                    ))
+                }
+                (more, advanced) = decode_candidate(candidate, self.calls)?
+                self.calls = advanced
+                out = out ~ more
+                if provider.str_at(candidate, "finishReason") != "" {
+                    self.stopped = true
+                }
+            }
+            fresh = decode_usage(provider.obj_at(doc, "usageMetadata"))
+            if any_usage(fresh) {
+                self.usage = provider.merge_usage(self.usage, fresh)
+                out = out ~ [Delta.UsageDelta(usage: self.usage)]
+            }
+            return Ok(out)
+        }
+
+        fn finish(): Result<Usage, AiError> {
+            if !self.opened {
+                return Err(AiError.Decode(
+                    path: "",
+                    message: "the Gemini event stream carried no chunks — nothing was streamed. A non-2xx answer streams its error body like any other body, so a rate limit or a rejected request can arrive here as an empty stream",
+                ))
+            }
+            if !self.stopped {
+                return Err(AiError.Decode(
+                    path: "",
+                    message: "the Gemini event stream ended before any chunk carried a `finishReason` — the reply is truncated, and reporting it as a complete answer would be worse than failing",
+                ))
+            }
+            return Ok(self.usage)
+        }
+    }
+}
+
+impl Provider for Google {
+    fn name(): string {
+        return "google"
+    }
+
+    // **The model and the transport are both in the URL.** A streamed call is a different method on
+    // a different path, not a body flag — which is why the framing and the path are decided together
+    // here and never apart.
+    fn encode(req: ModelRequest): Result<Wire, AiError> {
+        (system, turns) = encode_contents(req.messages)?
+
+        mut body: Map<string, dyn> = {"contents": turns}
+        if system.len() > 0 {
+            instruction: Map<string, dyn> = {"parts": system}
+            body = body.set("systemInstruction", instruction)
+        }
+        // No tools, no key. An empty `tools` array is not the same request as an absent one, and a
+        // vendor is entitled to treat it differently.
+        if req.tools.len() > 0 {
+            body = body.set("tools", encode_tools(req.tools)?)
+        }
+        // Every sampling knob lives under `generationConfig` here rather than at the top level, so
+        // the block is built first and only added when it says something.
+        mut config: Map<string, dyn> = {}
+        match req.max_tokens {
+            some(n) => {
+                config = config.set("maxOutputTokens", n)
+            },
+            none => {},
+        }
+        match req.temperature {
+            some(t) => {
+                config = config.set("temperature", t)
+            },
+            none => {},
+        }
+        if req.stop.len() > 0 {
+            stop: List<dyn> = req.stop.map(fn(s) => s)
+            config = config.set("stopSequences", stop)
+        }
+        if config.keys().len() > 0 {
+            body = body.set("generationConfig", config)
+        }
+        // The escape hatch, merged verbatim and last, so it can also override a key this codec set —
+        // including `generationConfig` itself, which is how a caller reaches `thinkingConfig`,
+        // `responseMimeType`, or a safety-settings block. Unchecked in content, checked in syntax.
+        for k in req.extra.keys() {
+            body = body.set(k, provider.parse_value(req.extra[k], "extra key `${k}`")?)
+        }
+
+        headers = {
+            "x-goog-api-key": self.key,
+            "content-type": "application/json",
+        }
+        root = "${self.base_url}/${self.version}/models/${req.model}"
+        if req.stream {
+            streamed = Wire {
+                url: "${root}:streamGenerateContent?alt=sse",
+                method: "post",
+                headers: headers,
+                body: json.stringify(body),
+            }
+            return Ok(streamed.as_sse())
+        }
+        return Ok(Wire {
+            url: "${root}:generateContent",
+            method: "post",
+            headers: headers,
+            body: json.stringify(body),
+        })
+    }
+
+    fn decode_deltas(body: string): Result<List<Delta>, AiError> {
+        doc = provider.parse_object(body, "google reply")?
+        if doc.has("error") {
+            return Err(typed_error(0, doc))
+        }
+        // The served model leads, so the delta list describes the reply completely and the streaming
+        // path needs no side channel for it.
+        mut out: List<Delta> = [Delta.ModelDelta(model: provider.str_at(doc, "modelVersion"))]
+        usage = Delta.UsageDelta(usage: decode_usage(provider.obj_at(doc, "usageMetadata")))
+
+        blocked = decode_block(doc)
+        if blocked.len() > 0 {
+            return Ok(out ~ blocked ~ [usage])
+        }
+        candidates = provider.list_at(doc, "candidates")
+        if candidates.len() == 0 {
+            return Err(AiError.Decode(
+                path: "candidates",
+                message: "the Gemini reply carried no candidates and no `promptFeedback` — nothing was generated and nothing said why",
+            ))
+        }
+        if candidates.len() > 1 {
+            return Err(AiError.Decode(
+                path: "candidates",
+                message: "the Gemini reply carried ${candidates.len()} candidates and a neutral `ModelReply` holds one — request `candidateCount: 1`",
+            ))
+        }
+        (more, advanced) = decode_candidate(candidates[0].as<Map<string, dyn>>() ?? {}, 0)?
+        return Ok(out ~ more ~ [usage])
+    }
+
+    fn decode_reply(body: string): Result<ModelReply, AiError> {
+        return Ok(provider.fold(self.decode_deltas(body)?, ""))
+    }
+
+    fn decoder(): dyn StreamDecoder {
+        return GoogleStream.new()
+    }
+
+    fn decode_error(status: int, body: string): AiError {
+        return match provider.parse_object(body, "google error") {
+            Ok(doc) => typed_error(status, doc),
+            // An HTML error page from a proxy, or an empty 502: the raw text is the only evidence of
+            // what actually answered, so it is reported verbatim rather than swallowed.
+            Err(_) => AiError.Provider(status: status, code: "", message: body),
+        }
+    }
+
+    // **`none`, and that is a real answer.** Gemini's exact count comes from the `countTokens`
+    // endpoint, which is a network round trip and therefore not something a pure codec may do.
+    // Returning a fabricated number here would be trusted absolutely and be wrong by a few percent,
+    // which surfaces as a vendor-side context error in the middle of a run.
+    fn estimate_tokens(msgs: List<Message>): ?int {
+        return none
+    }
+}
+
+// --- Test helpers ---------------------------------------------------------------------------------
+
+fn encode_or_fail(codec: Google, req: ModelRequest): Wire {
+    match codec.encode(req) {
+        Ok(w) => {
+            return w
+        },
+        Err(e) => {
+            assert(false, "encode failed: ${e}")
+        },
+    }
+    return Wire { url: "" }
+}
+
+fn decode_or_fail(codec: Google, body: string): ModelReply {
+    match codec.decode_reply(body) {
+        Ok(r) => {
+            return r
+        },
+        Err(e) => {
+            assert(false, "decode failed: ${e}")
+        },
+    }
+    return ModelReply { parts: [] }
+}
+
+// Cut a verbatim transcript into the frames `std.http`'s SSE reader hands back. Test-only — the run
+// loop never sees wire text, it sees frames std already cut.
+fn sse_frames(lines: List<string>): List<Frame> {
+    mut out: List<Frame> = []
+    mut data = ""
+    mut open = false
+    for line in lines {
+        if line == "" {
+            if open {
+                out = out ~ [Frame { event: "", data: data, id: "", retry: none }]
+            }
+            data = ""
+            open = false
+        } else if line.starts_with("data: ") {
+            piece = line.slice(6, line.len())
+            data = if data == "" then piece else data ~ "\n" ~ piece
+            open = true
+        }
+    }
+    if open {
+        out = out ~ [Frame { event: "", data: data, id: "", retry: none }]
+    }
+    return out
+}
+
+fn stream_or_fail(decoder: dyn StreamDecoder, lines: List<string>): List<Delta> {
+    mut out: List<Delta> = []
+    for f in sse_frames(lines) {
+        match decoder.push(f) {
+            Ok(more) => {
+                out = out ~ more
+            },
+            Err(e) => {
+                assert(false, "push failed on `${f.data}`: ${e}")
+            },
+        }
+    }
+    return out
+}
+
+// A verbatim `text/event-stream` transcript of `:streamGenerateContent?alt=sse` — the chunk shape
+// Google publishes, line for line, including the `safetyRatings` and `avgLogprobs` a decoder has to
+// ignore, the cumulative `usageMetadata` repeated on every chunk, and the absence of any terminator
+// at all. Held as raw wire lines rather than as pre-cut `Frame`s so that what the decoder is proved
+// against is *the vendor's bytes*, diffable against the vendor's own documentation, rather than a
+// frame list written to match this decoder.
+fn captured_text_stream(): List<string> {
+    return [
+        "data: {\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"Hej\"}],\"role\": \"model\"},\"index\": 0}],\"usageMetadata\": {\"promptTokenCount\": 8,\"candidatesTokenCount\": 1,\"totalTokenCount\": 9},\"modelVersion\": \"gemini-2.5-flash\"}",
+        "",
+        "data: {\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"! Hur mår du?\"}],\"role\": \"model\"},\"index\": 0}],\"usageMetadata\": {\"promptTokenCount\": 8,\"candidatesTokenCount\": 6,\"totalTokenCount\": 14},\"modelVersion\": \"gemini-2.5-flash\"}",
+        "",
+        "data: {\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"\"}],\"role\": \"model\"},\"finishReason\": \"STOP\",\"index\": 0,\"safetyRatings\": [{\"category\": \"HARM_CATEGORY_HATE_SPEECH\",\"probability\": \"NEGLIGIBLE\"}],\"avgLogprobs\": -0.031}],\"usageMetadata\": {\"promptTokenCount\": 8,\"candidatesTokenCount\": 7,\"totalTokenCount\": 15},\"modelVersion\": \"gemini-2.5-flash\"}",
+    ]
+}
+
+// A streamed turn that thinks and then calls a function. Three things this pins that the text
+// transcript does not: a thought part is a `text` with `"thought": true` and its signature arrives on
+// the same part, a `functionCall` arrives **whole** in one chunk (so its arguments never need
+// accumulating, unlike every other vendor's), and the chunk that carries it still reports
+// `finishReason: "STOP"` — which is why `ToolUse` has to be derived.
+fn captured_thinking_tool_call_stream(): List<string> {
+    return [
+        "data: {\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"The user wants the weather in Malmö. I should call get_weather.\",\"thought\": true,\"thoughtSignature\": \"CikBVKhc7uS0lQ\"}],\"role\": \"model\"},\"index\": 0}],\"usageMetadata\": {\"promptTokenCount\": 62,\"thoughtsTokenCount\": 41,\"totalTokenCount\": 103},\"modelVersion\": \"gemini-2.5-flash\"}",
+        "",
+        "data: {\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"Let me check.\"}],\"role\": \"model\"},\"index\": 0}],\"usageMetadata\": {\"promptTokenCount\": 62,\"candidatesTokenCount\": 4,\"thoughtsTokenCount\": 41,\"totalTokenCount\": 107},\"modelVersion\": \"gemini-2.5-flash\"}",
+        "",
+        "data: {\"candidates\": [{\"content\": {\"parts\": [{\"functionCall\": {\"name\": \"get_weather\",\"args\": {\"city\": \"Malmö\"}}}],\"role\": \"model\"},\"finishReason\": \"STOP\",\"index\": 0}],\"usageMetadata\": {\"promptTokenCount\": 62,\"candidatesTokenCount\": 12,\"thoughtsTokenCount\": 41,\"totalTokenCount\": 115},\"modelVersion\": \"gemini-2.5-flash\"}",
+    ]
+}
+
+// A captured `:generateContent` response body — the shape Google documents, keys and all.
+fn captured_text_reply(): string {
+    return "{\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"Hej! Hur mår du?\"}],\"role\": \"model\"},\"finishReason\": \"STOP\",\"index\": 0,\"safetyRatings\": [{\"category\": \"HARM_CATEGORY_DANGEROUS_CONTENT\",\"probability\": \"NEGLIGIBLE\"}]}],\"usageMetadata\": {\"promptTokenCount\": 2095,\"candidatesTokenCount\": 503,\"cachedContentTokenCount\": 1024,\"thoughtsTokenCount\": 128,\"totalTokenCount\": 2726},\"modelVersion\": \"gemini-2.5-flash\"}"
+}
+
+// The published function-calling response. Note `finishReason: "STOP"` on a turn whose only content
+// is a `functionCall`: Gemini has no `tool_use` reason, which is the single most consequential
+// difference between this family and the other two.
+fn captured_function_call_reply(): string {
+    return "{\"candidates\": [{\"content\": {\"parts\": [{\"functionCall\": {\"name\": \"get_current_weather\",\"args\": {\"location\": \"Boston\",\"unit\": \"celsius\"}}}],\"role\": \"model\"},\"finishReason\": \"STOP\",\"index\": 0}],\"usageMetadata\": {\"promptTokenCount\": 62,\"candidatesTokenCount\": 8,\"totalTokenCount\": 70},\"modelVersion\": \"gemini-2.0-flash\"}"
+}
+
+@test {
+    // A known request, asserted against the exact bytes it produces. `json.stringify` emits map keys
+    // in sorted order, so this is stable — and an exact-string assertion is the only kind that
+    // catches a key silently changing name or moving nesting level.
+    fn encode_produces_exactly_this_json(): void {
+        req = ModelRequest {
+            model: "gemini-2.5-flash",
+            messages: [
+                Message.system("Answer in Swedish."),
+                Message.user("Say hello."),
+            ],
+            max_tokens: some(64),
+            temperature: some(0.0),
+            stop: ["\n\n"],
+        }
+        wire = encode_or_fail(Google.new("k"), req)
+        // The model rides in the URL and the method is part of the path.
+        assert(wire.url == "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+            wire.url)
+        assert(wire.body == "{\"contents\":[{\"parts\":[{\"text\":\"Say hello.\"}],\"role\":\"user\"}],\"generationConfig\":{\"maxOutputTokens\":64,\"stopSequences\":[\"\\n\\n\"],\"temperature\":0.0},\"systemInstruction\":{\"parts\":[{\"text\":\"Answer in Swedish.\"}]}}",
+            "exact request body, got: ${wire.body}")
+    }
+
+    fn encode_sends_the_key_as_a_header(): void {
+        wire = encode_or_fail(Google.new("AIza-test"), ModelRequest { model: "m", messages: [Message.user("hi")] })
+        assert(wire.headers["x-goog-api-key"] == "AIza-test")
+        assert(wire.headers["content-type"] == "application/json")
+    }
+
+    fn encode_points_at_a_gateway_when_told_to(): void {
+        wire = encode_or_fail(Google.at("https://gateway.internal", "k"),
+            ModelRequest { model: "m", messages: [Message.user("hi")] })
+        assert(wire.url == "https://gateway.internal/v1beta/models/m:generateContent", wire.url)
+    }
+
+    // The assistant's role is `model`, and a system turn is hoisted out of `contents` wherever it
+    // appears — Gemini has no `system` role and would reject one.
+    fn encode_uses_the_model_role_and_hoists_every_system_turn(): void {
+        wire = encode_or_fail(Google.new("k"), ModelRequest {
+            model: "m",
+            messages: [
+                Message.system("first"),
+                Message.user("a"),
+                Message.system("second"),
+                Message.assistant("b"),
+            ],
+        })
+        assert(wire.body.contains("\"systemInstruction\":{\"parts\":[{\"text\":\"first\"},{\"text\":\"second\"}]}"),
+            "both system turns hoisted, in order: ${wire.body}")
+        assert(wire.body.contains("\"role\":\"model\""), wire.body)
+        assert(!wire.body.contains("\"role\":\"assistant\""), "there is no assistant role here")
+        assert(!wire.body.contains("\"role\":\"system\""), wire.body)
+    }
+
+    // **The name resolution that makes this codec's tool loop work.** A `functionResponse` is
+    // addressed by the name of the call it answers, and the neutral model carries only the id — so
+    // the id is resolved against the `functionCall` parts earlier in the same conversation.
+    fn a_tool_result_is_addressed_by_the_name_of_the_call_it_answers(): void {
+        wire = encode_or_fail(Google.new("k"), ModelRequest {
+            model: "m",
+            messages: [
+                Message.user("weather in both?"),
+                Message {
+                    role: Role.Assistant,
+                    parts: [
+                        Part.ToolCall(id: "call_0", name: "get_weather", args: "{\"city\":\"Malmö\"}"),
+                        Part.ToolCall(id: "call_1", name: "distance_km", args: "{\"from\":\"Malmö\",\"to\":\"Lund\"}"),
+                    ],
+                },
+                Message {
+                    role: Role.Tool,
+                    parts: [
+                        Part.ToolResult(id: "call_0", content: "18C", is_error: false),
+                        Part.ToolResult(id: "call_1", content: "no road on file", is_error: true),
+                    ],
+                },
+            ],
+        })
+        assert(wire.body.contains("{\"functionResponse\":{\"name\":\"get_weather\",\"response\":{\"output\":\"18C\"}}}"),
+            wire.body)
+        // Gemini has no error flag either, but it does have an arbitrary response object — so a
+        // failing result keeps its shape instead of having prose put in its mouth.
+        assert(wire.body.contains("{\"functionResponse\":{\"name\":\"distance_km\",\"response\":{\"error\":\"no road on file\"}}}"),
+            wire.body)
+        // The arguments go out as a real map, not as a quoted string.
+        assert(wire.body.contains("{\"functionCall\":{\"args\":{\"city\":\"Malmö\"},\"name\":\"get_weather\"}}"), wire.body)
+    }
+
+    // A result answering no call in the conversation cannot be addressed at all, so it is refused
+    // rather than sent under a guessed name — an unmatched `functionResponse` makes the model answer
+    // a question nobody asked.
+    fn a_tool_result_with_no_matching_call_is_refused(): void {
+        match Google.new("k").encode(ModelRequest {
+            model: "m",
+            messages: [Message.tool("call_99", "18C", false)],
+        }) {
+            Ok(_) => {
+                assert(false, "an unaddressable function response must not encode")
+            },
+            Err(e) => {
+                assert("${e}".contains("call_99"), "${e}")
+                assert("${e}".contains("google"), "${e}")
+                assert("${e}".contains("name"), "the message says what Gemini addresses by: ${e}")
+            },
+        }
+    }
+
+    // A `Role.Tool` turn encodes as `user`, so it would follow a user question as a second `user`
+    // entry. Adjacent same-role turns are merged into one, as in the Anthropic codec.
+    fn encode_merges_adjacent_turns_of_the_same_role(): void {
+        wire = encode_or_fail(Google.new("k"), ModelRequest {
+            model: "m",
+            messages: [Message.user("first"), Message.user("second")],
+        })
+        assert(wire.body.contains("\"contents\":[{\"parts\":[{\"text\":\"first\"},{\"text\":\"second\"}],\"role\":\"user\"}]"),
+            "one user turn carrying both: ${wire.body}")
+    }
+
+    // All the declarations go in **one** `tools` entry: that list is of tool *kinds* — functions,
+    // code execution, search grounding — not of functions.
+    fn encode_sends_every_tool_in_one_function_declarations_entry(): void {
+        wire = encode_or_fail(Google.new("k"), ModelRequest {
+            model: "m",
+            messages: [Message.user("weather?")],
+            tools: [
+                ToolSpec {
+                    name: "weather",
+                    description: "Current weather for a city",
+                    parameters: "{\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"}",
+                },
+                ToolSpec { name: "clock", description: "The time", parameters: "{\"type\":\"object\"}" },
+            ],
+        })
+        assert(wire.body.contains("\"tools\":[{\"functionDeclarations\":[{\"description\":\"Current weather for a city\",\"name\":\"weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"}},{\"description\":\"The time\",\"name\":\"clock\",\"parameters\":{\"type\":\"object\"}}]}]"),
+            wire.body)
+    }
+
+    fn encode_omits_the_tools_key_when_there_are_none(): void {
+        assert(!encode_or_fail(Google.new("k"), ModelRequest {
+            model: "m",
+            messages: [Message.user("hi")],
+        }).body.contains("\"tools\""))
+    }
+
+    fn encode_rejects_a_tool_whose_schema_is_not_json(): void {
+        match Google.new("k").encode(ModelRequest {
+            model: "m",
+            messages: [Message.user("hi")],
+            tools: [ToolSpec { name: "broken", description: "", parameters: "{oops" }],
+        }) {
+            Ok(_) => {
+                assert(false, "a malformed schema must not encode")
+            },
+            Err(e) => {
+                assert("${e}".contains("broken"), "${e}")
+                assert("${e}".contains("google"), "${e}")
+            },
+        }
+    }
+
+    // Gemini's `inlineData` takes far more than an image — which means this codec accepts a
+    // `Part.File` the Anthropic codec refuses, and the neutral model is the richer for it.
+    fn encode_inlines_media_of_every_kind_the_vendor_takes(): void {
+        wire = encode_or_fail(Google.new("k"), ModelRequest {
+            model: "m",
+            messages: [Message {
+                role: Role.User,
+                parts: [
+                    Part.Image(mime: "image/png", data: "foobar".to_bytes()),
+                    Part.File(mime: "video/mp4", name: "clip.mp4", data: "foo".to_bytes()),
+                    Part.File(mime: "application/pdf", name: "draft.pdf", data: "fo".to_bytes()),
+                ],
+            }],
+        })
+        assert(wire.body.contains("{\"inlineData\":{\"data\":\"Zm9vYmFy\",\"mimeType\":\"image/png\"}}"), wire.body)
+        assert(wire.body.contains("{\"inlineData\":{\"data\":\"Zm9v\",\"mimeType\":\"video/mp4\"}}"),
+            "a video Anthropic refuses: ${wire.body}")
+        assert(wire.body.contains("{\"inlineData\":{\"data\":\"Zm8=\",\"mimeType\":\"application/pdf\"}}"), wire.body)
+    }
+
+    // Wider is not unbounded: a type the vendor does not take is still refused, naming the part.
+    fn encode_rejects_media_the_vendor_cannot_read(): void {
+        match Google.new("k").encode(ModelRequest {
+            model: "m",
+            messages: [Message {
+                role: Role.User,
+                parts: [Part.File(mime: "application/zip", name: "logs.zip", data: "x".to_bytes())],
+            }],
+        }) {
+            Ok(_) => {
+                assert(false, "a zip must not silently encode")
+            },
+            Err(e) => {
+                assert("${e}".contains("logs.zip"), "${e}")
+                assert("${e}".contains("application/pdf"), "and what would work: ${e}")
+            },
+        }
+    }
+
+    // The signature has to come back or the vendor invalidates the thought; nothing here reads it.
+    fn encode_round_trips_a_thought_and_its_signature(): void {
+        wire = encode_or_fail(Google.new("k"), ModelRequest {
+            model: "m",
+            messages: [Message {
+                role: Role.Assistant,
+                parts: [Part.Thinking(text: "let me see", signature: "CikBVKhc7uS0lQ")],
+            }],
+        })
+        assert(wire.body.contains("{\"text\":\"let me see\",\"thought\":true,\"thoughtSignature\":\"CikBVKhc7uS0lQ\"}")
+            || wire.body.contains("{\"thought\":true,\"thoughtSignature\":\"CikBVKhc7uS0lQ\",\"text\":\"let me see\"}"),
+            wire.body)
+    }
+
+    // `args` must be a map of named parameters; a fragment that parses to an array is a request the
+    // vendor rejects with a message that says nothing about which tool.
+    fn encode_rejects_tool_call_arguments_that_are_not_an_object(): void {
+        match Google.new("k").encode(ModelRequest {
+            model: "m",
+            messages: [Message {
+                role: Role.Assistant,
+                parts: [Part.ToolCall(id: "c", name: "weather", args: "[1, 2]")],
+            }],
+        }) {
+            Ok(_) => {
+                assert(false, "an array of arguments must not encode")
+            },
+            Err(e) => {
+                assert("${e}".contains("weather"), "${e}")
+                assert("${e}".contains("named parameters"), "${e}")
+            },
+        }
+    }
+
+    // The escape hatch reaches `generationConfig` itself, which is how a caller gets at
+    // `thinkingConfig`, `responseMimeType`, or a safety-settings block without a codec change.
+    fn encode_merges_the_extra_escape_hatch_last(): void {
+        wire = encode_or_fail(Google.new("k"), ModelRequest {
+            model: "m",
+            messages: [Message.user("hi")],
+            max_tokens: some(64),
+            extra: {
+                "generationConfig": "{\"maxOutputTokens\":128,\"thinkingConfig\":{\"thinkingBudget\":0}}",
+                "safetySettings": "[{\"category\":\"HARM_CATEGORY_HARASSMENT\",\"threshold\":\"BLOCK_NONE\"}]",
+            },
+        })
+        assert(wire.body.contains("\"generationConfig\":{\"maxOutputTokens\":128,\"thinkingConfig\":{\"thinkingBudget\":0}}"),
+            "the escape hatch wins over the codec's own block: ${wire.body}")
+        assert(wire.body.contains("\"safetySettings\":[{\"category\":\"HARM_CATEGORY_HARASSMENT\",\"threshold\":\"BLOCK_NONE\"}]"),
+            wire.body)
+    }
+
+    // Phase 8 places a cache breakpoint on a `@prompt`'s stable prefix. Gemini's implicit cache
+    // matches an exact prefix, so the correct handling is to ignore the hint — and "ignore" has to
+    // mean byte-identical, or the marker defeats the cache it was meant to serve.
+    fn a_cache_breakpoint_is_ignored_byte_for_byte(): void {
+        plain = ModelRequest {
+            model: "m",
+            messages: [Message.system("a long stable system prefix"), Message.user("hi")],
+        }
+        marked = ModelRequest {
+            model: "m",
+            messages: [Message.system("a long stable system prefix").cached(), Message.user("hi")],
+        }
+        assert(encode_or_fail(Google.new("k"), plain).body == encode_or_fail(Google.new("k"), marked).body,
+            "Gemini caches implicitly, so the breakpoint must not change a byte")
+        // And the saving the cache produced is still reported, because that part is the vendor's.
+        assert(decode_or_fail(Google.new("k"), captured_text_reply()).usage.cached_input_tokens == 1024)
+    }
+
+    // --- Decoding a real captured response body --------------------------------------------------
+
+    fn decode_reads_a_captured_text_reply(): void {
+        reply = decode_or_fail(Google.new("k"), captured_text_reply())
+        assert(reply.parts == [Part.Text(text: "Hej! Hur mår du?")])
+        assert(reply.stop == StopReason.EndTurn)
+        assert(reply.model == "gemini-2.5-flash")
+        assert(reply.usage == Usage {
+            input_tokens: 2095,
+            output_tokens: 503,
+            cached_input_tokens: 1024,
+            reasoning_tokens: 128,
+        }, "${reply.usage}")
+    }
+
+    // **The one that would silently break every tool loop.** Gemini reports `finishReason: "STOP"`
+    // for a turn whose only content is a function call, so `ToolUse` is derived from the parts.
+    fn a_function_call_is_tool_use_even_though_the_vendor_says_stop(): void {
+        reply = decode_or_fail(Google.new("k"), captured_function_call_reply())
+        assert(reply.stop == StopReason.ToolUse, "derived from the parts, not read off finishReason")
+        assert(reply.parts == [Part.ToolCall(
+            id: "call_0",
+            name: "get_current_weather",
+            args: "{\"location\":\"Boston\",\"unit\":\"celsius\"}",
+        )], "${reply.parts}")
+    }
+
+    // A reply → request round trip: what the model said, sent straight back as history, has to be
+    // re-encodable. Here that exercises the id-to-name resolution end to end — the id the decoder
+    // synthesized is the one the encoder has to resolve.
+    fn a_decoded_reply_re_encodes_as_history(): void {
+        codec = Google.new("k")
+        reply = decode_or_fail(codec, captured_function_call_reply())
+        wire = encode_or_fail(codec, ModelRequest {
+            model: "gemini-2.0-flash",
+            messages: [
+                Message.user("weather in Boston?"),
+                Message { role: Role.Assistant, parts: reply.parts },
+                Message.tool("call_0", "18°C, clear", false),
+            ],
+        })
+        assert(wire.body.contains("{\"functionResponse\":{\"name\":\"get_current_weather\",\"response\":{\"output\":\"18°C, clear\"}}}"),
+            "the synthesized id resolved back to the vendor's name: ${wire.body}")
+        assert(wire.body.contains("{\"functionCall\":{\"args\":{\"location\":\"Boston\",\"unit\":\"celsius\"},\"name\":\"get_current_weather\"}}"),
+            wire.body)
+    }
+
+    fn decode_maps_every_finish_reason(): void {
+        assert(decode_stop("STOP") == StopReason.EndTurn)
+        assert(decode_stop("") == StopReason.EndTurn, "an absent finish reason is a normal end")
+        assert(decode_stop("MAX_TOKENS") == StopReason.MaxTokens)
+        assert(decode_stop("SAFETY") == StopReason.Refusal)
+        assert(decode_stop("RECITATION") == StopReason.Refusal)
+        assert(decode_stop("PROHIBITED_CONTENT") == StopReason.Refusal)
+        assert(decode_stop("SPII") == StopReason.Refusal)
+        assert(decode_stop("BLOCKLIST") == StopReason.Refusal)
+        // A stopped generation nobody modeled survives rather than reading as a clean finish.
+        assert(decode_stop("MALFORMED_FUNCTION_CALL") == StopReason.Other(raw: "MALFORMED_FUNCTION_CALL"))
+    }
+
+    // A blocked prompt comes back with no candidates at all. That is a refusal — the vendor's own
+    // word for why is what the run loop reports — not an empty answer and not a decode failure.
+    fn a_blocked_prompt_is_a_refusal_with_the_vendors_reason(): void {
+        body = "{\"promptFeedback\": {\"blockReason\": \"SAFETY\",\"safetyRatings\": [{\"category\": \"HARM_CATEGORY_DANGEROUS_CONTENT\",\"probability\": \"HIGH\"}]},\"usageMetadata\": {\"promptTokenCount\": 12,\"totalTokenCount\": 12},\"modelVersion\": \"gemini-2.5-flash\"}"
+        reply = decode_or_fail(Google.new("k"), body)
+        assert(reply.stop == StopReason.Refusal)
+        assert(reply.parts == [Part.Text(text: "the prompt was blocked: SAFETY")], "${reply.parts}")
+        assert(reply.usage.input_tokens == 12)
+    }
+
+    // No candidates and nothing that says why is not an answer at all.
+    fn decode_refuses_a_reply_with_no_candidates_and_no_reason(): void {
+        match Google.new("k").decode_reply("{\"modelVersion\":\"m\"}") {
+            Ok(_) => {
+                assert(false, "an empty document is not a reply")
+            },
+            Err(e) => {
+                assert("${e}".contains("no candidates"), "${e}")
+            },
+        }
+    }
+
+    // The delta vocabulary has no increment that can carry a generated image, so one is named rather
+    // than dropped from the answer.
+    fn decode_refuses_generated_media_it_cannot_carry(): void {
+        body = "{\"candidates\":[{\"content\":{\"parts\":[{\"inlineData\":{\"mimeType\":\"image/png\",\"data\":\"Zm9v\"}}],\"role\":\"model\"},\"finishReason\":\"STOP\"}],\"modelVersion\":\"gemini-2.5-flash-image\"}"
+        match Google.new("k").decode_reply(body) {
+            Ok(_) => {
+                assert(false, "generated media must not be silently dropped")
+            },
+            Err(e) => {
+                assert("${e}".contains("inlineData"), "the path names the part: ${e}")
+                assert("${e}".contains("generated media"), "${e}")
+            },
+        }
+    }
+
+    fn decode_reports_a_malformed_body_rather_than_aborting(): void {
+        match Google.new("k").decode_reply("<html>502 Bad Gateway</html>") {
+            Ok(_) => {
+                assert(false, "HTML is not a reply")
+            },
+            Err(e) => {
+                assert("${e}".contains("google reply"), "${e}")
+            },
+        }
+    }
+
+    // --- Error bodies ------------------------------------------------------------------------------
+
+    // `status` is the canonical Google API error enum, which is what a caller matches on — nobody
+    // should have to regex the prose or compare a number that repeats the HTTP status.
+    fn decode_error_reads_the_vendors_typed_error(): void {
+        body = "{\"error\": {\"code\": 429,\"message\": \"Resource has been exhausted (e.g. check quota).\",\"status\": \"RESOURCE_EXHAUSTED\",\"details\": [{\"@type\": \"type.googleapis.com/google.rpc.QuotaFailure\"}]}}"
+        e = Google.new("k").decode_error(429, body)
+        assert(match e {
+            AiError.Provider(status, code, message) => status == 429 && code == "RESOURCE_EXHAUSTED"
+                && message.contains("check quota"),
+            _ => false,
+        }, "${e}")
+    }
+
+    fn decode_error_falls_back_to_the_numeric_code(): void {
+        e = Google.new("k").decode_error(400, "{\"error\":{\"code\":400,\"message\":\"API key not valid\"}}")
+        assert(match e {
+            AiError.Provider(status, code, message) => status == 400 && code == "400"
+                && message == "API key not valid",
+            _ => false,
+        }, "${e}")
+    }
+
+    fn decode_error_keeps_an_undecodable_body_verbatim(): void {
+        e = Google.new("k").decode_error(502, "<html>Bad Gateway</html>")
+        assert(match e {
+            AiError.Provider(status, code, message) => status == 502 && code == ""
+                && message == "<html>Bad Gateway</html>",
+            _ => false,
+        }, "${e}")
+    }
+
+    // O-5, demonstrated: an exact Gemini count needs the `countTokens` endpoint, which is a network
+    // round trip a pure codec may not make. `none` is the honest answer.
+    fn estimate_tokens_is_none_because_there_is_no_local_tokenizer(): void {
+        assert(Google.new("k").estimate_tokens([Message.user("hello")]) == none)
+    }
+
+    // --- Streaming ---------------------------------------------------------------------------------
+
+    // A streamed call is a **different method on a different path**, not a body flag — so the
+    // request that asks for one has no `stream` key anywhere in it.
+    fn a_streamed_call_is_a_different_url_and_not_a_body_key(): void {
+        buffered = encode_or_fail(Google.new("k"), ModelRequest { model: "m", messages: [Message.user("hi")] })
+        assert(buffered.url.ends_with(":generateContent"), buffered.url)
+        assert(!buffered.streamed())
+
+        streamed = encode_or_fail(Google.new("k"), ModelRequest {
+            model: "m",
+            messages: [Message.user("hi")],
+            stream: true,
+        })
+        assert(streamed.url == "https://generativelanguage.googleapis.com/v1beta/models/m:streamGenerateContent?alt=sse",
+            streamed.url)
+        assert(!streamed.body.contains("\"stream\""), "the flag is in the path, not the body: ${streamed.body}")
+        assert(streamed.streamed())
+        assert(!streamed.ndjson(), "`?alt=sse` is what makes it server-sent events rather than a JSON array")
+    }
+
+    // The captured text transcript, frame by frame. `usageMetadata` repeats on every chunk with
+    // cumulative counts, so the last one has to win rather than accumulate.
+    fn a_captured_text_stream_decodes_frame_by_frame(): void {
+        decoder: dyn StreamDecoder = GoogleStream.new()
+        deltas = stream_or_fail(decoder, captured_text_stream())
+        assert(deltas == [
+            Delta.ModelDelta(model: "gemini-2.5-flash"),
+            Delta.TextDelta(id: "0", text: "Hej"),
+            Delta.UsageDelta(usage: Usage { input_tokens: 8, output_tokens: 1 }),
+            Delta.TextDelta(id: "0", text: "! Hur mår du?"),
+            Delta.UsageDelta(usage: Usage { input_tokens: 8, output_tokens: 6 }),
+            Delta.TextDelta(id: "0", text: ""),
+            Delta.Stop(reason: StopReason.EndTurn),
+            Delta.UsageDelta(usage: Usage { input_tokens: 8, output_tokens: 7 }),
+        ], "${deltas}")
+        assert(decoder.finish() == Ok(Usage { input_tokens: 8, output_tokens: 7 }))
+
+        reply = provider.fold(deltas, "")
+        assert(reply.parts == [Part.Text(text: "Hej! Hur mår du?")])
+        assert(reply.model == "gemini-2.5-flash")
+        assert(reply.stop == StopReason.EndTurn)
+    }
+
+    // The captured thinking-and-tool transcript. The signature lands on the thought's own block, the
+    // function call arrives whole in one chunk, and `ToolUse` is derived from the part rather than
+    // read off the `STOP` the vendor sent with it.
+    fn a_captured_thinking_tool_call_stream_decodes_frame_by_frame(): void {
+        decoder: dyn StreamDecoder = GoogleStream.new()
+        deltas = stream_or_fail(decoder, captured_thinking_tool_call_stream())
+        assert(deltas == [
+            Delta.ModelDelta(model: "gemini-2.5-flash"),
+            Delta.ThinkingDelta(id: "0:thought", text: "The user wants the weather in Malmö. I should call get_weather."),
+            Delta.ThinkingSignature(id: "0:thought", signature: "CikBVKhc7uS0lQ"),
+            Delta.UsageDelta(usage: Usage { input_tokens: 62, reasoning_tokens: 41 }),
+            Delta.TextDelta(id: "0", text: "Let me check."),
+            Delta.UsageDelta(usage: Usage { input_tokens: 62, output_tokens: 4, reasoning_tokens: 41 }),
+            Delta.ToolCallStart(id: "call_0", name: "get_weather"),
+            Delta.ToolCallArgs(id: "call_0", fragment: "{\"city\":\"Malmö\"}"),
+            Delta.Stop(reason: StopReason.ToolUse),
+            Delta.UsageDelta(usage: Usage { input_tokens: 62, output_tokens: 12, reasoning_tokens: 41 }),
+        ], "${deltas}")
+        assert(decoder.finish() == Ok(Usage { input_tokens: 62, output_tokens: 12, reasoning_tokens: 41 }))
+
+        reply = provider.fold(deltas, "")
+        assert(reply.stop == StopReason.ToolUse)
+        assert(reply.parts == [
+            Part.Thinking(
+                text: "The user wants the weather in Malmö. I should call get_weather.",
+                signature: "CikBVKhc7uS0lQ",
+            ),
+            Part.Text(text: "Let me check."),
+            Part.ToolCall(id: "call_0", name: "get_weather", args: "{\"city\":\"Malmö\"}"),
+        ], "${reply.parts}")
+    }
+
+    // **A truncated stream must not look like a complete answer.** Gemini's stream has no terminator
+    // of its own, so `finishReason` is the only thing that says the generation is whole — and that
+    // is exactly what `finish` asks for.
+    fn a_truncated_stream_is_refused_rather_than_answered(): void {
+        full = captured_text_stream()
+        cut = full.slice(0, full.len() - 2)
+        decoder: dyn StreamDecoder = GoogleStream.new()
+        deltas = stream_or_fail(decoder, cut)
+        assert(deltas.len() > 0, "the frames that arrived still decode")
+        match decoder.finish() {
+            Ok(u) => {
+                assert(false, "a stream with no `finishReason` is not a finished reply: ${u}")
+            },
+            Err(e) => {
+                assert("${e}".contains("finishReason"), "${e}")
+                assert("${e}".contains("truncated"), "${e}")
+            },
+        }
+    }
+
+    fn a_stream_that_never_started_says_what_probably_happened(): void {
+        probe: dyn StreamDecoder = GoogleStream.new()
+        match probe.finish() {
+            Ok(u) => {
+                assert(false, "an empty stream is not a reply: ${u}")
+            },
+            Err(e) => {
+                assert("${e}".contains("no chunks"), "${e}")
+                assert("${e}".contains("error body"), "the message names the reason it cannot tell: ${e}")
+            },
+        }
+    }
+
+    // A blocked prompt can arrive mid-stream too, and it ends the stream the same way.
+    fn a_blocked_prompt_ends_a_stream_as_a_refusal(): void {
+        decoder: dyn StreamDecoder = GoogleStream.new()
+        deltas = stream_or_fail(decoder, [
+            "data: {\"promptFeedback\": {\"blockReason\": \"PROHIBITED_CONTENT\"},\"usageMetadata\": {\"promptTokenCount\": 7,\"totalTokenCount\": 7},\"modelVersion\": \"gemini-2.5-flash\"}",
+        ])
+        assert(deltas == [
+            Delta.ModelDelta(model: "gemini-2.5-flash"),
+            Delta.TextDelta(id: "0", text: "the prompt was blocked: PROHIBITED_CONTENT"),
+            Delta.Stop(reason: StopReason.Refusal),
+        ], "${deltas}")
+        assert(match decoder.finish() { Ok(_) => true, Err(_) => false }, "a refusal is a complete answer")
+    }
+
+    // The whole point of `decode_deltas`: the buffered door speaks the same vocabulary the streaming
+    // door does, so everything downstream of it is one implementation — including the ids, which is
+    // why the same `call_0` comes out of both.
+    fn the_buffered_door_produces_deltas_too(): void {
+        match Google.new("k").decode_deltas(captured_function_call_reply()) {
+            Ok(deltas) => {
+                assert(deltas == [
+                    Delta.ModelDelta(model: "gemini-2.0-flash"),
+                    Delta.ToolCallStart(id: "call_0", name: "get_current_weather"),
+                    Delta.ToolCallArgs(id: "call_0", fragment: "{\"location\":\"Boston\",\"unit\":\"celsius\"}"),
+                    Delta.Stop(reason: StopReason.ToolUse),
+                    Delta.UsageDelta(usage: Usage { input_tokens: 62, output_tokens: 8 }),
+                ], "${deltas}")
+            },
+            Err(e) => {
+                assert(false, "${e}")
+            },
+        }
+    }
+}

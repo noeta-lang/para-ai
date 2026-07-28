@@ -4,7 +4,7 @@ An agent harness for Noeta: a **provider codec seam**, one run loop over `para/a
 
 The split that decides everything else: **a provider is a codec, not a client.** The thing that varies between model vendors is the wire format; auth headers, retries, timeouts, mocking, recording, and tracing are identical across all of them. So a `Provider` turns a neutral `ModelRequest` into a request description and a response body back into a neutral `ModelReply` — and never performs I/O. The transport is written once, over a `para.api.Api`, which means a 429 backoff is not para/ai code.
 
-> **Status: phases 1–3, 6, and 8.** Core data model, the `Provider` seam, the Anthropic codec, the `Mock` provider, the run loop, errors, telemetry, **tool calling**, **streaming** (`StreamDecoder`, the neutral `Event` enum, `agent.stream(conv, tx)`, and a scripted `FrameStream` so a streaming test needs no socket), the **`@prompt` expression tier with automatic provider prompt caching**, and the **MCP client** (stdio and streamable HTTP, tools as a `ToolSource`, resources, prompts, and a sampling seam that is off by default). AG-UI encoding and the SSE responder, guardrails, context strategies, structured output, and the OpenAI/Google/OpenRouter/Ollama codecs are later phases; [DESIGN.md](DESIGN.md) is the whole plan and §18 is the order. What is *not* here is not stubbed — it is absent, and the seams it will attach to are marked in the source.
+> **Status: phases 1–4, 6, and 8.** Core data model, the `Provider` seam, the run loop, errors, telemetry, **tool calling**, **streaming** (`StreamDecoder`, the neutral `Event` enum, `agent.stream(conv, tx)`, and a scripted `FrameStream` so a streaming test needs no socket), the **`@prompt` expression tier with automatic provider prompt caching**, the **MCP client** (stdio and streamable HTTP, tools as a `ToolSource`, resources, prompts, and a sampling seam that is off by default) — and **all five provider codecs**: Anthropic, OpenAI, OpenRouter, Google, and Ollama, across three codec families. AG-UI encoding and the SSE responder, guardrails, context strategies, and structured output are later phases; [DESIGN.md](DESIGN.md) is the whole plan and §18 is the order. What is *not* here is not stubbed — it is absent, and the seams it will attach to are marked in the source.
 
 ## What it provides
 
@@ -16,6 +16,9 @@ The split that decides everything else: **a provider is a codec, not a client.**
 | `para.ai.prompt` | `render`, `Prompt`, `Resolved` — the `@prompt` expression tier, and the stable/volatile split a prompt cache is placed from |
 | `para.ai.mcp` | `McpClient`, `Stdio`, `Http`, `Transport`, `Events`, `Sampler`, `Capabilities`, `Resource`, `PromptSpec` — the MCP client, and `impl ToolSource for McpClient` |
 | `para.ai.providers.anthropic` | `Anthropic` — the Anthropic Messages API codec |
+| `para.ai.providers.openai` | `OpenAiCompat` — the Chat Completions codec — and `OpenAi`, `OpenRouter`, `OllamaCompat`, which are *configurations* of it |
+| `para.ai.providers.google` | `Google` — the Gemini `generateContent` codec |
+| `para.ai.providers.ollama` | `Ollama` — Ollama's native `/api/chat` codec, over NDJSON |
 | `para.ai.mock` | `Mock`, `Scripted`, `ScriptedCall`, `Collector`, `ScriptedFrames`, `Replay` — the hermetic test double, codec *and* both transports |
 
 ## Installation
@@ -143,6 +146,7 @@ p.resolve().volatile()   // "Acme. Be brief. "                — everything fro
 | Anthropic | explicit | `cache_control: {"type": "ephemeral"}` on the marked turn's last content block; at most four per request, and a fifth is `AiError.Encode` at encode time rather than a vendor 400 that names no message |
 | OpenAI | implicit prefix match | nothing — the marker is ignored; what it needs is the stable text **first and byte-identical**, which the split guarantees |
 | Google | implicit prefix match | the same |
+| Ollama | implicit prefix match | the same — the server keeps a KV cache for the prefix it last served |
 
 Marking is on by default (`AgentConfig.cache`), which is the point: caching is correct *by default* because the language handed us the split. `.uncached()` removes the marker and changes no other byte — the prefix is still first and still identical, so an implicitly-caching vendor is unaffected. That is the switch for the one shape where a marker costs: a single-call workload with a large system prompt that never repeats inside the cache's TTL, where a cache *write* is priced above a plain read.
 
@@ -403,7 +407,7 @@ Three of those differ from [DESIGN.md](DESIGN.md) §2.1's sketch, and each is fo
 
 ### `estimate_tokens` returns `?int`, and `none` is a real answer
 
-A provider with no local tokenizer says so, rather than returning a number that will be trusted absolutely and is wrong by a few percent — a failure that otherwise surfaces as a vendor-side context error in the middle of a run, which is the worst possible place to learn about it. **Anthropic returns `none`**: it publishes no local tokenizer, and exact counts need its count-tokens endpoint, which is a network round trip and therefore not something a pure codec may do. A caller that needs a budget names its own margin instead of inheriting a constant we picked.
+A provider with no local tokenizer says so, rather than returning a number that will be trusted absolutely and is wrong by a few percent — a failure that otherwise surfaces as a vendor-side context error in the middle of a run, which is the worst possible place to learn about it. **Every codec in this package returns `none`, and each says why.** Anthropic and Google publish no local tokenizer — exact counts need their count-tokens endpoints, which are network round trips and therefore not something a pure codec may do. OpenAI's tokenizer is a library and a byte-pair table rather than anything reachable from here. Ollama's lives *inside the served model*, a different one per model, loaded on the server. A caller that needs a budget names its own margin instead of inheriting a constant we picked.
 
 ### Deltas: one accumulator, both transports
 
@@ -446,6 +450,61 @@ Anthropic.new(key).with_beta("…")           // the anthropic-beta header
 An error status is decoded into `AiError.Provider(429, "rate_limit_error", "…")`, so `code == "rate_limit_error"` is matchable and nobody has to regex a message string. A body that is *not* the documented envelope (an HTML error page from a proxy) is reported verbatim rather than swallowed.
 
 An unmodeled content block type is a **loud** `AiError.Decode` naming the path (`content[1].type`), not a silent drop: dropping a block would turn a partial answer into one that looks complete.
+
+## Five providers, three codec families
+
+DESIGN §2.1 makes a claim the code either supports or does not: **OpenRouter and Ollama's `/v1` are not new wire formats, so they should be configurations of the OpenAI-compatible codec rather than new files of JSON-shuffling.** They are.
+
+| provider | family | module | what differs from the family codec |
+| --- | --- | --- | --- |
+| Anthropic | `anthropic` | `providers.anthropic` | — |
+| Google | `google` | `providers.google` | — |
+| OpenAI | `openai_compat` | `providers.openai` | — (the family base) |
+| OpenRouter | `openai_compat` | `providers.openai` | **three field values** and two helpers: base URL, `max_tokens` rather than `max_completion_tokens`, reasoning accepted back on input; `OpenRouter.app` sets `HTTP-Referer`/`X-Title`, `OpenRouter.fallbacks`/`routing` set the `models` and `provider` body keys |
+| Ollama (`/v1`) | `openai_compat` | `providers.openai` | **four field values**: base URL, no auth, no `file` content part, `max_tokens` |
+| Ollama (`/api/chat`) | `ollama` | `providers.ollama` | its own codec — NDJSON, `keep_alive`, `options`, `think`, per-message `images` |
+
+`OpenAiCompat` is a value struct with nine fields; `OpenAi`, `OpenRouter`, and `OllamaCompat` are field-less structs holding only constructors that return one. **None of the three declares a `Provider` impl, an `encode`, or a decoder** — there is one of each, and `a_configuration_is_fields_not_code` in `openai.noe` asserts it by comparing each constructor's result against a literal `OpenAiCompat`. The payoff is that a sixth compatible provider is a call:
+
+```noeta
+groq  = OpenAiCompat.at("https://api.groq.com/openai/v1", key, "groq")
+vllm  = OpenAiCompat.at("http://gpu-01.internal:8000/v1", "", "vllm")
+```
+
+Two things DESIGN §2.1's table predicted and the code corrected:
+
+- **Reasoning-token accounting is not an OpenRouter delta.** OpenRouter reports it in `usage.completion_tokens_details.reasoning_tokens` — OpenAI's own field — so the family base already reads it and OpenRouter needed no code for it.
+- **Ollama's native endpoint genuinely needs its own codec**, exactly as the table's second Ollama row says. It is not a delta from `openai_compat`: `arguments` is an object rather than a string, a tool result is addressed by `tool_name` rather than by a call id, images are bare base64 on the message, sampling lives under `options` with different key names, and the stream is NDJSON. Sharing a codec with that many disagreements would have been a codec with a mode switch in it.
+
+### Where the three families genuinely disagree
+
+Worth knowing before writing a fourth, because each of these is a place a codec can be silently wrong:
+
+| | Anthropic | `openai_compat` | Google | Ollama native |
+| --- | --- | --- | --- | --- |
+| system prompt | hoisted to `system` | a `system` message | hoisted to `systemInstruction` | a `system` message |
+| assistant role | `assistant` | `assistant` | **`model`** | `assistant` |
+| tool result addressed by | call id | call id | **the call's name** | **the call's name** (`tool_name`) |
+| one tool turn becomes | one `user` turn | **one message per result** | one `user` turn | one message per result |
+| tool arguments on the wire | a JSON object | **a JSON string** | a JSON object | a JSON object |
+| "the model wants a tool" | `stop_reason: tool_use` | `finish_reason: tool_calls` | **`STOP` — derived from the parts** | **`stop` — derived from the parts** |
+| stream framing | SSE | SSE | SSE (`?alt=sse`) | **NDJSON** |
+| stream terminator | `message_stop` | `[DONE]`, but `finish_reason` is what means *complete* | none — `finishReason` is the only signal | `"done": true` |
+| inline media | images, PDF | images, PDF | images, audio, video, PDF, text | **images only** |
+
+The two derived stop reasons are the entries most worth staring at. Gemini and Ollama both report an ordinary "stopped" reason for a turn whose only content is a tool call, so a codec that trusted the vendor's word would end every tool loop on its first turn — with the model's request unanswered and the run reported as complete. Both codecs derive `StopReason.ToolUse` from the parts instead, and both have a test named for it.
+
+### Every decoder is proved against a real transcript
+
+Not against a fixture written to match the decoder — that proves nothing but its own consistency. Each codec holds verbatim published wire transcripts as raw lines and replays them frame by frame, asserting the **exact** delta list:
+
+| codec | transcripts |
+| --- | --- |
+| `anthropic` | text with a `ping`; a tool call whose arguments arrive as six partial-JSON fragments; extended thinking with its signature delta; a stream that dies with `event: error` |
+| `openai` | text with an `include_usage` chunk and `[DONE]`; a tool call whose id arrives once and whose arguments arrive as six fragments; an OpenRouter reasoning stream with `: OPENROUTER PROCESSING` keepalives |
+| `google` | text with the cumulative `usageMetadata` repeated on every chunk and no terminator at all; a thinking-then-function-call turn whose `finishReason` is `STOP` |
+| `ollama` | NDJSON text ending in `"done": true`; a thinking-then-tool-call stream whose tool call arrives **whole** in one line |
+
 
 ## Streaming
 
@@ -509,7 +568,7 @@ Streaming is therefore **off by default**: `AgentConfig.stream` is `false`, so `
 
 `client.stream` reads the response head and then hands back a reader; it exposes **no way to read the status back**. A 429 or a 400 therefore streams its JSON error body like any other body, and an SSE reader frames a plain JSON document into nothing at all — so a rate limit arrives at the decoder as an *empty stream* rather than as `AiError.Provider(429, "rate_limit_error", …)`.
 
-What this package does about it: each codec's `finish()` refuses an empty stream with a message that names the likely cause and says the status is unavailable, so the failure is loud and points at the right thing. What it cannot do is give you the matchable `code`. The streaming retry consequently fires on transport failures and on any status a `Streamer` *can* report — which the scripted one can, and the live one cannot yet. **Closing this needs `FrameStream.status()` in `std.http`**; until then, a workload that needs typed vendor errors should stay on the buffered path.
+What this package does about it: each codec's `finish()` refuses an empty stream with a message that names the likely cause and says the status is unavailable, so the failure is loud and points at the right thing. What it cannot do is give you the matchable `code`. The streaming retry consequently fires on transport failures and on any status a `Streamer` *can* report — which the scripted one can, and the live one cannot yet. **`FrameStream.status()` has since landed in `std.http`** — along with `ok()`, `header(name)`, and `error_for_status()`, all readable before the first `recv()` — so the gap is now on this side: `para.ai.Streamer.open` returns frames and nothing else, and surfacing the status means widening that trait and its four implementations. Until that lands, a workload that needs typed vendor errors should stay on the buffered path.
 
 ### Testing a stream
 
@@ -646,7 +705,9 @@ Three commitments:
 - [`examples/memory/`](examples/memory) — **memory as an MCP server**: a sixty-line POSIX-shell memory server the example spawns over stdio, an agent whose entire tool vocabulary came from that subprocess, and a fact that survives between runs because it left the process. Declares no `#[Tool]` of its own, and a test asserts that from the trust-boundary index. Hermetic, no key, no npm install.
 - [`examples/prompt_cache/`](examples/prompt_cache) — a `@prompt` system prompt with a stable preamble and a per-customer tail: the exact statics/holes decomposition, a recall that proves reading the cache prefix never evaluated it, and the encoded Anthropic body with `cache_control` on the stable block and nowhere else. Hermetic, no key.
 
-The design's other examples (`chat-cli`, `agui-server`, `structured`, `local-ollama`) arrive with the phases they exercise.
+- [`examples/providers/`](examples/providers) — five vendors, three codec families, one program: the runtime-selection `match` at six arms, the whole run loop driven over each real codec from a captured vendor body (buffered through `para/api`'s `Mock`, streamed through `Replay`) — and **two live checks against a local Ollama**, which skip when none is running and are made un-skippable in CI by `OLLAMA_REQUIRED=1`.
+
+The design's other examples (`chat-cli`, `agui-server`, `structured`) arrive with the phases they exercise; `local-ollama` is folded into `examples/providers` above, since the example that selects a provider at runtime is already the one that has an Ollama to talk to.
 
 ## Requirements
 
