@@ -39,7 +39,7 @@ use para.ai.agui
 use para.ai.agui.{RunInput, Tape}
 use para.ai.mock.Mock
 use para.ai.providers.anthropic.Anthropic
-use para.ai.tools.{Arg, Local, Tool}
+use para.ai.tools.{Arg, Local, Tool, Toolbox}
 
 // --- The agent ------------------------------------------------------------------------------------
 
@@ -212,6 +212,26 @@ server.serve(port(), fetch)
     fn the_server_answers_its_other_routes(): void {
         assert(fetch(post("/nope", "")).status() == 404)
         assert(fetch(get("/")).body().contains("RunAgentInput"))
+    }
+
+    // **A dependency's test fixtures must not reach this program's model.**
+    //
+    // `agui.noe` declares two `#[Tool]` fixtures for its own suite, and `attributes_of::<Tool>()` is
+    // whole-program — dependency packages included. They live inside a `@test` block, which is
+    // stripped before lowering on every build that is not that module's own `noeta test`, so they
+    // cannot be linked in here at all. `examples/tools` asserts the same for `tools.noe` and
+    // `mock.noe`; this is the assertion for the module phase 7 added, and the thing worth catching
+    // is the *next* fixture somebody adds to the library.
+    fn no_dependency_tool_reaches_this_programs_model(): void {
+        match Toolbox.of(Local.new()) {
+            Ok(box) => {
+                assert(box.names() == ["weather"],
+                    "a consumer's toolbox is its own tools and nothing else: ${box.names()}")
+            },
+            Err(e) => {
+                assert(false, "${e}")
+            },
+        }
     }
 }
 
