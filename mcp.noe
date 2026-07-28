@@ -53,8 +53,12 @@
 namespace para.ai.mcp
 
 use std.{env, fs, json, os}
+use std.http.client
+use std.http.server
+use std.http.{Framing, FrameStream, HttpError, Request, Response}
 use std.id.{uuid}
 use std.task.{map_bounded, sleep}
+use para.api.{Api, Middleware, Next}
 use para.ai.{AiError, Message, Part, Role}
 use para.ai.provider
 use para.ai.tools
@@ -261,6 +265,10 @@ pub trait Transport {
 
     // Server→client documents that arrive outside a reply, up to `max` of them.
     fn poll(max: int): Result<List<string>, AiError>
+
+    // The revision the handshake settled on. Streamable HTTP has to put it on every later request
+    // (`MCP-Protocol-Version`); stdio has nowhere to put it and ignores it.
+    fn negotiated(revision: string): void
 
     // Release the server. Idempotent — `close` on an already-closed client is not an error.
     fn shutdown(): void
@@ -499,6 +507,12 @@ pub class Stdio {
             return Ok(empty)
         }
 
+        // A stdio session has no request headers to carry the revision on: both sides already
+        // agreed to it in the handshake, and there is no intermediary to re-tell.
+        fn negotiated(revision: string): void {
+            return
+        }
+
         // Close stdin first: EOF on stdin is how the MCP stdio transport asks a server to exit.
         // Then reap, and kill whatever is still there. **No unbounded wait** — a synchronous wait
         // cannot be bounded (see `with_deadline`), and a server that ignores EOF would otherwise
@@ -630,6 +644,326 @@ async fn napping(n: Nap): int {
 fn nap(ms: int): void {
     napped = map_bounded([Nap { ms: ms }], 1, napping)
     return
+}
+
+// --- Streamable HTTP -------------------------------------------------------------------------------
+
+// The other transport MCP defines: **POST for requests**, and an SSE channel for whatever the server
+// wants to say on its own.
+//
+// The POST half rides the `para/api` onion, exactly as the run loop's buffered model call does, so
+// `Retry`, `Logging`, `Record`, and `Cache` are available to an MCP session for free and a test can
+// answer it with a scripted middleware instead of a socket. The server→client half cannot: a
+// `FrameStream` structurally cannot flow through that onion (DESIGN O-4), which is why it comes
+// through the `Events` seam below.
+//
+// Three protocol details this class owns, because they are the difference between working against a
+// real server and almost working:
+//
+//   * **The session id.** A server may answer `initialize` with `Mcp-Session-Id`; every later
+//     request has to carry it, and a `404` once we have one means the session was expired by the
+//     server rather than that the URL is wrong — reported as `session_expired`, which is a
+//     reconnect, not a bug in the caller's config.
+//   * **The negotiated protocol revision** goes back out as `MCP-Protocol-Version` once the
+//     handshake settles, which is how a server knows which revision's rules to apply.
+//   * **A POST may be answered either way.** `Accept` names both types, and a `text/event-stream`
+//     answer is cut into its documents rather than handed to a JSON parser whole.
+pub class Http {
+    mut endpoint: string
+    mut api: Api
+    mut events: dyn Events
+    mut extra: Map<string, string>
+    mut session: string
+    mut protocol: string
+    mut pending: List<string>
+    mut closed: bool
+
+    // The default transport: a plain client with a deadline, and the real event channel.
+    //
+    // The deadline is the *client's*, which is where a streamable-HTTP timeout belongs — unlike
+    // stdio, `std.http` already bounds a request and a stream open, so this transport needs no
+    // watchdog and no kill.
+    fn new(endpoint: string, timeout_ms: int = 30000): Http {
+        return Http.over(endpoint, Api.new(client.new().timeout(timeout_ms)))
+    }
+
+    // Over a transport chain you composed yourself — the door for a bearer token, a recorder, or a
+    // scripted middleware in a test.
+    fn over(endpoint: string, api: Api): Http {
+        return Http {
+            endpoint: endpoint,
+            api: api,
+            events: HttpEvents {},
+            extra: {},
+            session: "",
+            protocol: "",
+            pending: [],
+            closed: false,
+        }
+    }
+
+    // A header on every request — an `Authorization`, a tenant id, an API gateway key.
+    fn with_header(name: string, value: string): Http {
+        self.extra = self.extra.set(name, value)
+        return self
+    }
+
+    // Where the server→client channel comes from. Defaults to the real one; a test scripts it.
+    fn with_events(source: dyn Events): Http {
+        self.events = source
+        return self
+    }
+
+    // The session id the server assigned, or `""` if it runs sessionless.
+    fn session_id(): string {
+        return self.session
+    }
+
+    // What goes on every request. `Accept` names **both** types because the spec says a server may
+    // answer a POST either way, and a client that named one would be told so with a 406.
+    fn headers(): Map<string, string> {
+        mut h: Map<string, string> = {
+            "accept": "application/json, text/event-stream",
+            "content-type": "application/json",
+        }
+        if self.session != "" {
+            h = h.set("mcp-session-id", self.session)
+        }
+        if self.protocol != "" {
+            h = h.set("mcp-protocol-version", self.protocol)
+        }
+        for name in self.extra.keys() {
+            h = h.set(name, self.extra[name])
+        }
+        return h
+    }
+
+    // Learn the session id and the negotiated revision from a reply, so the next request carries
+    // both. Reading the revision off the *reply* rather than off our own request is deliberate:
+    // what matters is what the server agreed to.
+    fn absorb(status: int, header: string, body: string, kind: string): Result<void, AiError> {
+        if header != "" {
+            self.session = header
+        }
+        if status == 404 && self.session != "" {
+            self.session = ""
+            return Err(AiError.Mcp(
+                server: self.label(),
+                code: "session_expired",
+                message: "the server no longer knows this session — reconnect with a fresh `McpClient.connect`",
+            ))
+        }
+        if status == 202 {
+            // Accepted, no body: the answer to a notification.
+            return Ok()
+        }
+        if status < 200 || status >= 300 {
+            return Err(AiError.Mcp(
+                server: self.label(),
+                code: "http_status",
+                message: "the endpoint answered ${status}: ${body}",
+            ))
+        }
+        trimmed = body.trim()
+        if trimmed == "" {
+            return Ok()
+        }
+        if kind.contains("text/event-stream") {
+            for doc in sse_documents(body) {
+                self.pending = self.pending ~ [doc]
+            }
+            return Ok()
+        }
+        self.pending = self.pending ~ [trimmed]
+        return Ok()
+    }
+
+    // Inline for the `dyn`-coercion reason every impl in this file is inline; see `Stdio`.
+    impl Transport {
+        fn label(): string {
+            return "http:${self.endpoint}"
+        }
+
+        // Nothing to start. An HTTP transport has no child to spawn and no connection to hold —
+        // the first POST is the first thing that can fail, and it fails as itself.
+        fn start(): Result<void, AiError> {
+            return Ok()
+        }
+
+        fn send_doc(doc: string): Result<void, AiError> {
+            if self.closed {
+                return Err(AiError.Mcp(
+                    server: self.label(),
+                    code: "closed",
+                    message: "this session was closed — its endpoint has nothing to answer with",
+                ))
+            }
+            req: Request = self.api.prepare("post", self.endpoint, doc, self.headers())
+            // `?` is the `impl From<HttpError>` conversion: a *transport* failure is an `Err` here,
+            // while an error status arrives as an ordinary response and is typed below.
+            resp = self.api.send(req)?
+            return self.absorb(
+                resp.status(),
+                resp.header("mcp-session-id") ?? "",
+                resp.body(),
+                (resp.header("content-type") ?? "").lower(),
+            )
+        }
+
+        // Whatever the last POST brought back, one document at a time. `none` means this exchange
+        // is out of documents — for HTTP that is an ordinary end rather than a broken session.
+        fn next_doc(): Result<?string, AiError> {
+            if self.pending.len() == 0 {
+                return Ok(none)
+            }
+            head = self.pending[0]
+            self.pending = self.pending.slice(1, self.pending.len())
+            return Ok(some(head))
+        }
+
+        // The server→client channel: a GET that the server answers with an event stream.
+        //
+        // `Events.drain` reads the **head before any frame**, so a 405 (the spec's way of saying
+        // "this server offers no such channel") and a 429 are visible without waiting on a frame
+        // that is never coming — which is what `FrameStream.status()`/`error_for_status()` are for.
+        fn poll(max: int): Result<List<string>, AiError> {
+            if self.closed || max <= 0 {
+                empty: List<string> = []
+                return Ok(empty)
+            }
+            return self.events.drain(self.endpoint, self.headers(), max)
+        }
+
+        // Every later request carries the revision the server agreed to, which is how it knows
+        // which revision's rules to apply. Read off the *reply* rather than off our own request:
+        // what matters is what was agreed, not what was asked for.
+        fn negotiated(revision: string): void {
+            self.protocol = revision
+            return
+        }
+
+        // The spec's own teardown: `DELETE` with the session id ends the session server-side.
+        // Best-effort — a server that already forgot us is not an error worth raising at `close`.
+        fn shutdown(): void {
+            if self.session != "" && !self.closed {
+                farewell: Request = self.api.prepare("delete", self.endpoint, "", self.headers())
+                said_goodbye = self.api.send(farewell)
+            }
+            self.session = ""
+            self.pending = []
+            self.closed = true
+            return
+        }
+    }
+}
+
+// Where the server→client event channel comes from.
+//
+// A seam rather than a direct `client.stream` call, for the reason `para.ai.Streamer` exists: a
+// `FrameStream` cannot flow through the `para/api` onion, so the scripted-middleware trick that
+// makes the POST half testable does not reach the streaming half. One trait with two
+// implementations — the real client, and whatever a test hands it — is what keeps a streaming test
+// as hermetic as a buffered one.
+//
+// It hands back **documents** rather than frames on purpose: SSE framing belongs to `std.http`
+// (DESIGN §3), and a second copy of that decoder in this package would be worse than the seam.
+pub trait Events {
+    // Up to `max` server→client documents. `Ok([])` when the channel had nothing to say.
+    fn drain(endpoint: string, headers: Map<string, string>, max: int): Result<List<string>, AiError>
+}
+
+// The real channel: `client.stream(req, Framing.Sse)`, with the head checked before a single frame
+// is consumed.
+pub struct HttpEvents {
+    impl Events {
+        fn drain(endpoint: string, headers: Map<string, string>, max: int): Result<List<string>, AiError> {
+            req: Request = client.new().prepare("get", endpoint, "", headers)
+            opened = client.stream(req, Framing.Sse)?
+            // 405 is how the spec says "this server has no server→client channel", and it is not a
+            // failure — it is an answer. Every other non-2xx is a real one, and `status()` makes it
+            // visible without consuming a frame that would never arrive.
+            if opened.status() == 405 {
+                opened.close()
+                empty: List<string> = []
+                return Ok(empty)
+            }
+            if !opened.ok() {
+                status = opened.status()
+                opened.close()
+                return Err(AiError.Mcp(
+                    server: "http:${endpoint}",
+                    code: "http_status",
+                    message: "the event channel answered ${status}",
+                ))
+            }
+            return Ok(drain_frames(opened, max))
+        }
+    }
+}
+
+// One bounded drain of a frame stream, packaged for `map_bounded` — the same synchronous-to-async
+// bridge `run_sync` uses, because `recv` is `async` and `Transport.poll` is not.
+struct FrameJob {
+    stream: FrameStream
+    max: int
+}
+
+async fn draining(j: FrameJob): List<string> {
+    mut out: List<string> = []
+    mut left = j.max
+    mut reading = true
+    while reading && left > 0 {
+        left = left - 1
+        arrived = j.stream.recv().await
+        match arrived {
+            some(f) => {
+                if f.data != "" {
+                    out = out ~ [f.data]
+                }
+            },
+            none => {
+                reading = false
+            },
+        }
+    }
+    j.stream.close()
+    return out
+}
+
+fn drain_frames(stream: FrameStream, max: int): List<string> {
+    return map_bounded([FrameJob { stream: stream, max: max }], 1, draining)[0]
+}
+
+// A **buffered** `text/event-stream` body, cut into the JSON-RPC documents it carries.
+//
+// This is not a second SSE decoder and must not become one. Streaming SSE belongs to `std.http`
+// (DESIGN §3), and this reads a body that has already arrived whole — the case where a server
+// answers one POST with an event stream and closes it, which the spec allows and several servers
+// do. A `data:` payload may be split across continuation lines, so they are joined with a newline
+// exactly as the SSE grammar says; everything else in the block (an `event:`, an `id:`, a comment)
+// is not a JSON-RPC message and is skipped.
+pub fn sse_documents(body: string): List<string> {
+    mut out: List<string> = []
+    mut current = ""
+    mut open = false
+    for raw in body.split("\n") {
+        line = raw.replace("\r", "")
+        if line == "" {
+            if open && current != "" {
+                out = out ~ [current]
+            }
+            current = ""
+            open = false
+        } else if line.starts_with("data:") {
+            piece = line.slice(5, line.len()).trim()
+            current = if open then current ~ "\n" ~ piece else piece
+            open = true
+        }
+    }
+    if open && current != "" {
+        out = out ~ [current]
+    }
+    return out
 }
 
 // --- Sampling ---------------------------------------------------------------------------------------
@@ -792,6 +1126,7 @@ pub class McpClient {
                 message: "`initialize` answered without a `protocolVersion`, so this is not an MCP server",
             ))
         }
+        self.transport.negotiated(self.protocol_revision)
         self.caps = capabilities_of(provider.obj_at(reply, "capabilities"))
         info = provider.obj_at(reply, "serverInfo")
         named = provider.str_at(info, "name")
@@ -1473,6 +1808,127 @@ fn probe_client(mode: string): McpClient {
 }
 
 
+// A scripted MCP endpoint: a `para.api` middleware that answers each POST from a queue and keeps
+// what it was sent.
+//
+// The buffered half of streamable HTTP goes through the `para/api` onion, so this is all it takes
+// to test it without a socket — the same trick `mock.Mock` plays for the model call, and the reason
+// the POST half was built on `Api` rather than on a bare client.
+class ScriptedEndpoint {
+    mut replies: List<Response>
+    mut at: int
+    mut sent: List<string>
+    mut sessions: List<string>
+
+    fn new(): ScriptedEndpoint {
+        return ScriptedEndpoint { replies: [], at: 0, sent: [], sessions: [] }
+    }
+
+    fn answering(status: int, body: string, headers: Map<string, string> = {}): ScriptedEndpoint {
+        self.replies = self.replies ~ [server.response(status, body, headers)]
+        return self
+    }
+
+    // Every request body, in order — "what did the client actually send?", which is the difference
+    // between a session that connected and one that connected correctly.
+    fn sent_bodies(): List<string> {
+        return self.sent
+    }
+
+    // The `Mcp-Session-Id` each request carried, so "the client sends the session back" is a claim
+    // a test can check rather than assume.
+    fn sent_sessions(): List<string> {
+        return self.sessions
+    }
+
+    // Inline, for the `dyn`-coercion reason every impl in this file is.
+    impl Middleware {
+        fn handle(req: Request, next: Next): Result<Response, HttpError> {
+            self.sent = self.sent ~ [req.body()]
+            self.sessions = self.sessions ~ [req.header("mcp-session-id") ?? ""]
+            if self.at >= self.replies.len() {
+                // Loud: a session that outlasts its script is a test that scripted the wrong number
+                // of exchanges, and answering something plausible would hide that.
+                return Ok(server.response(500, "the endpoint script ran out after ${self.at} repl(y/ies)"))
+            }
+            answer = self.replies[self.at]
+            self.at = self.at + 1
+            return Ok(answer)
+        }
+    }
+}
+
+// A scripted server→client channel. `Events` hands back documents rather than frames precisely so a
+// test can be this small.
+class ScriptedEvents {
+    mut docs: List<string>
+    mut drains: int
+
+    fn of(docs: List<string>): ScriptedEvents {
+        return ScriptedEvents { docs: docs, drains: 0 }
+    }
+
+    fn drain_count(): int {
+        return self.drains
+    }
+
+    impl Events {
+        fn drain(endpoint: string, headers: Map<string, string>, max: int): Result<List<string>, AiError> {
+            self.drains = self.drains + 1
+            return Ok(self.docs)
+        }
+    }
+}
+
+// The `initialize` reply the HTTP tests script, with a session id on the response.
+fn http_initialize_reply(): string {
+    return "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"tools\":{\"listChanged\":true}},\"protocolVersion\":\"2025-06-18\",\"serverInfo\":{\"name\":\"probe\",\"version\":\"9.9\"}}}"
+}
+
+fn http_tools_reply(id: int): string {
+    return "{\"jsonrpc\":\"2.0\",\"id\":${id},\"result\":{\"tools\":[{\"description\":\"Echo the text back\",\"inputSchema\":{\"type\":\"object\"},\"name\":\"echo\"}]}}"
+}
+
+fn json_headers(): Map<string, string> {
+    h: Map<string, string> = {"content-type": "application/json"}
+    return h
+}
+
+fn session_headers(): Map<string, string> {
+    h: Map<string, string> = {"content-type": "application/json", "mcp-session-id": "sess-1"}
+    return h
+}
+
+// An `Http` transport over a scripted endpoint, and the client on top of it.
+fn http_client(endpoint: ScriptedEndpoint, transport: Http): McpClient {
+    match McpClient.connect(transport) {
+        Ok(c) => {
+            return c
+        },
+        Err(e) => {
+            assert(false, "connect failed: ${e}")
+        },
+    }
+    return McpClient.unstarted()
+}
+
+fn http_transport(endpoint: ScriptedEndpoint): Http {
+    return Http.over("https://example.test/mcp", Api.new(client.new()).with(endpoint))
+}
+
+fn http_connect_error(transport: Http): string {
+    match McpClient.connect(transport) {
+        Ok(c) => {
+            c.close()
+            assert(false, "connect must not succeed")
+        },
+        Err(e) => {
+            return "${e}"
+        },
+    }
+    return ""
+}
+
 // The sampler the sampling tests hand to `connect_sampling`. Module level rather than inside the
 // `@test` block for the same reason the fixture is: a helper the tests call has to exist where a
 // `dyn` coercion can see it, and nothing here is `pub` or `#[Tool]`.
@@ -2107,5 +2563,141 @@ fn connect_error(t: dyn Transport): string {
             Err(e) => false,
         })
         c.close()
+    }
+
+    // --- Streamable HTTP ----------------------------------------------------------------------------
+    //
+    // Hermetic in a different way from the stdio tests: the POST half rides the `para/api` onion, so
+    // a scripted middleware answers it and no socket is opened. The server→client channel comes
+    // through the `Events` seam for the same reason `para.ai.Streamer` exists — a `FrameStream`
+    // cannot flow through that onion.
+
+    fn http_posts_exactly_the_initialize_bytes_and_carries_the_session_back(): void {
+        endpoint = ScriptedEndpoint.new()
+            .answering(200, http_initialize_reply(), session_headers())
+            .answering(202, "", json_headers())
+            .answering(200, http_tools_reply(2), json_headers())
+        transport = http_transport(endpoint)
+        c = http_client(endpoint, transport)
+        sent = endpoint.sent_bodies()
+        assert(sent.len() == 3, "initialize, initialized, tools/list: ${sent.len()}")
+        assert(sent[0] == request_doc(1, "initialize", initialize_params(false)), sent[0])
+        assert(sent[1] == "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\",\"params\":{}}", sent[1])
+        assert(sent[2] == "{\"id\":2,\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"params\":{}}", sent[2])
+        // The session id the server assigned is carried on every request after the one that
+        // assigned it.
+        assert(transport.session_id() == "sess-1", transport.session_id())
+        carried = endpoint.sent_sessions()
+        assert(carried[0] == "", "there is no session to send on the first request: ${carried}")
+        assert(carried[1] == "sess-1" && carried[2] == "sess-1", "${carried}")
+        assert(names_of(specs_or_fail(c)) == ["echo"], "${names_of(specs_or_fail(c))}")
+        c.close()
+    }
+
+    // The same tool-call bytes as over stdio — one protocol, two pipes.
+    fn a_tool_call_over_http_is_the_same_document(): void {
+        endpoint = ScriptedEndpoint.new()
+            .answering(200, http_initialize_reply(), session_headers())
+            .answering(202, "", json_headers())
+            .answering(200, http_tools_reply(2), json_headers())
+            .answering(200, "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"echo: over http\"}]}}", json_headers())
+        transport = http_transport(endpoint)
+        c = http_client(endpoint, transport)
+        assert(call_or_fail(c, "echo", "{\"text\": \"over http\"}") == "echo: over http")
+        call = endpoint.sent_bodies()[3]
+        assert(call
+            == "{\"id\":3,\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"arguments\":{\"text\":\"over http\"},\"name\":\"echo\"}}",
+            call)
+        c.close()
+    }
+
+    // An error *status* is an answer, and it is typed as one rather than parsed as a reply.
+    fn an_http_error_status_is_typed_rather_than_parsed(): void {
+        endpoint = ScriptedEndpoint.new().answering(503, "upstream is down", json_headers())
+        message = http_connect_error(http_transport(endpoint))
+        assert(message.contains("http_status"), message)
+        assert(message.contains("503"), message)
+        assert(message.contains("upstream is down"), "the body is in the message: ${message}")
+    }
+
+    // A 404 once we hold a session is the server saying the session is gone — a reconnect, not a
+    // wrong URL, and the message says which.
+    fn a_404_after_a_session_says_the_session_expired(): void {
+        endpoint = ScriptedEndpoint.new()
+            .answering(200, http_initialize_reply(), session_headers())
+            .answering(202, "", json_headers())
+            .answering(200, http_tools_reply(2), json_headers())
+            .answering(404, "unknown session", json_headers())
+        transport = http_transport(endpoint)
+        c = http_client(endpoint, transport)
+        message = call_error(c, "echo", "{}")
+        assert(message.contains("session_expired"), message)
+        assert(message.contains("reconnect"), message)
+        c.close()
+    }
+
+    // The spec lets a server answer one POST with an event stream and close it. That body arrives
+    // whole, so it is cut where it stands rather than through a second streaming decoder.
+    fn an_event_stream_answer_to_a_post_is_cut_into_documents(): void {
+        streamed: Map<string, string> = {"content-type": "text/event-stream"}
+        body = "event: message\ndata: ${http_initialize_reply()}\n\n"
+        endpoint = ScriptedEndpoint.new()
+            .answering(200, body, streamed)
+            .answering(202, "", json_headers())
+            .answering(200, http_tools_reply(2), json_headers())
+        c = http_client(endpoint, http_transport(endpoint))
+        assert(c.server_name() == "mcp:probe", c.server_name())
+        assert(names_of(specs_or_fail(c)) == ["echo"])
+        c.close()
+    }
+
+    // The cut itself, including the two shapes that are easy to get wrong: a payload continued over
+    // several `data:` lines, and everything that is not one.
+    fn a_buffered_event_stream_body_cuts_on_blank_lines(): void {
+        found = sse_documents(": a comment\nevent: message\ndata: {\"a\":1}\n\nid: 7\ndata: {\"b\":\ndata: 2}\n\n")
+        assert(found.len() == 2, "${found}")
+        assert(found[0] == "{\"a\":1}", found[0])
+        assert(found[1] == "{\"b\":\n2}", "a continued payload is joined with a newline: ${found[1]}")
+        // A body with no blank line after the last block still yields it.
+        assert(sse_documents("data: {}") == ["{}"])
+        assert(sse_documents("") == [])
+    }
+
+    // The server→client channel. A notification that arrives on it is handled exactly as one that
+    // arrives interleaved with a reply — same `inbound`, same cache invalidation.
+    fn listen_reads_the_server_to_client_channel(): void {
+        endpoint = ScriptedEndpoint.new()
+            .answering(200, http_initialize_reply(), session_headers())
+            .answering(202, "", json_headers())
+            .answering(200, http_tools_reply(2), json_headers())
+            .answering(200, "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"tools\":[{\"description\":\"New\",\"inputSchema\":{\"type\":\"object\"},\"name\":\"fresh\"}]}}", json_headers())
+        channel = ScriptedEvents.of(["{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}"])
+        transport = http_transport(endpoint).with_events(channel)
+        c = http_client(endpoint, transport)
+        assert(names_of(specs_or_fail(c)) == ["echo"])
+        assert(match c.listen(8) {
+            Ok(n) => n == 1,
+            Err(e) => false,
+        }, "listen failed")
+        assert(channel.drain_count() == 1, "${channel.drain_count()}")
+        assert(c.notification_count() == 1, "${c.notification_count()}")
+        assert(names_of(specs_or_fail(c)) == ["fresh"], "the notification invalidated the cache")
+        c.close()
+    }
+
+    // `close` is the spec's own teardown — `DELETE` with the session id — and the session is gone
+    // locally whatever the server says about it.
+    fn closing_an_http_session_deletes_it_server_side(): void {
+        endpoint = ScriptedEndpoint.new()
+            .answering(200, http_initialize_reply(), session_headers())
+            .answering(202, "", json_headers())
+            .answering(200, http_tools_reply(2), json_headers())
+            .answering(204, "", json_headers())
+        transport = http_transport(endpoint)
+        c = http_client(endpoint, transport)
+        c.close()
+        assert(endpoint.sent_bodies().len() == 4, "the DELETE went out: ${endpoint.sent_bodies().len()}")
+        assert(endpoint.sent_sessions()[3] == "sess-1", "${endpoint.sent_sessions()}")
+        assert(transport.session_id() == "")
     }
 }
