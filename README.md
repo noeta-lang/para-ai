@@ -4,7 +4,7 @@ An agent harness for Noeta: a **provider codec seam**, one run loop over `para/a
 
 The split that decides everything else: **a provider is a codec, not a client.** The thing that varies between model vendors is the wire format; auth headers, retries, timeouts, mocking, recording, and tracing are identical across all of them. So a `Provider` turns a neutral `ModelRequest` into a request description and a response body back into a neutral `ModelReply` — and never performs I/O. The transport is written once, over a `para.api.Api`, which means a 429 backoff is not para/ai code.
 
-> **Status: phase 3.** Core data model, the `Provider` seam, the Anthropic codec, the `Mock` provider, the run loop, errors, telemetry, **tool calling** — and **streaming**: `StreamDecoder`, the neutral `Event` enum, `agent.stream(conv, tx)`, and a scripted `FrameStream` so a streaming test needs no socket. AG-UI encoding and the SSE responder, MCP, guardrails, context strategies, structured output, `@prompt`, and the OpenAI/Google/OpenRouter/Ollama codecs are later phases; [DESIGN.md](DESIGN.md) is the whole plan and §18 is the order. What is *not* here is not stubbed — it is absent, and the seams it will attach to are marked in the source.
+> **Status: phases 1–3 and 8.** Core data model, the `Provider` seam, the Anthropic codec, the `Mock` provider, the run loop, errors, telemetry, **tool calling**, **streaming** (`StreamDecoder`, the neutral `Event` enum, `agent.stream(conv, tx)`, and a scripted `FrameStream` so a streaming test needs no socket) — and the **`@prompt` expression tier with automatic provider prompt caching**. AG-UI encoding and the SSE responder, MCP, guardrails, context strategies, structured output, and the OpenAI/Google/OpenRouter/Ollama codecs are later phases; [DESIGN.md](DESIGN.md) is the whole plan and §18 is the order. What is *not* here is not stubbed — it is absent, and the seams it will attach to are marked in the source.
 
 ## What it provides
 
@@ -13,6 +13,7 @@ The split that decides everything else: **a provider is a codec, not a client.**
 | `para.ai` | `Agent`, `AgentConfig`, `Conversation`, `Run`, `Message`, `Part`, `Role`, `AiError` — the data model, the run loop, and the errors; plus `Event`, `EventSink`, `Frames`, and `Streamer` — the streaming surface |
 | `para.ai.provider` | `Provider`, `StreamDecoder`, `ModelRequest`, `ModelReply`, `Delta`, `Usage`, `StopReason`, `Wire`, `Framing` — the codec seam and the delta accumulator |
 | `para.ai.tools` | `Tool`, `Arg`, `ToolSpec`, `ToolSource`, `Local`, `Toolbox`, `dispatch` — the signature-is-the-spec pipeline |
+| `para.ai.prompt` | `render`, `Prompt`, `Resolved` — the `@prompt` expression tier, and the stable/volatile split a prompt cache is placed from |
 | `para.ai.providers.anthropic` | `Anthropic` — the Anthropic Messages API codec |
 | `para.ai.mock` | `Mock`, `Scripted`, `ScriptedCall`, `Collector`, `ScriptedFrames`, `Replay` — the hermetic test double, codec *and* both transports |
 
@@ -82,13 +83,14 @@ pub enum Part {
     Thinking(text: string, signature: string)            // opaque; round-tripped verbatim
 }
 
-pub struct Message { role: Role  parts: List<Part>  name: ?string }
+pub struct Message { role: Role  parts: List<Part>  name: ?string  cache_breakpoint: bool }
 ```
 
-Two of those are decisions rather than shapes:
+Three of those are decisions rather than shapes:
 
 - **`ToolCall.args` is a raw JSON string, not a decoded map.** Vendors stream tool arguments as partial JSON fragments, so keeping the raw text puts the accumulate-then-decode boundary in one place, and a malformed argument blob is a recoverable error with a path rather than a half-built value.
 - **`Thinking.signature` is round-tripped verbatim.** Anthropic requires the signature back on the next turn for the block to remain valid; discarding it silently degrades multi-turn reasoning. Nothing in para/ai interprets it.
+- **`cache_breakpoint` is a hint, exactly like `name`.** It means "everything up to and including this turn may be served from the vendor's prompt cache". A codec whose vendor caches implicitly ignores it and still produces a correct request; Anthropic's turns it into `cache_control`. `AgentConfig` sets it on the system prompt's stable prefix for you — see [`@prompt`](#prompt-a-prompt-is-a-value-and-prompt-caching-falls-out-of-it) — and `Message.cached()` is the hand door.
 
 `Message.system/user/assistant/tool` are the constructors, `Message.text()` is the plain-string view (thinking and tool calls are deliberately absent — they are not what the message *said*), and `Conversation` is an immutable builder over a `List<Message>`.
 
@@ -97,6 +99,61 @@ A completed run gives back more than the answer:
 ```noeta
 pub struct Run { messages: List<Message>  usage: Usage  turns: int  stop: StopReason }
 ```
+
+## `@prompt`: a prompt is a value, and prompt caching falls out of it
+
+`@prompt { … }` is an **expression tier** — a typed value built from the block's text, not a string:
+
+```noeta
+use para.ai.prompt.render          // the one import that makes `@prompt { … }` exist here
+
+cfg = AgentConfig.new("claude-opus-5").with_system_prompt(@prompt {
+    You are a support agent. Answer in at most three sentences and never promise a refund.
+
+    Customer: ${account.company}, on the ${account.plan} plan since ${account.opened}.
+}.trimmed())
+```
+
+The block desugars to `render(statics, holes)`, where `statics` is the literal text split at every `${…}` and `holes` are the interpolations as **zero-argument closures**. Three things follow, and the third is the reason this module exists.
+
+**1. A malformed prompt variable is a compile error pointing inside the prompt.** A hole is real Noeta, parsed by the full grammar, closed over the enclosing scope, and type-checked — so `${acount.plan}` is E0007 at that column rather than a `${undefined}` that ships to production.
+
+**2. Holes are thunks, so an expensive interpolation runs only if something asks for it.** `p.stable()`, `p.is_static()`, and `p.trimmed()` all read the prompt's cache prefix without evaluating a single hole, which is what makes a caching decision free even when a hole is a memory recall or a database read. `p.resolve()` evaluates each hole **exactly once** and hands back a `Resolved`.
+
+**3. Statics always number holes + 1** — so the prompt arrives *pre-split into its stable and its volatile part*, which is precisely the input a prompt cache wants.
+
+```noeta
+p = @prompt { You work for ${company}. Be brief. }
+
+p.statics            // [" You work for ", ". Be brief. "]   — holes + 1, always
+p.holes.len()        // 1                                     — still unevaluated
+p.stable()           // " You work for "                      — the longest part that cannot vary
+p.resolve().volatile()   // "Acme. Be brief. "                — everything from the first hole on
+```
+
+`stable()` is the cache breakpoint, computed by the compiler. **No other agent framework can do this**, because in every other language a prompt is one opaque string by the time the SDK sees it — so a framework has to guess at the boundary, ask you to mark it by hand, or skip caching.
+
+### Where the breakpoint lands, per vendor
+
+`AgentConfig.with_system_prompt` resolves the prompt once and stores it **split** (`AgentConfig.system` is a `Resolved`, not a `string`). The run loop turns the split into two system turns — the stable prefix, then the volatile tail — and marks the first with `Message.cache_breakpoint`. Two turns rather than one turn with two parts, because a vendor's breakpoint attaches to a *content block* and the cached prefix ends where that block ends.
+
+| vendor | mechanism | what the codec does |
+| --- | --- | --- |
+| Anthropic | explicit | `cache_control: {"type": "ephemeral"}` on the marked turn's last content block; at most four per request, and a fifth is `AiError.Encode` at encode time rather than a vendor 400 that names no message |
+| OpenAI | implicit prefix match | nothing — the marker is ignored; what it needs is the stable text **first and byte-identical**, which the split guarantees |
+| Google | implicit prefix match | the same |
+
+Marking is on by default (`AgentConfig.cache`), which is the point: caching is correct *by default* because the language handed us the split. `.uncached()` removes the marker and changes no other byte — the prefix is still first and still identical, so an implicitly-caching vendor is unaffected. That is the switch for the one shape where a marker costs: a single-call workload with a large system prompt that never repeats inside the cache's TTL, where a cache *write* is priced above a plain read.
+
+### The rest of the surface
+
+- **`with_system("…")` is unchanged.** A plain string is a prompt with no holes, so it is stable in its entirety and gets the *maximal* cache prefix. Nothing an existing caller wrote had to change. (It is a separate method from `with_system_prompt` rather than an overload because a trait cannot be implemented for `string` — E0013 — so no bound can span the two.)
+- **`Conversation.system_prompt(p)` / `.user_prompt(p)`** take a `@prompt` as naturally as the string doors do, resolving once on the way in. They do **not** mark by default: a conversation turn is not reliably a prefix, and breakpoints are a scarce per-request resource. Pass `true`, or use `Message.cached()`, when a turn really is a long stable prefix worth caching — a retrieved corpus, a code base, a transcript.
+- **Resolution happens at configuration time, once.** Every turn of a run re-sends the system prompt, and implicit prefix caching keys on the bytes being identical; a hole re-evaluated per call would break the match silently, with nothing downstream able to notice.
+- **`text: "markdown"`** on the tier declaration is why the body highlights as Markdown in an editor and why hovering `@prompt` reports `expression tier @prompt — markdown body, evaluates to Prompt`. One line in `para.ai.prompt`, and every consumer picks it up.
+- **The body is verbatim**, including the whitespace the braces introduce — because the bytes a vendor's cache is keyed on are not something a handler should quietly rewrite. `.trimmed()` removes the block's outer edges when you want it; interior layout is content.
+
+[`examples/prompt_cache/`](examples/prompt_cache) is the whole of the above, asserted.
 
 ## Tools: the function signature is the spec
 
@@ -292,6 +349,8 @@ Three things about this wire format are easy to get wrong, and all three are han
 - **There is no `tool` role.** A `Role.Tool` message becomes a `user` turn carrying `tool_result` blocks.
 - **`max_tokens` is required.** A request that does not name one gets `Anthropic.default_max_tokens()` (4096) rather than a 400.
 
+It is also the one vendor here whose prompt cache is **explicit**: a `Message.cache_breakpoint` becomes `cache_control: {"type": "ephemeral"}` on that turn's last content block, stamped *before* the alternation merge so a merged turn keeps the marker on the block it was placed on. Four markers is a vendor limit, so a fifth is `AiError.Encode` at encode time.
+
 ```noeta
 Anthropic.new(key)                          // api.anthropic.com
 Anthropic.at("https://gateway.internal", key)   // a proxy or gateway
@@ -406,6 +465,8 @@ use para.ai.mock.Mock
 }
 ```
 
+`m.with_cache_reads(n)` scripts what a vendor reports about its prompt cache — a scripted transport has no cache of its own, so the figure is declared rather than earned, and what it demonstrates is that a vendor's number reaches `Run.usage` and `gen_ai.usage.cached_input_tokens`. A request's `cache_breakpoint` is rendered into the mock's own flat request JSON, so a test can watch the marker reach the wire without a vendor's dialect.
+
 `m.agent(cfg)` wires both halves in one call; `m.tool_agent(cfg, src)` does the same with a source of tools attached. `Scripted` covers the four things a turn can be — `reply_text`, `reply_tool` / `reply_tools`, `refuse`, `fail(status, code, message)` — and the script is consumed in order, one entry per model call. A run that outlasts its script gets a loud `mock_script_exhausted` error rather than a plausible-looking answer.
 
 `reply_tools` scripts **several calls in one turn**, which is what every current vendor actually emits and the only shape that exercises the concurrency bound:
@@ -463,7 +524,7 @@ Following the OpenTelemetry **GenAI semantic conventions, v1.37.0**:
 | span | attributes |
 | --- | --- |
 | `invoke_agent {agent}` | `gen_ai.operation.name`, `gen_ai.agent.name`, `gen_ai.provider.name`, `gen_ai.request.model`, aggregate `gen_ai.usage.*`, `gen_ai.response.finish_reasons`, `para.ai.run.turns` |
-| `chat {model}` | `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.request.max_tokens`, `gen_ai.request.temperature`, `gen_ai.response.model`, `gen_ai.response.finish_reasons`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens` |
+| `chat {model}` | `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.request.max_tokens`, `gen_ai.request.temperature`, `gen_ai.response.model`, `gen_ai.response.finish_reasons`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.usage.cached_input_tokens` |
 | `execute_tool {name}` | `gen_ai.operation.name`, `gen_ai.tool.name`, `gen_ai.tool.call.id`, `gen_ai.tool.type` (`function` / `mcp`) |
 
 | metric | kind | attributes |
@@ -471,6 +532,8 @@ Following the OpenTelemetry **GenAI semantic conventions, v1.37.0**:
 | `gen_ai.client.token.usage` | histogram | `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.token.type` |
 | `gen_ai.client.operation.duration` | histogram (seconds) | the same, plus `error.type` on a failure |
 | `para.ai.tool.calls` | counter | `gen_ai.tool.name`, `para.ai.tool.outcome` (`ok` / `error`) |
+
+`gen_ai.usage.cached_input_tokens` is set **only when a vendor reported a cache read** — on both the `chat` span and the aggregate on `invoke_agent`. `Usage.cached_input_tokens` is `0` both for "the cache missed" and for "this vendor does not report it", and those are not the same claim, so the attribute's *presence* is what means "served from the cache". It is a subset of `gen_ai.usage.input_tokens`, never an addition.
 
 `para.ai.guard.denials` arrives with phase 5.
 
@@ -492,6 +555,7 @@ Three commitments:
 
 - [`examples/ask/`](examples/ask) — one question, one answer: the runtime-provider `match`, the config/agent split, and a hermetic `@test` block over `Mock`.
 - [`examples/tools/`](examples/tools) — a full multi-turn tool loop: two `#[Tool]` functions, a scripted parallel tool turn, the exact derived JSON Schema, a failing tool that becomes a recoverable turn, and the `roles_of::<Semantic>()` query. Hermetic, no key.
+- [`examples/prompt_cache/`](examples/prompt_cache) — a `@prompt` system prompt with a stable preamble and a per-customer tail: the exact statics/holes decomposition, a recall that proves reading the cache prefix never evaluated it, and the encoded Anthropic body with `cache_control` on the stable block and nowhere else. Hermetic, no key.
 
 The design's other examples (`chat-cli`, `agui-server`, `mcp-memory`, `structured`, `local-ollama`) arrive with the phases they exercise.
 

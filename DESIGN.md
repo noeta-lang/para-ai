@@ -2,7 +2,7 @@
 
 An agent harness for Noeta: model calls, tool calling, MCP, structured responses, guardrails, rolling context, streaming (AG-UI over SSE), and OpenTelemetry — in the shape the rest of the `para` suite already has.
 
-Status: **phases 1, 2, and 3 are built and merged** — the codec seam, Anthropic, Mock, the run loop with tool calling, GenAI telemetry, and streaming. Phases 4–8 remain design. Every toolchain prerequisite this document named has landed (§17); the questions are settled or corrected in place.
+Status: **phases 1, 2, 3 and 8 are built and merged** — the codec seam, Anthropic, Mock, the run loop with tool calling, GenAI telemetry, streaming, and the `@prompt` tier with automatic cache breakpoints. Phases 4, 5, 6 and 7 are in flight or queued. Every toolchain prerequisite this document named has landed (§17); the questions are settled or corrected in place.
 
 ---
 
@@ -636,6 +636,20 @@ No other agent framework can do (3), because in every other language a prompt is
 
 `text: "markdown"` on the tier declaration gives editors highlighting and the LSP a hover, for free.
 
+### 14.1 What phase 8 built, and where it diverges
+
+Built as specified: `@tier(prompt, text: "markdown", expr: Prompt)` in `para.ai.prompt`, a handler that keeps the pieces, the split placed as a cache breakpoint by the run loop, and `cache_control` in the Anthropic codec. Measured rather than assumed at every step — the exact statics/holes decomposition of a known block, a recording thunk that proves reading the cache prefix evaluates nothing, and the exact encoded request body with the marker on the stable block and nowhere else.
+
+Five divergences, each with its reason:
+
+- **Two types, not one: `Prompt` (lazy) and `Resolved` (evaluated).** §14 speaks of "a `Prompt`". Laziness and value semantics cannot live in one struct: a field of function type derives neither `Equatable` nor `Display` and is not `Send`, so a `Prompt` that kept its thunks could not be stored in `AgentConfig` (which is the `Send` half of the API, by §5's design) and a `Prompt` that evaluated at construction would throw away point 2. So `Prompt` holds statics + thunks, `resolve()` calls each hole exactly once, and `Resolved` holds statics + evaluated holes — still split, still carrying the boundary, and an ordinary value.
+- **`AgentConfig.system` is a `?Resolved`, not a `?string`.** Flattening the system prompt to text at configuration time would destroy the boundary before any codec could use it, which is the one thing this section says must not happen. `with_system("…")` is unchanged for callers — a plain string is a prompt with no holes — and `system_text()` is there for a caller who only wants to read it.
+- **`with_system_prompt` is a second method rather than an overload of `with_system`.** A `trait IntoPrompt` with an `impl … for string` is **E0013** (`cannot implement a trait for `string`: it is not a record, class, or enum declared in this module`), so no bound can span the two types. Two named doors that agree on one internal representation beat a `dyn` parameter the checker cannot see through.
+- **The breakpoint is carried by `Message.cache_breakpoint`, and the split becomes two turns.** §14 does not say how the boundary reaches a codec. A vendor's marker attaches to a *content block* and the cached prefix ends where that block ends, so the stable text has to be a block of its own; a defaulted `bool` on `Message` is the smallest neutral carrier that survives a codec's alternation merge, needs no change to `Provider` or `ModelRequest` (phase 4's floor), and lets a caller mark a long stable turn of their own with `Message.cached()`.
+- **Marking is a default with a switch (`AgentConfig.cache`, true).** "Correct by default" is the section's claim, and a system prompt is re-sent on every turn of a run, so a tool loop repays the cache write on its second call. The one shape where a marker costs is a single-call workload with a large system prompt that never repeats inside the TTL, and `.uncached()` is that caller's answer — it removes the marker and changes no other byte, so an implicitly-caching vendor is unaffected.
+
+Two things §14 does not claim, stated so nobody assumes them: the run loop marks **only** what the language proved stable, so a conversation's earlier turns are left unmarked even though they do repeat within one run (a breakpoint spent on a guess is one of the four Anthropic allows); and the block's body is **verbatim**, including the whitespace the braces introduce, because the bytes a cache is keyed on are not something a handler should quietly rewrite. `Prompt.trimmed()` removes the outer edges on request; a *dedent* of interior indentation is the obvious next combinator and is deliberately not guessed at here.
+
 ---
 
 ## 15. Testing
@@ -837,4 +851,4 @@ Each phase is independently useful and independently shippable.
 5. **Structured responses + guardrails.** `extract::<T>`, `Validate` at the door, bounded repair, the `Guard` trait and standard guards.
 6. **MCP.** stdio first (no native code), then streamable HTTP. Memory example lands here.
 7. **AG-UI.** The SSE responder, the aether integration, the event-sequence test harness.
-8. **`@prompt` tier + cache breakpoints.** Last, because it is the one piece nothing else depends on — and the one most worth getting right rather than early.
+8. **`@prompt` tier + cache breakpoints.** Last, because it is the one piece nothing else depends on — and the one most worth getting right rather than early. **Built**, with the divergences in §14.1.

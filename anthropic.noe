@@ -16,6 +16,13 @@
 //   * **There is no `tool` role.** A tool result is a `user` turn carrying `tool_result` blocks.
 //   * **A `thinking` block must carry its `signature` back** on the next turn or the vendor
 //     invalidates it, so both are round-tripped verbatim.
+//
+// This is also the one vendor here whose prompt cache is **explicit**: a `cache_control` marker on
+// a content block means "everything up to and including this block may be served from the cache".
+// `Message.cache_breakpoint` is where that marker comes from, and `mark_cache` is the only place in
+// the package that knows how Anthropic spells it — OpenAI and Google cache the same prefix
+// implicitly, on an exact match, and need no marker at all. That is exactly why the neutral model
+// carries a *hint* and not a vendor field.
 namespace para.ai.providers.anthropic
 
 use std.http.{Frame}
@@ -182,12 +189,23 @@ fn wire_role(r: Role): string {
 // as `user`, so a user question followed by a tool result — or a hoisted system turn splitting two
 // user turns — would otherwise produce two consecutive `user` entries and a 400 whose message says
 // nothing about tools. Merging here keeps the neutral model free to say what it means.
+//
+// A turn marked `cache_breakpoint` has `cache_control` stamped on its **last** content block, which
+// is what "cacheable up to and including this turn" means in Anthropic's spelling. Stamping before
+// the merge is deliberate: a marked turn folded into the one before it keeps the marker on its own
+// block, in the middle of the merged `content` array, and the cached prefix still ends exactly
+// where the neutral model said it did.
 fn encode_messages(msgs: List<Message>): Result<(List<dyn>, List<dyn>), AiError> {
     mut system: List<dyn> = []
     mut turns: List<dyn> = []
     mut last_role = ""
+    mut breakpoints = 0
     for m in msgs {
-        blocks = encode_parts(m.parts)?
+        plain = encode_parts(m.parts)?
+        blocks = if m.cache_breakpoint then mark_cache(plain) else plain
+        if m.cache_breakpoint && plain.len() > 0 {
+            breakpoints = breakpoints + 1
+        }
         if m.role == Role.System {
             system = system ~ blocks
         } else if wire_role(m.role) == last_role && turns.len() > 0 {
@@ -200,7 +218,47 @@ fn encode_messages(msgs: List<Message>): Result<(List<dyn>, List<dyn>), AiError>
             last_role = role
         }
     }
+    if breakpoints > max_cache_breakpoints() {
+        return Err(AiError.Encode(
+            provider: "anthropic",
+            message: "Anthropic accepts at most ${max_cache_breakpoints()} prompt-cache breakpoints "
+                ~ "per request, and this one marks ${breakpoints} messages — mark fewer, or leave "
+                ~ "the system prompt's breakpoint to `AgentConfig.cache` and none of your own",
+        ))
+    }
     return Ok((system, turns))
+}
+
+// How many `cache_control` markers one Messages request may carry. A vendor limit, rejected here
+// rather than at the vendor: a 400 whose body says `at most 4 blocks with cache_control` arrives
+// after a round trip and names no message.
+//
+// A function rather than a top-level binding because a named `fn` does not see one (E0005) — the
+// same shape `kind_text()` and its siblings in `provider.noe` take.
+fn max_cache_breakpoints(): int {
+    return 4
+}
+
+// Stamp `cache_control` on the last of a turn's content blocks — Anthropic's way of saying that
+// everything up to and including it may be served from the prompt cache.
+//
+// `ephemeral` is the only cache type the API defines; its TTL is five minutes, refreshed on each
+// read. A turn that produced no blocks is returned untouched, because a marker needs a block to sit
+// on and an empty `content` array is already a vendor error with a better message than ours.
+fn mark_cache(blocks: List<dyn>): List<dyn> {
+    n = blocks.len()
+    if n == 0 {
+        return blocks
+    }
+    return match blocks[n - 1].as<Map<string, dyn>>() {
+        some(last) => blocks.set(n - 1, cache_marked(last)),
+        none => blocks,
+    }
+}
+
+fn cache_marked(block: Map<string, dyn>): Map<string, dyn> {
+    ephemeral: Map<string, dyn> = {"type": "ephemeral"}
+    return block.set("cache_control", ephemeral)
 }
 
 fn merged_turn(previous: dyn, role: string, blocks: List<dyn>): Map<string, dyn> {
@@ -998,6 +1056,102 @@ fn captured_tool_use_reply(): string {
                 assert(false, "${e}")
             },
         }
+    }
+
+    // The cache breakpoint, asserted against the exact bytes. A `@prompt` split at its first hole
+    // reaches this codec as two system turns, and the marker goes on the **first** block — so the
+    // cached prefix ends where the author's fixed text ends and not one character later.
+    fn a_cache_breakpoint_marks_exactly_the_stable_block(): void {
+        req = ModelRequest {
+            model: "m",
+            messages: [
+                Message.system("You work for ").cached(),
+                Message.system("Acme. Be brief."),
+                Message.user("hi"),
+            ],
+            max_tokens: some(16),
+        }
+        wire = encode_or_fail(Anthropic.new("k"), req)
+        assert(wire.body.contains("\"system\":[{\"cache_control\":{\"type\":\"ephemeral\"},\"text\":\"You work for \",\"type\":\"text\"},{\"text\":\"Acme. Be brief.\",\"type\":\"text\"}]"),
+            "the marker is on the stable block and only that one: ${wire.body}")
+        // Exactly one marker in the whole request.
+        assert(wire.body.split("cache_control").len() == 2, "one marker: ${wire.body}")
+    }
+
+    // A prompt that interpolates nothing is one block, marked — the maximal prefix, which is the
+    // best case for a cache and not a degenerate one.
+    fn a_static_system_prompt_caches_in_its_entirety(): void {
+        req = ModelRequest {
+            model: "m",
+            messages: [Message.system("Answer in one sentence.").cached(), Message.user("hi")],
+            max_tokens: some(16),
+        }
+        wire = encode_or_fail(Anthropic.new("k"), req)
+        assert(wire.body.contains("\"system\":[{\"cache_control\":{\"type\":\"ephemeral\"},\"text\":\"Answer in one sentence.\",\"type\":\"text\"}]"),
+            "${wire.body}")
+    }
+
+    // Nothing is marked unless something asked for it. A codec that stamped `cache_control` on
+    // every system block would charge a cache write on requests that never repeat.
+    fn an_unmarked_request_carries_no_cache_control(): void {
+        req = ModelRequest {
+            model: "m",
+            messages: [Message.system("Answer in Swedish."), Message.user("hi")],
+        }
+        assert(!encode_or_fail(Anthropic.new("k"), req).body.contains("cache_control"))
+    }
+
+    // The marker survives the alternation merge. A marked `user` turn followed by another one
+    // becomes a single turn with two blocks, and the marker stays on the block it was placed on —
+    // mid-array, which is legal and is what "cacheable up to here" means.
+    fn a_merged_turn_keeps_the_marker_on_the_block_it_was_placed_on(): void {
+        req = ModelRequest {
+            model: "m",
+            messages: [
+                Message.user("a long retrieved corpus").cached(),
+                Message.user("now answer this"),
+            ],
+            max_tokens: some(16),
+        }
+        wire = encode_or_fail(Anthropic.new("k"), req)
+        assert(wire.body.contains("\"content\":[{\"cache_control\":{\"type\":\"ephemeral\"},\"text\":\"a long retrieved corpus\",\"type\":\"text\"},{\"text\":\"now answer this\",\"type\":\"text\"}]"),
+            "one merged turn, marker on the first block: ${wire.body}")
+    }
+
+    // Four is the vendor's limit, and it is rejected here rather than after a round trip — a 400
+    // whose body says `at most 4 blocks with cache_control` names no message and costs a request.
+    fn a_fifth_breakpoint_is_refused_at_encode(): void {
+        four = ModelRequest {
+            model: "m",
+            messages: [
+                Message.system("a").cached(),
+                Message.user("b").cached(),
+                Message.assistant("c").cached(),
+                Message.user("d").cached(),
+            ],
+        }
+        assert(encode_or_fail(Anthropic.new("k"), four).body.contains("cache_control"), "four is fine")
+
+        five = ModelRequest { model: "m", messages: four.messages ~ [Message.assistant("e").cached()] }
+        match Anthropic.new("k").encode(five) {
+            Ok(w) => {
+                assert(false, "a fifth breakpoint is not encodable: ${w.body}")
+            },
+            Err(e) => {
+                assert("${e}".contains("at most 4"), "${e}")
+                assert("${e}".contains("marks 5 messages"), "${e}")
+            },
+        }
+    }
+
+    // A marker needs a block to sit on. A turn that produced none is left alone rather than
+    // growing an empty content entry to carry it — and it does not count against the limit.
+    fn a_marked_turn_with_no_content_is_left_alone(): void {
+        req = ModelRequest {
+            model: "m",
+            messages: [Message { role: Role.User, parts: [], cache_breakpoint: true }, Message.user("hi")],
+        }
+        assert(!encode_or_fail(Anthropic.new("k"), req).body.contains("cache_control"))
     }
 
     // Anthropic has no `tool` role: a tool result rides a `user` turn.

@@ -28,6 +28,10 @@ use para.api.{Api, Middleware, Next}
 use para.ai.{Agent, AgentConfig, AiError, Conversation, Event, EventSink, Frames, Message, Part, Role, Run, Streamer}
 use para.ai.provider
 use para.ai.provider.{Delta, ModelReply, ModelRequest, Provider, StopReason, StreamDecoder, Usage, Wire}
+// The `@prompt` tier's value type, so this file's suite can drive the run loop with a real split
+// prompt. The tier *itself* (`para.ai.prompt.render`) is deliberately not imported: a `Prompt` is
+// an ordinary value and a mock has no business declaring block syntax for its consumers.
+use para.ai.prompt.{Prompt}
 use para.ai.tools.{Arg, Local, Tool, ToolSource}
 
 // One tool call in a scripted turn. `args` is a raw JSON blob, exactly as a vendor would stream
@@ -101,7 +105,14 @@ fn message_to_json(m: Message): Map<string, dyn> {
     for p in m.parts {
         parts = parts ~ [part_to_json(p)]
     }
-    out: Map<string, dyn> = {"role": role_name(m.role), "parts": parts}
+    mut out: Map<string, dyn> = {"role": role_name(m.role), "parts": parts}
+    // A prompt-cache breakpoint is rendered **only when set**, so every existing exact-body
+    // assertion is unchanged and a test that cares can see the marker reach the wire without
+    // needing a real vendor's spelling. The same reason `tools` is rendered flat above: the
+    // difference between "the config asked for a breakpoint" and "the request carries one".
+    if m.cache_breakpoint {
+        out = out.set("cache_breakpoint", true)
+    }
     return out
 }
 
@@ -162,11 +173,15 @@ fn scripted_stop(s: Scripted): StopReason {
 
 // A scripted entry as the reply body this codec reads back. Usage is synthesized from the sizes
 // involved so a telemetry assertion has something deterministic and non-zero to look at.
-fn reply_body(s: Scripted, input_tokens: int): string {
+//
+// `cached` is what `Mock.with_cache_reads` scripted: the input tokens a vendor served from its
+// prompt cache. It is a **subset** of `input_tokens`, not an addition, exactly as `Usage` documents.
+fn reply_body(s: Scripted, input_tokens: int, cached: int): string {
     parts = scripted_parts(s)
     usage: Map<string, dyn> = {
         "input_tokens": input_tokens,
         "output_tokens": json.stringify(parts).len() / 4,
+        "cached_input_tokens": cached,
     }
     body: Map<string, dyn> = {
         "model": "mock",
@@ -189,7 +204,7 @@ fn reply_body(s: Scripted, input_tokens: int): string {
 // construction rather than by two implementations agreeing.
 
 // Every delta a scripted entry means. The one place `Mock` decides what an entry *says*.
-fn scripted_deltas(s: Scripted, input_tokens: int): List<Delta> {
+fn scripted_deltas(s: Scripted, input_tokens: int, cached: int): List<Delta> {
     mut out: List<Delta> = [Delta.ModelDelta(model: "mock")]
     out = out ~ match s {
         Scripted.Text(text) => [Delta.TextDelta(id: "0", text: text)],
@@ -203,6 +218,7 @@ fn scripted_deltas(s: Scripted, input_tokens: int): List<Delta> {
         Delta.UsageDelta(usage: Usage {
             input_tokens: input_tokens,
             output_tokens: json.stringify(scripted_parts(s)).len() / 4,
+            cached_input_tokens: cached,
         }),
     ]
 }
@@ -230,7 +246,12 @@ fn delta_to_json(d: Delta): Map<string, dyn> {
         Delta.ToolCallStart(id, name) => {"type": "tool_call", "id": id, "name": name},
         Delta.ToolCallArgs(id, fragment) => {"type": "tool_args", "id": id, "fragment": fragment},
         Delta.Stop(reason) => {"type": "stop", "stop": stop_name(reason)},
-        Delta.UsageDelta(usage) => {"type": "usage", "input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens},
+        Delta.UsageDelta(usage) => {
+            "type": "usage",
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "cached_input_tokens": usage.cached_input_tokens,
+        },
     }
 }
 
@@ -280,9 +301,9 @@ fn args_chunks(id: string, fragment: string, n: int): List<Delta> {
 
 // A scripted entry as the newline-delimited frames a streamed read of it would produce, with a
 // terminal `done` so that a truncated replay is distinguishable from a complete one.
-fn frames_of(s: Scripted, input_tokens: int, chunk: int): List<Frame> {
+fn frames_of(s: Scripted, input_tokens: int, cached: int, chunk: int): List<Frame> {
     mut out: List<Frame> = []
-    for d in scripted_deltas(s, input_tokens) {
+    for d in scripted_deltas(s, input_tokens, cached) {
         for piece in chunk_delta(d, chunk) {
             out = out ~ [Frame {
                 event: "",
@@ -373,6 +394,7 @@ pub class MockStream {
                 self.usage = Usage {
                     input_tokens: provider.int_at(doc, "input_tokens"),
                     output_tokens: provider.int_at(doc, "output_tokens"),
+                    cached_input_tokens: provider.int_at(doc, "cached_input_tokens"),
                 }
                 return Ok([Delta.UsageDelta(usage: self.usage)])
             }
@@ -471,9 +493,24 @@ pub class Mock {
     mut chunk: int
     // Every stream this mock handed out, so a test can assert the reader released them.
     mut streams: List<ScriptedFrames>
+    // How many input tokens every reply claims were served from the vendor's prompt cache. Zero —
+    // "this vendor reported nothing" — unless a test says otherwise, so no existing assertion moves.
+    mut cache_reads: int
 
     fn new(): Mock {
-        return Mock { script: [], cursor: 0, sent: [], chunk: 0, streams: [] }
+        return Mock { script: [], cursor: 0, sent: [], chunk: 0, streams: [], cache_reads: 0 }
+    }
+
+    // Report `n` input tokens served from the vendor's prompt cache on every reply — the hermetic
+    // stand-in for a cache hit.
+    //
+    // A scripted transport cannot produce one any other way: a cache read is a *server-side* effect
+    // of a request the server has seen before, and this mock has no cache. So the number is
+    // declared rather than earned, and what the assertion proves is that the figure a vendor
+    // reports reaches `Run.usage` and the run's telemetry — not that any caching happened.
+    fn with_cache_reads(n: int): Mock {
+        self.cache_reads = n
+        return self
     }
 
     // Deliver streamed payloads in runs of `n` characters — the knob that makes a scripted stream
@@ -656,6 +693,7 @@ impl Provider for Mock {
             Delta.UsageDelta(usage: Usage {
                 input_tokens: provider.int_at(usage, "input_tokens"),
                 output_tokens: provider.int_at(usage, "output_tokens"),
+                cached_input_tokens: provider.int_at(usage, "cached_input_tokens"),
             }),
         ])
     }
@@ -715,7 +753,7 @@ impl Streamer for Mock {
                 code: code,
                 message: message,
             )),
-            _ => Ok(self.hand_out(frames_of(entry, req.body().len() / 4, self.chunk))),
+            _ => Ok(self.hand_out(frames_of(entry, req.body().len() / 4, self.cache_reads, self.chunk))),
         }
     }
 }
@@ -741,7 +779,7 @@ impl Middleware for Mock {
                 "code": code,
                 "message": message,
             })),
-            _ => server.response(200, reply_body(entry, input_tokens)),
+            _ => server.response(200, reply_body(entry, input_tokens, self.cache_reads)),
         })
     }
 }
@@ -930,6 +968,116 @@ impl Middleware for Mock {
         second = m.calls()[1]
         assert(second.contains("{\"parts\":[{\"content\":\"ONE\",\"id\":\"a\",\"is_error\":false,\"type\":\"tool_result\"},{\"content\":\"5\",\"id\":\"b\",\"is_error\":false,\"type\":\"tool_result\"},{\"content\":\"THREE\",\"id\":\"c\",\"is_error\":false,\"type\":\"tool_result\"}],\"role\":\"tool\"}"),
             "one tool turn, three results, in call order: ${second}")
+    }
+
+    // --- The prompt split, through the run loop ----------------------------------------------
+    //
+    // `prompt.noe` proves the tier decomposes a block into statics and hole thunks; `ai.noe` proves
+    // the decomposition becomes turns; `anthropic.noe` proves a marked turn becomes `cache_control`.
+    // What is left — and what these prove — is that the run *loop* carries the split all the way to
+    // the wire, on every call, unchanged.
+
+    // The stable prefix is its own turn, marked, and the volatile tail follows it. This is the
+    // shape the whole phase exists to produce.
+    fn a_configured_prompt_marks_its_stable_prefix_on_the_wire(): void {
+        m = Mock.new().reply_text("ok")
+        cfg = AgentConfig.new("test-model").with_system_prompt(split_prompt("Acme"))
+        assert(m.agent(cfg).run_sync("hi") == Ok("ok"))
+
+        sent = m.calls()[0]
+        assert(sent.contains("{\"cache_breakpoint\":true,\"parts\":[{\"text\":\"You work for \",\"type\":\"text\"}],\"role\":\"system\"}"),
+            "the stable prefix is a marked system turn: ${sent}")
+        assert(sent.contains("{\"parts\":[{\"text\":\"Acme. Be brief.\",\"type\":\"text\"}],\"role\":\"system\"}"),
+            "the volatile tail follows it, unmarked: ${sent}")
+        assert(sent.split("cache_breakpoint").len() == 2, "exactly one breakpoint: ${sent}")
+    }
+
+    // Every turn of a run re-sends the system prompt, and OpenAI's and Google's implicit prefix
+    // caching keys on the bytes being **identical**. So the hole is resolved once, at configuration
+    // time, and not per call: a hole that read a clock would otherwise break the prefix silently,
+    // and nothing downstream could tell.
+    fn the_stable_prefix_is_byte_identical_on_every_call_of_a_run(): void {
+        spy = CountingHole.new()
+        p = Prompt { statics: ["You work for Acme. ", " Be brief."], holes: [fn() => spy.next()] }
+        assert(spy.calls == 0, "building the prompt evaluated a hole (${spy.calls})")
+
+        cfg = AgentConfig.new("test-model").with_system_prompt(p)
+        assert(spy.calls == 1, "the config resolves the prompt once, at configuration time (${spy.calls})")
+
+        m = Mock.new()
+            .reply_tool("call_1", "mock_shout", "{\"text\": \"hej\"}")
+            .reply_text("It said HEJ.")
+        assert(tool_agent_or_fail_with(m, cfg).run_sync("shout hej") == Ok("It said HEJ."))
+        assert(m.call_count() == 2, "two model calls")
+
+        // Still once, for a run that sent the prompt twice.
+        assert(spy.calls == 1, "a two-call run re-evaluated the hole (${spy.calls})")
+        first = m.calls()[0]
+        second = m.calls()[1]
+        marked = "{\"cache_breakpoint\":true,\"parts\":[{\"text\":\"You work for Acme. \",\"type\":\"text\"}],\"role\":\"system\"}"
+        assert(first.contains(marked), "${first}")
+        assert(second.contains(marked), "the same bytes on the second call: ${second}")
+        // And the volatile tail is identical too — which it would not be if the hole re-ran, since
+        // `CountingHole` answers with a different string each time.
+        tail = "{\"parts\":[{\"text\":\"visit-1 Be brief.\",\"type\":\"text\"}],\"role\":\"system\"}"
+        assert(first.contains(tail), "${first}")
+        assert(second.contains(tail), "${second}")
+    }
+
+    // A plain string is a prompt with no holes, so it is stable in its entirety — one marked turn,
+    // the maximal prefix. Nothing an existing caller wrote had to change to get this.
+    fn a_plain_string_system_prompt_caches_in_its_entirety(): void {
+        m = Mock.new().reply_text("ok")
+        cfg = AgentConfig.new("test-model").with_system("You are terse.")
+        assert(m.agent(cfg).run_sync("hi") == Ok("ok"))
+        assert(m.calls()[0].contains("{\"cache_breakpoint\":true,\"parts\":[{\"text\":\"You are terse.\",\"type\":\"text\"}],\"role\":\"system\"}"),
+            "${m.calls()[0]}")
+    }
+
+    // Switching the marker off changes the marker and nothing else. The stable text is still first
+    // and still byte-identical, so a vendor that caches implicitly is unaffected — which is the
+    // difference between "no explicit breakpoint" and "no caching".
+    fn uncached_drops_the_marker_and_keeps_the_bytes(): void {
+        p = split_prompt("Acme")
+        marked = sent_body(AgentConfig.new("test-model").with_system_prompt(p))
+        plain = sent_body(AgentConfig.new("test-model").with_system_prompt(p).uncached())
+        assert(marked.contains("\"cache_breakpoint\":true"))
+        assert(!plain.contains("cache_breakpoint"), "${plain}")
+        assert(marked.replace("\"cache_breakpoint\":true,", "") == plain, "only the marker differs:\n${marked}\n${plain}")
+    }
+
+    // What a vendor reports about its cache reaches the run's usage — the figure
+    // `gen_ai.usage.cached_input_tokens` is set from, aggregated over every call the run made.
+    async fn a_vendors_cache_read_reaches_the_runs_usage(): void {
+        m = Mock.new()
+            .with_cache_reads(1024)
+            .reply_tool("call_1", "mock_shout", "{\"text\": \"hej\"}")
+            .reply_text("It said HEJ.")
+        run = match tool_agent_or_fail(m).run(Conversation.of("shout hej")).await {
+            Ok(r) => r,
+            Err(e) => Run { messages: [Message.assistant("FAILED: ${e}")] },
+        }
+        assert(run.turns == 2)
+        assert(run.usage.cached_input_tokens == 2048, "summed over both calls: ${run.usage}")
+        // A cache read is a *subset* of what was charged as input, so the total counts it once.
+        assert(run.usage.total() == run.usage.input_tokens + run.usage.output_tokens,
+            "cached tokens are not added on top: ${run.usage}")
+    }
+
+    // Both halves of this travel the streamed path too. The two transports share one `request()`
+    // and one delta vocabulary rather than having two implementations — but "shares an
+    // implementation" is a claim, and a claim is worth an assertion.
+    async fn the_streamed_path_carries_the_breakpoint_and_the_cache_read(): void {
+        m = Mock.new().with_cache_reads(512).reply_text("ok")
+        cfg = AgentConfig.new("test-model").with_system_prompt(split_prompt("Acme")).streamed()
+        run = match m.agent(cfg).run(Conversation.of("hi")).await {
+            Ok(r) => r,
+            Err(e) => Run { messages: [Message.assistant("FAILED: ${e}")] },
+        }
+        assert(run.text() == "ok", "${run.messages}")
+        assert(m.calls()[0].contains("{\"cache_breakpoint\":true,\"parts\":[{\"text\":\"You work for \",\"type\":\"text\"}],\"role\":\"system\"}"),
+            "${m.calls()[0]}")
+        assert(run.usage.cached_input_tokens == 512, "the usage frame carries it: ${run.usage}")
     }
 
     // A concurrency cap of one is the sequential path through the same dispatcher, and it has to
@@ -1359,6 +1507,22 @@ impl Middleware for Mock {
         }
     }
 
+    // A hole that answers differently every time it runs, so an assertion can tell "resolved once"
+    // from "resolved per call" by looking at the bytes. A `class` because a hole closes over the
+    // binding, and only a reference type lets the test see afterwards what the closure did.
+    class CountingHole {
+        mut calls: int
+
+        fn new(): CountingHole {
+            return CountingHole { calls: 0 }
+        }
+
+        fn next(): string {
+            self.calls = self.calls + 1
+            return "visit-${self.calls}"
+        }
+    }
+
     // The `some(n)` half of `estimate_tokens(): ?int` — the branch Anthropic's `none` cannot cover.
     fn the_mock_estimates_tokens(): void {
         assert(match Mock.new().estimate_tokens([Message.user("a rather long sentence to count")]) {
@@ -1377,6 +1541,27 @@ impl Middleware for Mock {
 //
 // Unwrap-or-fail for the two fallible doors a tool test goes through. A `match` arm cannot both
 // fail an assertion and produce a value, so the unwrapping lives out here.
+
+// A prompt with a real stable/volatile boundary, built by hand rather than by a `@prompt` block:
+// `mock.noe` deliberately does not import the tier (see the import note at the top), and the tier's
+// own decomposition is `prompt.noe`'s to prove. What these tests are about is what the run loop
+// does with a split once it has one.
+fn split_prompt(company: string): Prompt {
+    return Prompt { statics: ["You work for ", ". Be brief."], holes: [fn() => company] }
+}
+
+// The single request body one run of `cfg` sends. The mock scripts one answer, so the run is one
+// call and `calls()[0]` is the whole of what went out.
+fn sent_body(cfg: AgentConfig): string {
+    m = Mock.new().reply_text("ok")
+    match m.agent(cfg).run_sync("hi") {
+        Ok(_) => {},
+        Err(e) => {
+            assert(false, "${e}")
+        },
+    }
+    return m.calls()[0]
+}
 
 fn tool_agent_or_fail_with(m: Mock, cfg: AgentConfig): Agent<Mock> {
     match m.tool_agent(cfg, Local.new()) {
