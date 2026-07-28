@@ -136,8 +136,12 @@ io.outln(match ask_verbose("Say hello in Swedish.").await {
                 assert(w.url == "https://api.anthropic.com/v1/messages")
                 assert(w.headers["x-api-key"] == "sk-test")
                 // The system prompt is hoisted to a top-level field — Anthropic rejects a
-                // `"role": "system"` entry in `messages`.
-                assert(w.body.contains("\"system\":[{\"text\":\"You are terse. Answer in one short sentence.\",\"type\":\"text\"}]"), w.body)
+                // `"role": "system"` entry in `messages` — and it carries a `cache_control`
+                // marker, because a system prompt that interpolates nothing is stable in its
+                // entirety and para/ai marks the longest stable prefix by default.
+                // `examples/prompt-cache` is what that looks like when a prompt has a volatile
+                // tail; `AgentConfig.uncached()` is how to turn it off.
+                assert(w.body.contains("\"system\":[{\"cache_control\":{\"type\":\"ephemeral\"},\"text\":\"You are terse. Answer in one short sentence.\",\"type\":\"text\"}]"), w.body)
                 assert(!w.body.contains("\"role\":\"system\""), w.body)
             },
             Err(e) => {

@@ -1,0 +1,288 @@
+// A `@prompt` block, and the provider prompt caching that falls out of it — the phase-8 surface in
+// one file.
+//
+// A system prompt normally has two halves that behave completely differently:
+//
+//   * a long **stable** preamble — the role, the rules, the tone, the tool policy — identical on
+//     every call your service ever makes; and
+//   * a short **volatile** tail — this customer, this plan, this account — different every time.
+//
+// A vendor's prompt cache is priced on exactly that difference: send the stable half first and
+// byte-identical, and you are billed a fraction for it on every call after the first. The catch is
+// that a framework has to *know where the halves meet*, and in every other language a prompt is one
+// opaque string by the time an SDK sees it. So other frameworks guess, or ask you to mark the
+// boundary by hand, or skip caching.
+//
+// Noeta hands para/ai the boundary for free. `@prompt { … }` is an **expression tier**: the block
+// is not a string, it is a call to `para.ai.prompt.render(statics, holes)`, where `statics` is the
+// literal text split at every `${…}` and `holes` are the interpolations as **thunks**. Statics
+// always number holes + 1, so `statics[0]` — everything before the first hole — is precisely the
+// longest part of the prompt that cannot vary. That is the cache breakpoint, computed by the
+// compiler, and `AgentConfig.with_system_prompt` places it automatically.
+//
+// Three consequences, all asserted in the `@test` block below:
+//
+//   1. `${acount.plan}` for `${account.plan}` is a **compile error at that column**, because a hole
+//      is real Noeta parsed by the full grammar — not a `${undefined}` that reaches a model.
+//   2. Holes are thunks, so `p.stable()` reads the cache prefix without running the expensive
+//      interpolation behind `${…}`. `CountingRecall` below proves it did not run.
+//   3. The encoded Anthropic request carries `cache_control` on the stable block and nothing else.
+//      OpenAI and Google need no marker — they cache implicitly on an exact prefix match — and get
+//      what they need from the same split: the stable text first, and identical on every call.
+//
+//     noeta run  main.noe        # the split, the markers, and what a run costs
+//     noeta test main.noe        # the assertions — hermetic, no key, no socket
+namespace noeta.prompt_cache
+
+use std.{io, json}
+use para.ai.{Agent, AgentConfig, Conversation, Message, Run}
+use para.ai.mock.Mock
+use para.ai.provider.ModelRequest
+use para.ai.providers.anthropic.Anthropic
+use para.ai.prompt.{Prompt, Resolved}
+// **This one import is what makes `@prompt { … }` exist in this file.** An expression tier is an
+// ordinary `@tier` declaration on a handler function, so bringing the handler into scope brings the
+// block syntax with it — no compiler plugin, no build step, and the same mechanism a package would
+// use to ship `@sql` or `@html`.
+use para.ai.prompt.render
+
+// The account this run is about. Everything interpolated into the prompt comes from here, and every
+// field read is a hole the compiler type-checks: rename `plan` and the prompt stops compiling.
+struct Account {
+    company: string
+    plan: string
+    opened: string
+}
+
+// The expensive half of a real prompt: a memory recall, a retrieval hit, a database read. Behind a
+// class so the example can *prove* it did not run when nothing asked for it — which is the whole
+// claim about thunks, and not a claim you can check by reading the code.
+class CountingRecall {
+    pub mut calls: int
+
+    fn new(): CountingRecall {
+        return CountingRecall { calls: 0 }
+    }
+
+    fn history(company: string): string {
+        self.calls = self.calls + 1
+        return "${company} last contacted support on 2026-07-02 about billing."
+    }
+}
+
+// The system prompt. Everything down to `${account.company}` is fixed text, so it is the stable
+// prefix and para/ai marks it; everything from there on varies per customer.
+//
+// `text: "markdown"` on the tier declaration is why the body highlights as Markdown in an editor
+// and why hovering `@prompt` reports `expression tier @prompt — markdown body, evaluates to
+// Prompt`. That comes from one line in `para.ai.prompt`, not from anything written here.
+fn system_prompt(account: Account, recall: CountingRecall): Prompt {
+    return @prompt {
+        You are a support agent. Answer in at most three sentences, in the customer's language,
+        and never promise a refund — say you will escalate instead. If you do not know something,
+        say so and offer to open a ticket rather than guessing.
+
+        Customer: ${account.company}, on the ${account.plan} plan since ${account.opened}.
+        History: ${recall.history(account.company)}
+    }.trimmed()
+}
+
+fn config(account: Account, recall: CountingRecall): AgentConfig {
+    return AgentConfig.new("claude-opus-5")
+        .with_system_prompt(system_prompt(account, recall))
+        .with_max_tokens(256)
+        .named("support")
+}
+
+fn acme(): Account {
+    return Account { company: "Acme", plan: "enterprise", opened: "2019-03-11" }
+}
+
+// The scripted stand-in, so this file runs and tests with no key and no socket. `with_cache_reads`
+// declares what a vendor would report about its cache — a scripted transport has no cache of its
+// own, so the number is stated rather than earned, and what it demonstrates is that the figure
+// reaches `Run.usage` and the run's `gen_ai.usage.cached_input_tokens` attribute.
+fn offline(): Mock {
+    return Mock.new().with_cache_reads(1580).reply_text("Jag eskalerar ärendet till fakturateamet.")
+}
+
+// `noeta test` never runs top-level statements, so everything below here is the entry point only.
+recall = CountingRecall.new()
+prompt = system_prompt(acme(), recall)
+
+io.outln("statics: ${prompt.statics.len()}, holes: ${prompt.holes.len()}  (statics are always holes + 1)")
+io.outln("holes evaluated so far: ${recall.calls}")
+io.outln("")
+io.outln("--- the stable prefix, the part a cache keeps -------------------------------------")
+io.outln(prompt.stable())
+io.outln("--- holes evaluated to read it: ${recall.calls} ----------------------------------------------------")
+io.outln("")
+
+resolved = prompt.resolve()
+io.outln("--- the volatile tail, different for every customer -------------------------------")
+io.outln(resolved.volatile())
+io.outln("")
+
+m = offline()
+io.outln(match m.agent(config(acme(), CountingRecall.new())).run_sync("Kan jag få pengarna tillbaka?") {
+    Ok(answer) => answer,
+    Err(e) => "error: ${e}",
+})
+io.outln("")
+io.outln("--- what went on the wire ---------------------------------------------------------")
+io.outln(m.calls()[0])
+
+// --- Test helpers ------------------------------------------------------------------------------
+
+// The Anthropic request body a config produces, with no agent, no transport, and no key: `encode`
+// is a pure function of a `ModelRequest`, which is what makes a codec assertion cheap.
+fn encoded(req: ModelRequest): string {
+    match Anthropic.new("sk-test").encode(req) {
+        Ok(w) => {
+            return w.body
+        },
+        Err(e) => {
+            assert(false, "${e}")
+        },
+    }
+    return ""
+}
+
+// The single request body one run of `cfg` sends, through the scripted mock — the mock's own flat
+// JSON, which spells a breakpoint `"cache_breakpoint": true` rather than in any vendor's dialect.
+fn sent_body(cfg: AgentConfig): string {
+    m = offline()
+    match m.agent(cfg).run_sync("hej") {
+        Ok(_) => {},
+        Err(e) => {
+            assert(false, "${e}")
+        },
+    }
+    return m.calls()[0]
+}
+
+// The marked system turn a prompt's stable half becomes in the mock's request body. Built with
+// `json.stringify` rather than by hand because the prefix is several lines long and its escaping is
+// the vendor's business, not the assertion's.
+fn stable_turn(p: Prompt): string {
+    return "{\"cache_breakpoint\":true,\"parts\":[{\"text\":" ~ json.stringify(p.stable()) ~ ",\"type\":\"text\"}],\"role\":\"system\"}"
+}
+
+@test {
+    // (1) The decomposition itself, exact. The compiler split the block; this is what it handed us.
+    fn the_prompt_arrives_pre_split_at_its_holes(): void {
+        p = system_prompt(acme(), CountingRecall.new())
+        assert(p.holes.len() == 4, "four `\${…}`: company, plan, opened, history")
+        assert(p.statics.len() == 5, "statics always number holes + 1")
+        assert(p.stable().starts_with("You are a support agent."), "[${p.stable()}]")
+        assert(p.stable().ends_with("Customer: "), "the prefix ends where the first hole begins: [${p.stable()}]")
+        // Nothing after the first hole is in the prefix, even the fixed text between two holes: a
+        // cache prefix has to be contiguous.
+        assert(!p.stable().contains("History:"))
+    }
+
+    // (2) Holes are thunks. Reading the cache prefix does not pay for the recall behind `${…}` —
+    // and a `Prompt` that is built and never sent costs nothing at all.
+    fn reading_the_cache_prefix_does_not_run_the_expensive_hole(): void {
+        recall = CountingRecall.new()
+        p = system_prompt(acme(), recall)
+        assert(recall.calls == 0, "building the prompt ran the recall (${recall.calls})")
+
+        stable = p.stable()
+        assert(stable.len() > 100, "there is a real prefix to cache")
+        assert(recall.calls == 0, "reading the cache prefix ran the recall (${recall.calls})")
+
+        // Only now, and exactly once.
+        r = p.resolve()
+        assert(recall.calls == 1, "resolve() calls each hole once (${recall.calls})")
+        assert(r.volatile().contains("last contacted support"), r.volatile())
+        assert(r.text() == stable ~ r.volatile(), "the halves reassemble into the prompt")
+    }
+
+    // The config is where the resolve happens — once, so that every turn of a run re-sends the same
+    // bytes. A hole re-evaluated per call would break an implicitly-caching vendor's prefix match
+    // silently, with nothing downstream able to notice.
+    fn the_config_resolves_the_prompt_once(): void {
+        recall = CountingRecall.new()
+        cfg = config(acme(), recall)
+        assert(recall.calls == 1, "once, at configuration time (${recall.calls})")
+
+        m = offline()
+        assert(m.agent(cfg).run_sync("hej") == Ok("Jag eskalerar ärendet till fakturateamet."))
+        assert(recall.calls == 1, "the run re-evaluated a hole (${recall.calls})")
+    }
+
+    // (3) The marker, where the split says it goes. `system` is two blocks — Anthropic hoists both
+    // system turns into it — and `cache_control` is on the first, so the cached prefix ends exactly
+    // where the author's fixed text ends.
+    fn the_encoded_request_marks_the_stable_block_and_only_that_one(): void {
+        recall = CountingRecall.new()
+        req = Agent.from(config(acme(), recall), Anthropic.new("sk-test")).request(Conversation.of("hej"))
+        body = encoded(req)
+
+        assert(body.contains("\"cache_control\":{\"type\":\"ephemeral\"}"), body)
+        assert(body.split("cache_control").len() == 2, "exactly one breakpoint in the request: ${body}")
+        // The marked block is the stable one, and the volatile tail is the block after it.
+        stable = system_prompt(acme(), CountingRecall.new()).stable()
+        assert(body.contains("\"cache_control\":{\"type\":\"ephemeral\"},\"text\":" ~ json.stringify(stable)),
+            "the marker sits on the stable text and nothing else: ${body}")
+        assert(body.contains("Acme, on the enterprise plan"), "the volatile tail is in the request too: ${body}")
+        assert(!body.contains("\"cache_control\":{\"type\":\"ephemeral\"},\"text\":\"Acme"),
+            "the volatile block is not the marked one: ${body}")
+        // And no system turn leaked into `messages` — Anthropic rejects a `"role": "system"` entry.
+        assert(!body.contains("\"role\":\"system\""), body)
+    }
+
+    // Two customers, one prompt: the stable half is the same bytes for both, which is what makes
+    // the cache worth having — and what an implicitly-caching vendor keys on with no marker at all.
+    fn two_customers_share_the_same_stable_prefix(): void {
+        a = system_prompt(acme(), CountingRecall.new())
+        b = system_prompt(Account { company: "Globex", plan: "starter", opened: "2024-01-02" }, CountingRecall.new())
+        assert(a.stable() == b.stable(), "the stable half does not depend on the customer")
+        assert(a.resolve().volatile() != b.resolve().volatile(), "the volatile half does")
+
+        // Byte-identical on the wire, too, and first — which is all OpenAI's and Google's implicit
+        // prefix caching needs, with no marker involved at all.
+        turn = stable_turn(a)
+        for account in [acme(), Account { company: "Globex", plan: "starter", opened: "2024-01-02" }] {
+            sent = sent_body(config(account, CountingRecall.new()))
+            assert(sent.contains(turn), "the same stable turn for every customer: ${sent}")
+            assert(sent.index_of(turn) == sent.index_of("{\"cache_breakpoint\""), "and it is the first turn")
+        }
+    }
+
+    // Turning it off changes the marker and nothing else. "No explicit breakpoint" is not "no
+    // caching": the prefix is still first and still identical.
+    fn the_marker_can_be_declined_without_losing_the_split(): void {
+        marked = sent_body(config(acme(), CountingRecall.new()))
+        plain = sent_body(config(acme(), CountingRecall.new()).uncached())
+        assert(marked.contains("\"cache_breakpoint\":true"))
+        assert(!plain.contains("cache_breakpoint"), plain)
+        assert(marked.replace("\"cache_breakpoint\":true,", "") == plain, "only the marker differs")
+    }
+
+    // What the vendor said about its cache comes back on the run, which is what the run's
+    // `gen_ai.usage.cached_input_tokens` span attribute is set from.
+    async fn a_cache_read_comes_back_on_the_run(): void {
+        m = offline()
+        run = match m.agent(config(acme(), CountingRecall.new())).run(Conversation.of("hej")).await {
+            Ok(r) => r,
+            Err(e) => Run { messages: [Message.assistant("FAILED: ${e}")] },
+        }
+        assert(run.usage.cached_input_tokens == 1580, "${run.usage}")
+        // A cache read is a subset of the input that was charged, never an addition.
+        assert(run.usage.total() == run.usage.input_tokens + run.usage.output_tokens, "${run.usage}")
+    }
+
+    // A prompt with no holes still works, and is the *best* case rather than a degenerate one: the
+    // whole body is stable, so the cache prefix is maximal.
+    fn a_prompt_with_no_holes_caches_in_its_entirety(): void {
+        p = @prompt { Answer in one short sentence. }.trimmed()
+        assert(p.is_static())
+        assert(p.holes.len() == 0)
+        assert(p.resolve() == Resolved.of("Answer in one short sentence."))
+        assert(sent_body(AgentConfig.new("m").with_system_prompt(p))
+            .contains("{\"cache_breakpoint\":true,\"parts\":[{\"text\":\"Answer in one short sentence.\",\"type\":\"text\"}],\"role\":\"system\"}"),
+            sent_body(AgentConfig.new("m").with_system_prompt(p)))
+    }
+}
