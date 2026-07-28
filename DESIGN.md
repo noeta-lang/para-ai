@@ -2,7 +2,7 @@
 
 An agent harness for Noeta: model calls, tool calling, MCP, structured responses, guardrails, rolling context, streaming (AG-UI over SSE), and OpenTelemetry — in the shape the rest of the `para` suite already has.
 
-Status: **phases 1, 2, and 3 are built and merged** — the codec seam, Anthropic, Mock, the run loop with tool calling, GenAI telemetry, and streaming. Phases 4–8 remain design. Every toolchain prerequisite this document named has landed (§17); the questions are settled or corrected in place.
+Status: **phases 1, 2, 3 and 8 are built and merged** — the codec seam, Anthropic, Mock, the run loop with tool calling, GenAI telemetry, streaming, and the `@prompt` tier with automatic cache breakpoints. Phases 4, 5, 6 and 7 are in flight or queued. Every toolchain prerequisite this document named has landed (§17); the questions are settled or corrected in place.
 
 ---
 
