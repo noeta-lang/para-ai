@@ -22,12 +22,12 @@ namespace para.ai.mock
 
 use std.http.client
 use std.http.server
-use std.http.{HttpError, Request, Response}
+use std.http.{Frame, Framing, HttpError, Request, Response}
 use std.json
 use para.api.{Api, Middleware, Next}
-use para.ai.{Agent, AgentConfig, AiError, Conversation, Message, Part, Role}
+use para.ai.{Agent, AgentConfig, AiError, Conversation, Event, EventSink, Frames, Message, Part, Role, Run, Streamer}
 use para.ai.provider
-use para.ai.provider.{Delta, ModelReply, ModelRequest, Provider, StopReason, Usage, Wire}
+use para.ai.provider.{Delta, ModelReply, ModelRequest, Provider, StopReason, StreamDecoder, Usage, Wire}
 use para.ai.tools.{Arg, Local, Tool, ToolSource}
 
 // One tool call in a scripted turn. `args` is a raw JSON blob, exactly as a vendor would stream
@@ -177,14 +177,321 @@ fn reply_body(s: Scripted, input_tokens: int): string {
     return json.stringify(body)
 }
 
-// The scripted `Provider` and the transport layer that answers it, in one object.
+// --- The streaming half ---------------------------------------------------------------------------
+//
+// `Mock` is the buffered transport by being a `para.api.Middleware`, and that is exactly what it
+// cannot be for a streamed call: a middleware answers with a whole `Response`, and a streamed call
+// never has one (DESIGN O-4). So `Mock` is a `para.ai.Streamer` as well, and replays a scripted
+// frame list instead. Same script, same recording of what was sent, no socket either way.
+//
+// The frames are derived from **the same `scripted_deltas`** the buffered body is, which is what
+// makes "a buffered run and a streamed run of one script produce the same answer" true by
+// construction rather than by two implementations agreeing.
+
+// Every delta a scripted entry means. The one place `Mock` decides what an entry *says*.
+fn scripted_deltas(s: Scripted, input_tokens: int): List<Delta> {
+    mut out: List<Delta> = [Delta.ModelDelta(model: "mock")]
+    out = out ~ match s {
+        Scripted.Text(text) => [Delta.TextDelta(id: "0", text: text)],
+        Scripted.Refusal(reason) => [Delta.TextDelta(id: "0", text: reason)],
+        Scripted.Tools(calls) => call_deltas(calls),
+        // Never reached: a failure never becomes a body at all.
+        Scripted.Failure(status, code, message) => [],
+    }
+    return out ~ [
+        Delta.Stop(reason: scripted_stop(s)),
+        Delta.UsageDelta(usage: Usage {
+            input_tokens: input_tokens,
+            output_tokens: json.stringify(scripted_parts(s)).len() / 4,
+        }),
+    ]
+}
+
+fn call_deltas(calls: List<ScriptedCall>): List<Delta> {
+    mut out: List<Delta> = []
+    for c in calls {
+        out = out ~ [
+            Delta.ToolCallStart(id: c.id, name: c.name),
+            Delta.ToolCallArgs(id: c.id, fragment: c.args),
+        ]
+    }
+    return out
+}
+
+// One delta as the mock's own frame payload. The format is `Mock`'s to choose, so it is a flat
+// rendering of the delta itself rather than an imitation of somebody's vendor protocol — a test
+// that fails should show what the mock said, not make you decode it.
+fn delta_to_json(d: Delta): Map<string, dyn> {
+    return match d {
+        Delta.ModelDelta(model) => {"type": "model", "model": model},
+        Delta.TextDelta(id, text) => {"type": "text", "id": id, "text": text},
+        Delta.ThinkingDelta(id, text) => {"type": "thinking", "id": id, "text": text},
+        Delta.ThinkingSignature(id, signature) => {"type": "signature", "id": id, "signature": signature},
+        Delta.ToolCallStart(id, name) => {"type": "tool_call", "id": id, "name": name},
+        Delta.ToolCallArgs(id, fragment) => {"type": "tool_args", "id": id, "fragment": fragment},
+        Delta.Stop(reason) => {"type": "stop", "stop": stop_name(reason)},
+        Delta.UsageDelta(usage) => {"type": "usage", "input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens},
+    }
+}
+
+// Split a string into runs of `n` **characters** — characters rather than bytes, because a chunk
+// boundary inside a multi-byte character would produce frames that are not text at all, and the
+// scripts in this package say `Malmö`.
+fn in_chunks(s: string, n: int): List<string> {
+    cs = s.chars()
+    mut out: List<string> = []
+    mut i = 0
+    while i < cs.len() {
+        stop = if i + n > cs.len() then cs.len() else i + n
+        out = out ~ [cs.slice(i, stop).join("")]
+        i = i + n
+    }
+    return if out.len() == 0 then [s] else out
+}
+
+// A delta as the one or more deltas a chunked stream would deliver it in. Only the two that carry
+// accumulating payloads split; everything else is atomic on every vendor's wire.
+fn chunk_delta(d: Delta, n: int): List<Delta> {
+    if n <= 0 {
+        return [d]
+    }
+    return match d {
+        Delta.TextDelta(id, text) => text_chunks(id, text, n),
+        Delta.ToolCallArgs(id, fragment) => args_chunks(id, fragment, n),
+        _ => [d],
+    }
+}
+
+fn text_chunks(id: string, text: string, n: int): List<Delta> {
+    mut out: List<Delta> = []
+    for piece in in_chunks(text, n) {
+        out = out ~ [Delta.TextDelta(id: id, text: piece)]
+    }
+    return out
+}
+
+fn args_chunks(id: string, fragment: string, n: int): List<Delta> {
+    mut out: List<Delta> = []
+    for piece in in_chunks(fragment, n) {
+        out = out ~ [Delta.ToolCallArgs(id: id, fragment: piece)]
+    }
+    return out
+}
+
+// A scripted entry as the newline-delimited frames a streamed read of it would produce, with a
+// terminal `done` so that a truncated replay is distinguishable from a complete one.
+fn frames_of(s: Scripted, input_tokens: int, chunk: int): List<Frame> {
+    mut out: List<Frame> = []
+    for d in scripted_deltas(s, input_tokens) {
+        for piece in chunk_delta(d, chunk) {
+            out = out ~ [Frame {
+                event: "",
+                data: json.stringify(delta_to_json(piece)),
+                id: "",
+                retry: none,
+            }]
+        }
+    }
+    done: Map<string, dyn> = {"type": "done"}
+    return out ~ [Frame { event: "", data: json.stringify(done), id: "", retry: none }]
+}
+
+// A `Frames` over a fixed list — a scripted or captured transcript, replayed at whatever pace the
+// reader asks for. The whole reason a streaming test needs no socket.
+pub class ScriptedFrames {
+    mut frames: List<Frame>
+    mut at: int
+    mut closed: bool
+
+    fn of(frames: List<Frame>): ScriptedFrames {
+        return ScriptedFrames { frames: frames, at: 0, closed: false }
+    }
+
+    // Whether the reader released the stream. Worth asserting: a run loop that abandoned a body
+    // without closing it would hold a real connection open for the life of the process, and the
+    // failing paths are the ones where that is easy to get wrong.
+    fn was_closed(): bool {
+        return self.closed
+    }
+}
+
+impl Frames for ScriptedFrames {
+    async fn next(): ?Frame {
+        if self.at >= self.frames.len() {
+            return none
+        }
+        f = self.frames[self.at]
+        self.at = self.at + 1
+        return some(f)
+    }
+
+    fn close(): void {
+        self.closed = true
+    }
+}
+
+// The mock's `StreamDecoder`: its own frames, read back as the deltas they were made from.
+pub class MockStream {
+    mut usage: Usage
+    mut done: bool
+
+    fn new(): MockStream {
+        return MockStream { usage: Usage {}, done: false }
+    }
+
+    // Inline for the reason `AnthropicStream`'s is: a standalone `impl StreamDecoder for
+    // MockStream` block is invisible to `dyn` coercion when this module is not the entry.
+    impl StreamDecoder {
+        fn push(frame: Frame): Result<List<Delta>, AiError> {
+            if frame.data == "" {
+                return Ok([])
+            }
+            doc = provider.parse_object(frame.data, "mock stream frame")?
+            kind = provider.str_at(doc, "type")
+            if kind == "model" {
+                return Ok([Delta.ModelDelta(model: provider.str_at(doc, "model"))])
+            }
+            if kind == "text" {
+                return Ok([Delta.TextDelta(id: provider.str_at(doc, "id"), text: provider.str_at(doc, "text"))])
+            }
+            if kind == "thinking" {
+                return Ok([Delta.ThinkingDelta(id: provider.str_at(doc, "id"), text: provider.str_at(doc, "text"))])
+            }
+            if kind == "signature" {
+                return Ok([Delta.ThinkingSignature(id: provider.str_at(doc, "id"), signature: provider.str_at(doc, "signature"))])
+            }
+            if kind == "tool_call" {
+                return Ok([Delta.ToolCallStart(id: provider.str_at(doc, "id"), name: provider.str_at(doc, "name"))])
+            }
+            if kind == "tool_args" {
+                return Ok([Delta.ToolCallArgs(id: provider.str_at(doc, "id"), fragment: provider.str_at(doc, "fragment"))])
+            }
+            if kind == "stop" {
+                return Ok([Delta.Stop(reason: stop_from_name(provider.str_at(doc, "stop")))])
+            }
+            if kind == "usage" {
+                self.usage = Usage {
+                    input_tokens: provider.int_at(doc, "input_tokens"),
+                    output_tokens: provider.int_at(doc, "output_tokens"),
+                }
+                return Ok([Delta.UsageDelta(usage: self.usage)])
+            }
+            if kind == "done" {
+                self.done = true
+                return Ok([])
+            }
+            return Err(AiError.Decode(path: "type", message: "mock cannot decode a `${kind}` frame"))
+        }
+
+        fn finish(): Result<Usage, AiError> {
+            if !self.done {
+                return Err(AiError.Decode(
+                    path: "",
+                    message: "the mock stream ended before its `done` frame — a truncated stream is not an answer",
+                ))
+            }
+            return Ok(self.usage)
+        }
+    }
+}
+
+
+// A `Streamer` that answers every request with the same frames, whatever was asked.
+//
+// `Mock`'s script cannot express the shapes that matter most for the read loop — a stream that
+// stops mid-message, and one that carries nothing at all — because a script describes *answers*
+// and these are failures of the transport underneath one. This describes frames instead.
+pub class Replay {
+    mut frames: List<Frame>
+    mut streams: List<ScriptedFrames>
+
+    fn of(frames: List<Frame>): Replay {
+        return Replay { frames: frames, streams: [] }
+    }
+
+    fn opened_streams(): List<ScriptedFrames> {
+        return self.streams
+    }
+
+    // Inline for the reason `MockStream`'s impl is; see there.
+    impl Streamer {
+        fn open(req: Request, framing: Framing): Result<dyn Frames, AiError> {
+            s = ScriptedFrames.of(self.frames)
+            self.streams = self.streams ~ [s]
+            return Ok(s)
+        }
+    }
+}
+
+// The test collector DESIGN §11 asks this module for: a sink that keeps every event, so asserting
+// on the exact event sequence of a run is a `@test` block with no server and no socket.
+pub class Collector {
+    mut seen: List<Event>
+
+    fn new(): Collector {
+        return Collector { seen: [] }
+    }
+
+    fn events(): List<Event> {
+        return self.seen
+    }
+
+    fn count(): int {
+        return self.seen.len()
+    }
+
+    // The run id this run was given, read off its `RunStarted`. A run id is a fresh uuid, so a test
+    // asserting on the exact sequence takes it from the run rather than predicting it.
+    fn run_id(): string {
+        mut found = ""
+        for e in self.seen {
+            found = match e {
+                Event.RunStarted(run_id, thread_id) => run_id,
+                _ => found,
+            }
+        }
+        return found
+    }
+}
+
+impl EventSink for Collector {
+    async fn emit(e: Event): void {
+        self.seen = self.seen ~ [e]
+    }
+}
+
+// The scripted `Provider` and both transports that answer it, in one object.
 pub class Mock {
     mut script: List<Scripted>
     mut cursor: int
     mut sent: List<string>
+    // How many characters of text or tool-argument payload each streamed frame carries. `0` means
+    // one frame per delta, which is what makes a streamed run's event sequence identical to a
+    // buffered one's; a test that wants to prove reassembly sets it small.
+    mut chunk: int
+    // Every stream this mock handed out, so a test can assert the reader released them.
+    mut streams: List<ScriptedFrames>
 
     fn new(): Mock {
-        return Mock { script: [], cursor: 0, sent: [] }
+        return Mock { script: [], cursor: 0, sent: [], chunk: 0, streams: [] }
+    }
+
+    // Deliver streamed payloads in runs of `n` characters — the knob that makes a scripted stream
+    // behave like a real one, where a sentence arrives as a dozen frames.
+    fn chunked(n: int): Mock {
+        self.chunk = n
+        return self
+    }
+
+    fn opened_streams(): List<ScriptedFrames> {
+        return self.streams
+    }
+
+    // Record a stream on the way out, so a test can ask afterwards whether the reader closed it.
+    fn hand_out(frames: List<Frame>): ScriptedFrames {
+        s = ScriptedFrames.of(frames)
+        self.streams = self.streams ~ [s]
+        return s
     }
 
     // --- Scripting ---------------------------------------------------------------------------
@@ -248,9 +555,11 @@ pub class Mock {
         return Api.new(client.new()).with(self)
     }
 
-    // The whole hermetic setup in one call: an agent whose codec **and** transport are this mock.
+    // The whole hermetic setup in one call: an agent whose codec and **both** transports are this
+    // mock — the middleware answers a buffered call, the `Streamer` answers a streamed one, and
+    // neither opens a socket.
     fn agent(cfg: AgentConfig): Agent<Mock> {
-        return Agent.over(cfg, self, self.api())
+        return Agent.over(cfg, self, self.api()).frames(self)
     }
 
     // The same, with a source of tools attached — the full tool loop with no socket in it.
@@ -308,17 +617,24 @@ impl Provider for Mock {
         // **no resolver at all** — a `.invalid` lookup is only NXDOMAIN if the resolver honors RFC
         // 6761, and a hijacking one that answers with a parking page would turn a transport failure
         // into a decode failure and flake the suite.
-        return Ok(Wire {
+        if req.stream {
+            body = body.set("stream", true)
+        }
+        wire = Wire {
             url: "http://127.0.0.1:1/v1/messages",
             method: "post",
             headers: {"content-type": "application/json"},
             body: json.stringify(body),
-        })
+        }
+        // Newline-delimited JSON rather than server-sent events, so the mock exercises the framing
+        // Ollama's native endpoint uses and Anthropic's tests exercise the other one. Between them
+        // the run loop's two cuts both have a hermetic test.
+        return Ok(if req.stream then wire.as_ndjson() else wire)
     }
 
-    fn decode_reply(body: string): Result<ModelReply, AiError> {
+    fn decode_deltas(body: string): Result<List<Delta>, AiError> {
         doc = provider.parse_object(body, "mock reply")?
-        mut deltas: List<Delta> = []
+        mut deltas: List<Delta> = [Delta.ModelDelta(model: provider.str_at(doc, "model"))]
         for (i, raw) in provider.list_at(doc, "parts").enumerate() {
             p = part_from_json(raw.as<Map<string, dyn>>() ?? {})?
             deltas = deltas ~ match p {
@@ -335,14 +651,21 @@ impl Provider for Mock {
             }
         }
         usage = provider.obj_at(doc, "usage")
-        deltas = deltas ~ [
+        return Ok(deltas ~ [
             Delta.Stop(reason: stop_from_name(provider.str_at(doc, "stop"))),
             Delta.UsageDelta(usage: Usage {
                 input_tokens: provider.int_at(usage, "input_tokens"),
                 output_tokens: provider.int_at(usage, "output_tokens"),
             }),
-        ]
-        return Ok(provider.fold(deltas, provider.str_at(doc, "model")))
+        ])
+    }
+
+    fn decode_reply(body: string): Result<ModelReply, AiError> {
+        return Ok(provider.fold(self.decode_deltas(body)?, ""))
+    }
+
+    fn decoder(): dyn StreamDecoder {
+        return MockStream.new()
     }
 
     fn decode_error(status: int, body: string): AiError {
@@ -361,6 +684,39 @@ impl Provider for Mock {
     // and saying `none` here would make the `some` path untestable without a real tokenizer.
     fn estimate_tokens(msgs: List<Message>): ?int {
         return some(provider.rough_token_estimate(msgs))
+    }
+}
+
+// The streaming transport half. Same script, same cursor, same recording of what was sent — and a
+// frame list where the middleware would have produced a whole `Response`.
+//
+// This is what DESIGN O-4 costs and what it buys. It costs a second implementation of "answer from
+// the script", because a streamed body cannot reach a `para.api.Middleware` at all. It buys the
+// incompatibility being a **compile error** — a `FrameStream` is simply not a `Response` — instead
+// of a `Retry` layer quietly re-requesting a body somebody was halfway through reading.
+impl Streamer for Mock {
+    fn open(req: Request, framing: Framing): Result<dyn Frames, AiError> {
+        self.sent = self.sent ~ [req.body()]
+        if self.cursor >= self.script.len() {
+            // Status `0`, not 500. A 500 is retryable and this is not a vendor answer at all — it
+            // is the test scripting fewer turns than the run took, and retrying it would record
+            // three more calls and bury the real complaint.
+            return Err(AiError.Provider(
+                status: 0,
+                code: "mock_script_exhausted",
+                message: "the mock script ran out after ${self.cursor} scripted repl(y/ies)",
+            ))
+        }
+        entry = self.script[self.cursor]
+        self.cursor = self.cursor + 1
+        return match entry {
+            Scripted.Failure(status, code, message) => Err(AiError.Provider(
+                status: status,
+                code: code,
+                message: message,
+            )),
+            _ => Ok(self.hand_out(frames_of(entry, req.body().len() / 4, self.chunk))),
+        }
     }
 }
 
@@ -647,6 +1003,291 @@ impl Middleware for Mock {
         }
     }
 
+
+    // --- Streaming ---------------------------------------------------------------------------------
+    //
+    // The transports differ; nothing above them does. These assert the **exact** event sequence of a
+    // run, because an event-order bug is invisible to a "did it finish" test: a `TextEnd` that never
+    // arrives, or a `ToolCallResult` emitted before the call it answers, leaves a renderer wrong in a
+    // way the final `Run` cannot show.
+
+    async fn a_streamed_run_emits_the_exact_event_sequence(): void {
+        m = Mock.new().reply_text("18°C and clear in Malmö.")
+        c = Collector.new()
+        agent = m.agent(AgentConfig.new("test-model").streamed())
+        match agent.run_into(Conversation.of("weather?"), c).await {
+            Ok(run) => {
+                rid = c.run_id()
+                assert(rid != "", "the run announced itself with an id")
+                assert(c.events() == [
+                    Event.RunStarted(run_id: rid, thread_id: ""),
+                    Event.TextStart(id: "0"),
+                    Event.TextDelta(id: "0", delta: "18°C and clear in Malmö."),
+                    Event.TextEnd(id: "0"),
+                    Event.RunFinished(run_id: rid, usage: run.usage),
+                ], "${c.events()}")
+                assert(run.text() == "18°C and clear in Malmö.")
+            },
+            Err(e) => {
+                assert(false, "${e}")
+            },
+        }
+    }
+
+    // The turn that matters. A tool call opens and closes its own block, its result is announced
+    // **after** the block closed and **before** the next turn opens, and the whole run still ends
+    // with exactly one terminal event.
+    async fn a_streamed_tool_turn_emits_the_exact_event_sequence(): void {
+        m = Mock.new()
+            .reply_tool("call_1", "mock_shout", "{\"text\": \"hej\"}")
+            .reply_text("It said HEJ.")
+        c = Collector.new()
+        agent = tool_agent_or_fail_with(m, AgentConfig.new("test-model").streamed())
+        match agent.run_into(Conversation.of("shout hej"), c).await {
+            Ok(run) => {
+                rid = c.run_id()
+                assert(c.events() == [
+                    Event.RunStarted(run_id: rid, thread_id: ""),
+                    Event.ToolCallStart(id: "call_1", name: "mock_shout"),
+                    Event.ToolCallArgsDelta(id: "call_1", delta: "{\"text\": \"hej\"}"),
+                    Event.ToolCallEnd(id: "call_1"),
+                    // The real `mock_shout` ran between these two events.
+                    Event.ToolCallResult(id: "call_1", content: "HEJ", is_error: false),
+                    Event.TextStart(id: "0"),
+                    Event.TextDelta(id: "0", delta: "It said HEJ."),
+                    Event.TextEnd(id: "0"),
+                    Event.RunFinished(run_id: rid, usage: run.usage),
+                ], "${c.events()}")
+                assert(run.turns == 2)
+            },
+            Err(e) => {
+                assert(false, "${e}")
+            },
+        }
+    }
+
+    // **The property the whole design is for.** One script, run both ways: the same conversation,
+    // the same turn count, the same stop reason, and the same events in the same order.
+    //
+    // The one thing that legitimately differs is the mock's *input* token count, which it synthesizes
+    // from the length of the request body — and the streamed request body really is longer, because
+    // it carries `"stream": true`. Asserting equality there would be asserting that two different
+    // requests are the same request, which they are not.
+    async fn a_buffered_run_and_a_streamed_run_agree(): void {
+        buffered = Collector.new()
+        streamed = Collector.new()
+        b = two_turn_script()
+        s = two_turn_script()
+        base = AgentConfig.new("test-model")
+        b_run = run_or_fail(tool_agent_or_fail_with(b, base), buffered).await
+        s_run = run_or_fail(tool_agent_or_fail_with(s, base.streamed()), streamed).await
+        assert(b_run.messages == s_run.messages, "the same conversation:\n  ${b_run.messages}\n  ${s_run.messages}")
+        assert(b_run.turns == s_run.turns)
+        assert(b_run.stop == s_run.stop)
+        assert(b_run.usage.output_tokens == s_run.usage.output_tokens, "the same answer, so the same output")
+        assert(comparable(buffered.events()) == comparable(streamed.events()),
+            "the same events:\n  buffered ${buffered.events()}\n  streamed ${streamed.events()}")
+        // And they really did take different roads to get there.
+        assert(b.opened_streams().len() == 0, "the buffered run opened no stream")
+        assert(s.opened_streams().len() == 2, "the streamed run opened one per turn")
+    }
+
+    // Chunking is what makes a scripted stream behave like a real one. The text arrives in pieces,
+    // every piece is its own event, and they reassemble into the one answer.
+    async fn chunked_frames_arrive_as_many_deltas_and_reassemble(): void {
+        m = Mock.new().chunked(4).reply_text("abcdefghij")
+        c = Collector.new()
+        agent = m.agent(AgentConfig.new("test-model").streamed())
+        match agent.run_into(Conversation.of("go"), c).await {
+            Ok(run) => {
+                assert(c.events() == [
+                    Event.RunStarted(run_id: c.run_id(), thread_id: ""),
+                    Event.TextStart(id: "0"),
+                    Event.TextDelta(id: "0", delta: "abcd"),
+                    Event.TextDelta(id: "0", delta: "efgh"),
+                    Event.TextDelta(id: "0", delta: "ij"),
+                    Event.TextEnd(id: "0"),
+                    Event.RunFinished(run_id: c.run_id(), usage: run.usage),
+                ], "${c.events()}")
+                assert(run.text() == "abcdefghij", "one block, whatever the frame boundaries were")
+            },
+            Err(e) => {
+                assert(false, "${e}")
+            },
+        }
+    }
+
+    // A chunk boundary is a character boundary, not a byte one. `Malmö` split every two bytes would
+    // produce frames that are not text at all.
+    async fn chunking_splits_characters_not_bytes(): void {
+        m = Mock.new().chunked(2).reply_text("Malmö")
+        c = Collector.new()
+        one = m.agent(AgentConfig.new("test-model").streamed()).run_into(Conversation.of("go"), c).await
+        assert(text_deltas(c.events()) == ["Ma", "lm", "ö"], "${text_deltas(c.events())}")
+    }
+
+    // A body left unread holds its connection open. The reader releases every stream it opened, on
+    // the ordinary path and on the failing one.
+    async fn the_reader_releases_every_stream_it_opens(): void {
+        m = Mock.new().reply_text("done")
+        one = m.agent(AgentConfig.new("test-model").streamed()).run(Conversation.of("go")).await
+        assert(m.opened_streams().len() == 1)
+        assert(m.opened_streams()[0].was_closed(), "the run loop closed the body")
+
+        // And when the decoder refuses a frame partway through.
+        bad = Replay.of([
+            Frame { event: "", data: "{\"type\": \"model\", \"model\": \"mock\"}", id: "", retry: none },
+            Frame { event: "", data: "{\"type\": \"nonsense\"}", id: "", retry: none },
+        ])
+        broken = Mock.new().reply_text("never used").agent(AgentConfig.new("test-model").streamed()).frames(bad)
+        two = broken.run(Conversation.of("go")).await
+        assert(match two { Ok(_) => false, Err(_) => true }, "an undecodable frame ends the call")
+        assert(bad.opened_streams()[0].was_closed(), "and the body is still released")
+    }
+
+    // **A truncated stream is not an answer.** The frames that arrived decode perfectly well; only
+    // the missing terminator says the reply is half of one, and `finish` is what notices.
+    async fn a_truncated_stream_is_refused_rather_than_answered(): void {
+        cut = Replay.of([
+            Frame { event: "", data: "{\"type\": \"model\", \"model\": \"mock\"}", id: "", retry: none },
+            Frame { event: "", data: "{\"type\": \"text\", \"id\": \"0\", \"text\": \"half an ans\"}", id: "", retry: none },
+        ])
+        agent = Mock.new().reply_text("unused").agent(AgentConfig.new("test-model").streamed()).frames(cut)
+        c = Collector.new()
+        match agent.run_into(Conversation.of("go"), c).await {
+            Ok(run) => {
+                assert(false, "a truncated stream must not answer: ${run.text()}")
+            },
+            Err(e) => {
+                assert("${e}".contains("done"), "${e}")
+                assert("${e}".contains("truncated"), "${e}")
+            },
+        }
+        // The failure is still a frame, and the block it interrupted was still closed.
+        assert(c.events() == [
+            Event.RunStarted(run_id: c.run_id(), thread_id: ""),
+            Event.TextStart(id: "0"),
+            Event.TextDelta(id: "0", delta: "half an ans"),
+            Event.TextEnd(id: "0"),
+            Event.RunError(message: "decode failed: the mock stream ended before its `done` frame — a truncated stream is not an answer", code: "decode"),
+        ], "${c.events()}")
+    }
+
+    // Every run ends with exactly one terminal event, whichever way it ended. A renderer cannot tell
+    // "still thinking" from "stopped" without it.
+    async fn a_failing_run_still_ends_with_one_terminal_event(): void {
+        m = Mock.new().fail(400, "invalid_request_error", "no")
+        c = Collector.new()
+        one = m.agent(AgentConfig.new("test-model").streamed()).run_into(Conversation.of("go"), c).await
+        assert(c.events() == [
+            Event.RunStarted(run_id: c.run_id(), thread_id: ""),
+            Event.RunError(message: "provider error 400 invalid_request_error: no", code: "invalid_request_error"),
+        ], "${c.events()}")
+    }
+
+    // **The streaming path owns its retry**, because `para/api`'s cannot reach it: retrying means
+    // asking for the body again, and a stream you have begun reading cannot be asked twice.
+    async fn a_retryable_streamed_status_is_retried_within_its_budget(): void {
+        m = Mock.new()
+            .fail(429, "rate_limit_error", "slow down")
+            .fail(429, "rate_limit_error", "slow down")
+            .reply_text("thanks for waiting")
+        cfg = AgentConfig.new("test-model").streamed().with_stream_retries(2).with_stream_backoff(1)
+        match m.agent(cfg).run(Conversation.of("go")).await {
+            Ok(run) => {
+                assert(run.text() == "thanks for waiting")
+                assert(m.call_count() == 3, "two refusals and the answer: ${m.call_count()}")
+            },
+            Err(e) => {
+                assert(false, "${e}")
+            },
+        }
+    }
+
+    // Narrowly. A 400 retried is a 400 twice, and a wasted second of somebody's rate limit.
+    async fn a_non_retryable_streamed_status_is_reported_at_once(): void {
+        m = Mock.new().fail(400, "invalid_request_error", "your request is wrong")
+        cfg = AgentConfig.new("test-model").streamed().with_stream_retries(3).with_stream_backoff(1)
+        match m.agent(cfg).run(Conversation.of("go")).await {
+            Ok(_) => {
+                assert(false, "a 400 is not an answer")
+            },
+            Err(e) => {
+                assert(match e { AiError.Provider(status, code, message) => status == 400, _ => false }, "${e}")
+                assert(m.call_count() == 1, "exactly one attempt, not four: ${m.call_count()}")
+            },
+        }
+    }
+
+    // Retrying is bounded, and running out is the vendor's error rather than a new one of ours.
+    async fn a_streamed_retry_gives_up_and_reports_the_last_failure(): void {
+        m = Mock.new()
+            .fail(503, "overloaded_error", "later")
+            .fail(503, "overloaded_error", "later")
+            .fail(503, "overloaded_error", "later")
+            .fail(503, "overloaded_error", "later")
+        cfg = AgentConfig.new("test-model").streamed().with_stream_retries(2).with_stream_backoff(1)
+        match m.agent(cfg).run(Conversation.of("go")).await {
+            Ok(_) => {
+                assert(false, "four failures are not an answer")
+            },
+            Err(e) => {
+                assert(match e { AiError.Provider(status, code, message) => code == "overloaded_error", _ => false }, "${e}")
+                assert(m.call_count() == 3, "the first attempt plus two retries: ${m.call_count()}")
+            },
+        }
+    }
+
+    // A refusal is `AiError.Refused` on both transports — it is decided from the stop reason, above
+    // the transport, which is the point.
+    async fn a_streamed_refusal_is_still_its_own_error(): void {
+        m = Mock.new().refuse("I can't help with that.")
+        match m.agent(AgentConfig.new("test-model").streamed()).run(Conversation.of("...")).await {
+            Ok(_) => {
+                assert(false, "a refusal is not an answer")
+            },
+            Err(e) => {
+                assert(match e { AiError.Refused(reason) => reason == "I can't help with that.", _ => false }, "${e}")
+            },
+        }
+    }
+
+    // The `Sender<Event>` door, with a concurrent reader — the shape an SSE responder will use in
+    // phase 7 and the reason every `Event` variant is a value type.
+    async fn the_channel_door_delivers_events_to_a_concurrent_reader(): void {
+        m = Mock.new().chunked(3).reply_text("streamed to you")
+        agent = m.agent(AgentConfig.new("test-model").streamed())
+        (tx, rx) = channel::<Event>(64)
+        mut got: List<Event> = []
+        concurrent {
+            reader = spawn drain_events(rx)
+            one = agent.stream(Conversation.of("go"), tx).await
+            tx.close()
+            got = reader.await
+        }
+        assert(got.len() > 0, "the reader saw the run")
+        assert(text_deltas(got).join("") == "streamed to you", "${got}")
+        assert(match got[0] { Event.RunStarted(run_id, thread_id) => true, _ => false }, "${got[0]}")
+        assert(match got[got.len() - 1] { Event.RunFinished(run_id, usage) => true, _ => false }, "${got}")
+    }
+
+    // `stream` streams even when the config does not, because a caller who asked for events as they
+    // happen has said what they want.
+    async fn the_stream_door_streams_whatever_the_config_says(): void {
+        m = Mock.new().reply_text("ok")
+        agent = m.agent(AgentConfig.new("test-model"))
+        assert(!agent.config.stream, "the config is buffered")
+        (tx, rx) = channel::<Event>(16)
+        mut got: List<Event> = []
+        concurrent {
+            reader = spawn drain_events(rx)
+            one = agent.stream(Conversation.of("go"), tx).await
+            tx.close()
+            got = reader.await
+        }
+        assert(m.opened_streams().len() == 1, "it opened a stream anyway")
+    }
+
     // --- The codec, on its own ---------------------------------------------------------------
 
     // Every part kind survives the mock's own wire format, which is what makes `calls()` readable
@@ -728,6 +1369,74 @@ fn two_call_results(cap: int): string {
     agent = tool_agent_or_fail_with(m, AgentConfig.new("test-model").with_tool_concurrency(cap))
     one = agent.run_sync("go")
     return m.calls()[1]
+}
+
+
+// The two-turn tool script both halves of the agreement test run.
+fn two_turn_script(): Mock {
+    return Mock.new()
+        .reply_tool("call_1", "mock_shout", "{\"text\": \"hej\"}")
+        .reply_text("It said HEJ.")
+}
+
+// Every event with the two things that are *supposed* to differ between two runs blanked: the run
+// id, which is a fresh uuid per run, and the terminal usage, which carries the mock's request-body
+// estimate and so reflects that a streamed request body is a few characters longer.
+fn comparable(events: List<Event>): List<Event> {
+    mut out: List<Event> = []
+    for e in events {
+        out = out ~ [match e {
+            Event.RunStarted(run_id, thread_id) => Event.RunStarted(run_id: "", thread_id: thread_id),
+            Event.RunFinished(run_id, usage) => Event.RunFinished(run_id: "", usage: Usage {}),
+            _ => e,
+        }]
+    }
+    return out
+}
+
+// Unwrap a run or fail the test. A `match` arm cannot both fail an assertion and produce a value.
+async fn run_or_fail(agent: Agent<Mock>, sink: dyn EventSink): Run {
+    match agent.run_into(Conversation.of("shout hej"), sink).await {
+        Ok(run) => {
+            return run
+        },
+        Err(e) => {
+            assert(false, "${e}")
+        },
+    }
+    return Run { messages: [] }
+}
+
+// Just the text a run streamed, in order.
+fn text_deltas(events: List<Event>): List<string> {
+    mut out: List<string> = []
+    for e in events {
+        match e {
+            Event.TextDelta(id, delta) => {
+                out = out ~ [delta]
+            },
+            _ => {},
+        }
+    }
+    return out
+}
+
+// Drain a run's event channel to a list — the "test collector" half of §11's two consumers, in its
+// channel form.
+async fn drain_events(rx: Receiver<Event>): List<Event> {
+    mut out: List<Event> = []
+    mut going = true
+    while going {
+        match rx.recv().await {
+            some(e) => {
+                out = out ~ [e]
+            },
+            none => {
+                going = false
+            },
+        }
+    }
+    return out
 }
 
 // --- The tools these tests drive ------------------------------------------------------------------

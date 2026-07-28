@@ -18,10 +18,11 @@
 //     invalidates it, so both are round-tripped verbatim.
 namespace para.ai.providers.anthropic
 
+use std.http.{Frame}
 use std.{env, json}
 use para.ai.{AiError, Message, Part, Role}
 use para.ai.provider
-use para.ai.provider.{Delta, ModelReply, ModelRequest, Provider, StopReason, Usage, Wire}
+use para.ai.provider.{Delta, ModelReply, ModelRequest, Provider, StopReason, StreamDecoder, Usage, Wire}
 use para.ai.tools.{ToolSpec}
 
 // The Anthropic Messages API, as a codec.
@@ -306,6 +307,221 @@ fn typed_error(status: int, doc: Map<string, dyn>): AiError {
     )
 }
 
+// --- The streaming protocol -------------------------------------------------------------------
+//
+// Anthropic streams a reply as `text/event-stream`:
+//
+//     message_start                     the message envelope: served model, input token count
+//       content_block_start   index 0   what kind of block slot 0 is, and its vendor id if any
+//       content_block_delta   index 0   … many, each naming only the index
+//       content_block_stop    index 0
+//       …                               more blocks, opened and closed in turn
+//     message_delta                     stop reason, and the cumulative output token count
+//     message_stop                      the terminator
+//
+// with `ping` frames anywhere and an `error` frame in place of the rest when generation fails
+// mid-stream. Two properties of that shape decide the decoder's design:
+//
+//   * **It is indexed, so the decoder is stateful.** A `content_block_delta` says `index: 1` and
+//     nothing else — which block that is, and therefore which neutral delta id its increments
+//     carry, is only knowable from the `content_block_start` that came before it.
+//   * **Token accounting is split across two frames.** The input count is in `message_start` and
+//     the output count in `message_delta`, so the decoder keeps a running `Usage` and re-emits the
+//     merged total rather than letting the second report erase the first (`provider.merge_usage`).
+//
+// The ids it hands out are **the same ones `decode_deltas` produces for a buffered reply** — the
+// block index for text and thinking, the vendor's own `toolu_…` for a tool call. That is what lets
+// one `fold` and one event emitter serve both transports.
+
+// Whether a usage report says anything at all. An absent `usage` object reads as all-zeros through
+// the total JSON readers, and re-emitting that as a delta would be noise.
+fn any_usage(u: Usage): bool {
+    return u.input_tokens + u.output_tokens + u.cached_input_tokens + u.reasoning_tokens > 0
+}
+
+// The event's name. The `data` payload carries its own `type`, which is authoritative; the SSE
+// `event:` field is the fallback for a framing that does not preserve event names.
+fn event_type(doc: Map<string, dyn>, frame: Frame): string {
+    named = provider.str_at(doc, "type")
+    return if named == "" then frame.event else named
+}
+
+pub class AnthropicStream {
+    // Block index (rendered as a string, since that is also the delta id for text and thinking) to
+    // the neutral delta id that block's increments carry. The whole of the indexed protocol's
+    // state: a `content_block_delta` names only an index, and its own `type` says the rest.
+    mut ids: Map<string, string>
+    mut usage: Usage
+    mut model: string
+    // Whether `message_start` and `message_stop` were seen. Both halves of `finish`'s job: a stream
+    // that never opened produced no reply at all, and one that never closed produced half of one.
+    mut opened: bool
+    mut closed: bool
+
+    fn new(): AnthropicStream {
+        return AnthropicStream {
+            ids: {},
+            usage: Usage {},
+            model: "",
+            opened: false,
+            closed: false,
+        }
+    }
+
+    fn remember(at: string, id: string): void {
+        self.ids = self.ids.set(at, id)
+    }
+
+    fn on_message_start(doc: Map<string, dyn>): Result<List<Delta>, AiError> {
+        self.opened = true
+        msg = provider.obj_at(doc, "message")
+        self.model = provider.str_at(msg, "model")
+        self.usage = provider.merge_usage(self.usage, decode_usage(provider.obj_at(msg, "usage")))
+        mut out: List<Delta> = [Delta.ModelDelta(model: self.model)]
+        if any_usage(self.usage) {
+            out = out ~ [Delta.UsageDelta(usage: self.usage)]
+        }
+        return Ok(out)
+    }
+
+    fn on_block_start(doc: Map<string, dyn>): Result<List<Delta>, AiError> {
+        at = "${provider.int_at(doc, "index")}"
+        block = provider.obj_at(doc, "content_block")
+        kind = provider.str_at(block, "type")
+        if kind == "text" {
+            self.remember(at, at)
+            return Ok([])
+        }
+        if kind == "thinking" {
+            self.remember(at, at)
+            return Ok([])
+        }
+        if kind == "tool_use" {
+            // The vendor's own call id, not the block index — it is what a `tool_result` must
+            // address, exactly as in the buffered decode.
+            call_id = provider.str_at(block, "id")
+            self.remember(at, call_id)
+            return Ok([Delta.ToolCallStart(id: call_id, name: provider.str_at(block, "name"))])
+        }
+        // Loud, for the same reason `decode_block` is: a block carries answer content, and dropping
+        // one turns a partial answer into a complete-looking one.
+        return Err(AiError.Decode(
+            path: "content[${at}].type",
+            message: "unsupported Anthropic content block type `${kind}`",
+        ))
+    }
+
+    fn on_block_delta(doc: Map<string, dyn>): Result<List<Delta>, AiError> {
+        at = "${provider.int_at(doc, "index")}"
+        // A delta for an index no `content_block_start` opened is not something the protocol
+        // produces; falling back to the index keeps the fold sane rather than dropping content.
+        id = self.ids.get(at) ?? at
+        d = provider.obj_at(doc, "delta")
+        kind = provider.str_at(d, "type")
+        if kind == "text_delta" {
+            return Ok([Delta.TextDelta(id: id, text: provider.str_at(d, "text"))])
+        }
+        if kind == "thinking_delta" {
+            return Ok([Delta.ThinkingDelta(id: id, text: provider.str_at(d, "thinking"))])
+        }
+        if kind == "signature_delta" {
+            return Ok([Delta.ThinkingSignature(id: id, signature: provider.str_at(d, "signature"))])
+        }
+        if kind == "input_json_delta" {
+            fragment = provider.str_at(d, "partial_json")
+            // The vendor opens every tool block with an empty fragment. It carries nothing, and
+            // passing it on would put a zero-length `ToolCallArgsDelta` in the event stream.
+            if fragment == "" {
+                return Ok([])
+            }
+            return Ok([Delta.ToolCallArgs(id: id, fragment: fragment)])
+        }
+        return Err(AiError.Decode(
+            path: "content[${at}].delta.type",
+            message: "unsupported Anthropic content block delta type `${kind}`",
+        ))
+    }
+
+    fn on_message_delta(doc: Map<string, dyn>): Result<List<Delta>, AiError> {
+        mut out: List<Delta> = []
+        raw = provider.str_at(provider.obj_at(doc, "delta"), "stop_reason")
+        if raw != "" {
+            out = out ~ [Delta.Stop(reason: decode_stop(raw))]
+        }
+        fresh = decode_usage(provider.obj_at(doc, "usage"))
+        if any_usage(fresh) {
+            self.usage = provider.merge_usage(self.usage, fresh)
+            out = out ~ [Delta.UsageDelta(usage: self.usage)]
+        }
+        return Ok(out)
+    }
+
+    // **Inline, not a standalone `impl StreamDecoder for AnthropicStream` block, and that is
+    // load-bearing.** Written standalone, the impl is invisible to `dyn` coercion whenever this
+    // module is not the entry: `Anthropic.decoder()` fails to check with E0007 "expected `dyn
+    // StreamDecoder`, found `AnthropicStream`" from a consuming package, while `noeta test
+    // anthropic.noe` — where this file *is* the entry — passes. Inline, it resolves everywhere.
+    // See AGENTS.md for the minimal repro.
+    impl StreamDecoder {
+        fn push(frame: Frame): Result<List<Delta>, AiError> {
+            // A keepalive comment dispatches no data. Nothing to decode, and it is not an error.
+            if frame.data == "" {
+                return Ok([])
+            }
+            doc = provider.parse_object(frame.data, "anthropic stream event")?
+            kind = event_type(doc, frame)
+            if kind == "message_start" {
+                return self.on_message_start(doc)
+            }
+            if kind == "content_block_start" {
+                return self.on_block_start(doc)
+            }
+            if kind == "content_block_delta" {
+                return self.on_block_delta(doc)
+            }
+            if kind == "message_delta" {
+                return self.on_message_delta(doc)
+            }
+            if kind == "content_block_stop" {
+                return Ok([])
+            }
+            if kind == "ping" {
+                return Ok([])
+            }
+            if kind == "message_stop" {
+                self.closed = true
+                return Ok([])
+            }
+            if kind == "error" {
+                // A vendor error inside an otherwise-successful 200 stream — an overload that struck
+                // mid-generation. There is no HTTP status to report, and `0` says exactly that; `code`
+                // stays matchable, which is the whole point of `AiError.Provider`.
+                return Err(typed_error(0, doc))
+            }
+            // "New event types may be added, and your code should handle unknown event types
+            // gracefully" — the vendor's own instruction, and the reason an unknown *event* is skipped
+            // where an unknown content *block* is refused. An envelope event carries no answer content.
+            return Ok([])
+        }
+
+        fn finish(): Result<Usage, AiError> {
+            if !self.opened {
+                return Err(AiError.Decode(
+                    path: "",
+                    message: "the Anthropic event stream carried no `message_start` — nothing was streamed. A non-2xx response streams its error body like any other body, and `std.http`'s `FrameStream` exposes no status, so a rate limit or a rejected request arrives here as an empty stream",
+                ))
+            }
+            if !self.closed {
+                return Err(AiError.Decode(
+                    path: "",
+                    message: "the Anthropic event stream ended before `message_stop` — the reply is truncated, and reporting it as a complete answer would be worse than failing",
+                ))
+            }
+            return Ok(self.usage)
+        }
+    }
+}
+
 impl Provider for Anthropic {
     fn name(): string {
         return "anthropic"
@@ -337,6 +553,9 @@ impl Provider for Anthropic {
             stop: List<dyn> = req.stop.map(fn(s) => s)
             body = body.set("stop_sequences", stop)
         }
+        if req.stream {
+            body = body.set("stream", true)
+        }
         // The escape hatch, merged verbatim and last, so it can also override a key this codec
         // set. Unchecked by design — but a fragment that is not JSON at all is caught here rather
         // than becoming a vendor-side 400 with no context.
@@ -352,25 +571,39 @@ impl Provider for Anthropic {
         if self.beta.len() > 0 {
             headers = headers.set("anthropic-beta", self.beta.join(","))
         }
-        return Ok(Wire {
+        wire = Wire {
             url: self.base_url ~ "/v1/messages",
             method: "post",
             headers: headers,
             body: json.stringify(body),
-        })
+        }
+        // The body key and the framing are set together and never apart: a request that says
+        // `"stream": true` but leaves the wire buffered would wait forever for a body that never
+        // arrives whole, and one that says the opposite would frame a complete JSON document as if
+        // it were events.
+        return Ok(if req.stream then wire.as_sse() else wire)
     }
 
-    fn decode_reply(body: string): Result<ModelReply, AiError> {
+    fn decode_deltas(body: string): Result<List<Delta>, AiError> {
         doc = provider.parse_object(body, "anthropic reply")?
-        mut deltas: List<Delta> = []
+        // The served model leads, so the delta list describes the reply completely and the
+        // streaming path needs no side channel for it.
+        mut deltas: List<Delta> = [Delta.ModelDelta(model: provider.str_at(doc, "model"))]
         for (i, blk) in provider.list_at(doc, "content").enumerate() {
             deltas = deltas ~ decode_block(blk.as<Map<string, dyn>>() ?? {}, i)?
         }
-        deltas = deltas ~ [
+        return Ok(deltas ~ [
             Delta.Stop(reason: decode_stop(provider.str_at(doc, "stop_reason"))),
             Delta.UsageDelta(usage: decode_usage(provider.obj_at(doc, "usage"))),
-        ]
-        return Ok(provider.fold(deltas, provider.str_at(doc, "model")))
+        ])
+    }
+
+    fn decode_reply(body: string): Result<ModelReply, AiError> {
+        return Ok(provider.fold(self.decode_deltas(body)?, ""))
+    }
+
+    fn decoder(): dyn StreamDecoder {
+        return AnthropicStream.new()
     }
 
     // Anthropic's error body is `{"type":"error","error":{"type":…,"message":…}}`. Decoding it into
@@ -423,6 +656,244 @@ fn decode_or_fail(codec: Anthropic, body: string): ModelReply {
         },
     }
     return ModelReply { parts: [] }
+}
+
+// A verbatim `text/event-stream` transcript of a `POST /v1/messages` with `"stream": true` — the
+// wire bytes Anthropic publishes for the basic case, line for line, including the `ping` the reader
+// has to shrug off. Held as raw wire lines rather than as pre-cut `Frame`s so that what the decoder
+// is proved against is *the vendor's bytes*, diffable against the vendor's own documentation,
+// rather than a frame list written to match this decoder.
+fn captured_text_stream(): List<string> {
+    return [
+        "event: message_start",
+        "data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_1nZdL29xx5MUA1yADyHTEsnR8uuvGzszyY\", \"type\": \"message\", \"role\": \"assistant\", \"content\": [], \"model\": \"claude-opus-5\", \"stop_reason\": null, \"stop_sequence\": null, \"usage\": {\"input_tokens\": 25, \"output_tokens\": 1}}}",
+        "",
+        "event: content_block_start",
+        "data: {\"type\": \"content_block_start\", \"index\": 0, \"content_block\": {\"type\": \"text\", \"text\": \"\"}}",
+        "",
+        "event: ping",
+        "data: {\"type\": \"ping\"}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\": \"content_block_delta\", \"index\": 0, \"delta\": {\"type\": \"text_delta\", \"text\": \"Hello\"}}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\": \"content_block_delta\", \"index\": 0, \"delta\": {\"type\": \"text_delta\", \"text\": \"!\"}}",
+        "",
+        "event: content_block_stop",
+        "data: {\"type\": \"content_block_stop\", \"index\": 0}",
+        "",
+        "event: message_delta",
+        "data: {\"type\": \"message_delta\", \"delta\": {\"stop_reason\": \"end_turn\", \"stop_sequence\":null}, \"usage\": {\"output_tokens\": 15}}",
+        "",
+        "event: message_stop",
+        "data: {\"type\": \"message_stop\"}",
+    ]
+}
+
+// The same, for a turn that talks and then calls a tool. This is the interesting one: the tool
+// block's arguments arrive as six separate partial-JSON fragments that are not individually valid
+// JSON, the first of which is empty, and the vendor's own `toolu_…` id — not the block index — is
+// what a later `tool_result` has to address. Note the stray space in `"index":1 }`: that is in the
+// published transcript and is left in, because a decoder that only survives tidy whitespace is not
+// one worth having.
+fn captured_tool_use_stream(): List<string> {
+    return [
+        "event: message_start",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_014p7gG3wDgGV9EUtLvnow3U\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":472,\"output_tokens\":2},\"content\":[],\"stop_reason\":null}}",
+        "",
+        "event: content_block_start",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}",
+        "",
+        "event: ping",
+        "data: {\"type\": \"ping\"}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Okay\"}}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\",\"}}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" let\"}}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"'s\"}}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" check\"}}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" the\"}}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" weather\"}}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" for\"}}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" San\"}}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" Francisco\"}}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\",\"}}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" CA\"}}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\":\"}}",
+        "",
+        "event: content_block_stop",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}",
+        "",
+        "event: content_block_start",
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_01T1x1fJ34qAmk2tNTrN7Up6\",\"name\":\"get_weather\",\"input\":{}}}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\"}}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"location\\\":\"}}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\" \\\"San\"}}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\" Francisc\"}}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"o,\"}}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\" CA\\\"}\"}}",
+        "",
+        "event: content_block_stop",
+        "data: {\"type\":\"content_block_stop\",\"index\":1 }",
+        "",
+        "event: message_delta",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":89}}",
+        "",
+        "event: message_stop",
+        "data: {\"type\":\"message_stop\"}",
+    ]
+}
+
+// A turn with extended thinking: four `thinking_delta`s, then the `signature_delta` that closes the
+// block, then an ordinary text block. Two things this fixture pins that the others do not — the
+// `message_start` here carries **no** `usage` object at all, and there is no `usage` on the
+// `message_delta` either, so the whole call reports zero tokens and must not fail for it.
+fn captured_thinking_stream(): List<string> {
+    return [
+        "event: message_start",
+        "data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_01...\", \"type\": \"message\", \"role\": \"assistant\", \"content\": [], \"model\": \"claude-opus-5\", \"stop_reason\": null, \"stop_sequence\": null}}",
+        "",
+        "event: content_block_start",
+        "data: {\"type\": \"content_block_start\", \"index\": 0, \"content_block\": {\"type\": \"thinking\", \"thinking\": \"\", \"signature\": \"\"}}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\": \"content_block_delta\", \"index\": 0, \"delta\": {\"type\": \"thinking_delta\", \"thinking\": \"I need to find the GCD of 1071 and 462 using the Euclidean algorithm.\\n\\n1071 = 2 × 462 + 147\"}}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\": \"content_block_delta\", \"index\": 0, \"delta\": {\"type\": \"thinking_delta\", \"thinking\": \"\\n462 = 3 × 147 + 21\"}}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\": \"content_block_delta\", \"index\": 0, \"delta\": {\"type\": \"thinking_delta\", \"thinking\": \"\\n147 = 7 × 21 + 0\"}}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\": \"content_block_delta\", \"index\": 0, \"delta\": {\"type\": \"thinking_delta\", \"thinking\": \"\\nThe remainder is 0, so GCD(1071, 462) = 21.\"}}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\": \"content_block_delta\", \"index\": 0, \"delta\": {\"type\": \"signature_delta\", \"signature\": \"EqQBCgIYAhIM1gbcDa9GJwZA2b3hGgxBdjrkzLoky3dl1pkiMOYds...\"}}",
+        "",
+        "event: content_block_stop",
+        "data: {\"type\": \"content_block_stop\", \"index\": 0}",
+        "",
+        "event: content_block_start",
+        "data: {\"type\": \"content_block_start\", \"index\": 1, \"content_block\": {\"type\": \"text\", \"text\": \"\"}}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\": \"content_block_delta\", \"index\": 1, \"delta\": {\"type\": \"text_delta\", \"text\": \"The greatest common divisor of 1071 and 462 is **21**.\"}}",
+        "",
+        "event: content_block_stop",
+        "data: {\"type\": \"content_block_stop\", \"index\": 1}",
+        "",
+        "event: message_delta",
+        "data: {\"type\": \"message_delta\", \"delta\": {\"stop_reason\": \"end_turn\", \"stop_sequence\": null}}",
+        "",
+        "event: message_stop",
+        "data: {\"type\": \"message_stop\"}",
+    ]
+}
+
+// A stream that dies mid-generation. Anthropic sends `event: error` inside an already-successful
+// 200 response, so the transport reports nothing wrong and the only evidence is in the frames.
+fn captured_interrupted_stream(): List<string> {
+    return [
+        "event: message_start",
+        "data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_01...\", \"type\": \"message\", \"role\": \"assistant\", \"content\": [], \"model\": \"claude-opus-5\", \"stop_reason\": null, \"stop_sequence\": null}}",
+        "",
+        "event: content_block_start",
+        "data: {\"type\": \"content_block_start\", \"index\": 0, \"content_block\": {\"type\": \"text\", \"text\": \"\"}}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\": \"content_block_delta\", \"index\": 0, \"delta\": {\"type\": \"text_delta\", \"text\": \"Hello\"}}",
+        "",
+        "event: error",
+        "data: {\"type\": \"error\", \"error\": {\"type\": \"overloaded_error\", \"message\": \"Overloaded\"}}",
+    ]
+}
+
+// Cut a verbatim transcript into the frames `std.http`'s reader hands back: `event:` names the
+// frame, `data:` lines join with a newline between them, and a blank line dispatches what has
+// accumulated. Test-only — the run loop never sees wire text, it sees frames std already cut.
+fn sse_frames(lines: List<string>): List<Frame> {
+    mut out: List<Frame> = []
+    mut event = ""
+    mut data = ""
+    mut open = false
+    for line in lines {
+        if line == "" {
+            if open {
+                out = out ~ [Frame { event: event, data: data, id: "", retry: none }]
+            }
+            event = ""
+            data = ""
+            open = false
+        } else if line.starts_with("event: ") {
+            event = line.slice(7, line.len())
+            open = true
+        } else if line.starts_with("data: ") {
+            piece = line.slice(6, line.len())
+            data = if data == "" then piece else data ~ "\n" ~ piece
+            open = true
+        }
+    }
+    if open {
+        out = out ~ [Frame { event: event, data: data, id: "", retry: none }]
+    }
+    return out
+}
+
+// Replay a transcript through a fresh decoder, one frame at a time, exactly as the run loop does.
+// The deltas are what `push` produced; `finish` is asserted separately, because whether a stream
+// ended where it should is a different question from what it said.
+fn stream_or_fail(decoder: dyn StreamDecoder, lines: List<string>): List<Delta> {
+    mut out: List<Delta> = []
+    for f in sse_frames(lines) {
+        match decoder.push(f) {
+            Ok(more) => {
+                out = out ~ more
+            },
+            Err(e) => {
+                assert(false, "push failed on `${f.event}`: ${e}")
+            },
+        }
+    }
+    return out
 }
 
 fn captured_text_reply(): string {
@@ -884,5 +1355,248 @@ fn captured_tool_use_reply(): string {
     // O-5, demonstrated: Anthropic ships no local tokenizer, so it says so rather than guessing.
     fn estimate_tokens_is_none_because_there_is_no_local_tokenizer(): void {
         assert(Anthropic.new("k").estimate_tokens([Message.user("hello")]) == none)
+    }
+
+    // --- Streaming ---------------------------------------------------------------------------------
+
+    // Asking for a stream is one body key and one framing, set together. A request that did not ask
+    // gets neither — an absent `stream` key is not the same request as `"stream": false`.
+    fn encode_asks_for_a_stream_only_when_the_request_does(): void {
+        buffered = encode_or_fail(Anthropic.new("k"), ModelRequest {
+            model: "m",
+            messages: [Message.user("hi")],
+        })
+        assert(!buffered.body.contains("\"stream\""), buffered.body)
+        assert(!buffered.streamed(), "and the wire says so")
+
+        streamed = encode_or_fail(Anthropic.new("k"), ModelRequest {
+            model: "m",
+            messages: [Message.user("hi")],
+            stream: true,
+        })
+        assert(streamed.body.contains("\"stream\":true"), streamed.body)
+        assert(streamed.streamed())
+        assert(!streamed.ndjson(), "Anthropic speaks server-sent events")
+    }
+
+    // The captured basic transcript, frame by frame. Every delta, in order — a "did it finish"
+    // assertion would pass on a decoder that dropped the `ping`, mislabeled the block, or lost the
+    // input token count when the output count arrived.
+    fn a_captured_text_stream_decodes_frame_by_frame(): void {
+        decoder: dyn StreamDecoder = AnthropicStream.new()
+        deltas = stream_or_fail(decoder, captured_text_stream())
+        assert(deltas == [
+            Delta.ModelDelta(model: "claude-opus-5"),
+            Delta.UsageDelta(usage: Usage { input_tokens: 25, output_tokens: 1 }),
+            Delta.TextDelta(id: "0", text: "Hello"),
+            Delta.TextDelta(id: "0", text: "!"),
+            Delta.Stop(reason: StopReason.EndTurn),
+            // `message_delta` reports only the output count; the input count from `message_start`
+            // survives rather than being overwritten with a zero.
+            Delta.UsageDelta(usage: Usage { input_tokens: 25, output_tokens: 15 }),
+        ], "${deltas}")
+        assert(decoder.finish() == Ok(Usage { input_tokens: 25, output_tokens: 15 }))
+
+        reply = provider.fold(deltas, "")
+        assert(reply.parts == [Part.Text(text: "Hello!")])
+        assert(reply.model == "claude-opus-5", "the served model rode in on `message_start`")
+        assert(reply.stop == StopReason.EndTurn)
+        assert(reply.usage == Usage { input_tokens: 25, output_tokens: 15 })
+    }
+
+    // The captured tool-use transcript. The arguments arrive as six partial-JSON fragments, five of
+    // which are not valid JSON on their own and the first of which is empty — which is exactly why
+    // `Part.ToolCall.args` is a raw string with one accumulate-then-decode boundary.
+    fn a_captured_tool_use_stream_decodes_frame_by_frame(): void {
+        decoder: dyn StreamDecoder = AnthropicStream.new()
+        deltas = stream_or_fail(decoder, captured_tool_use_stream())
+        assert(deltas == [
+            Delta.ModelDelta(model: "claude-opus-5"),
+            Delta.UsageDelta(usage: Usage { input_tokens: 472, output_tokens: 2 }),
+            Delta.TextDelta(id: "0", text: "Okay"),
+            Delta.TextDelta(id: "0", text: ","),
+            Delta.TextDelta(id: "0", text: " let"),
+            Delta.TextDelta(id: "0", text: "'s"),
+            Delta.TextDelta(id: "0", text: " check"),
+            Delta.TextDelta(id: "0", text: " the"),
+            Delta.TextDelta(id: "0", text: " weather"),
+            Delta.TextDelta(id: "0", text: " for"),
+            Delta.TextDelta(id: "0", text: " San"),
+            Delta.TextDelta(id: "0", text: " Francisco"),
+            Delta.TextDelta(id: "0", text: ","),
+            Delta.TextDelta(id: "0", text: " CA"),
+            Delta.TextDelta(id: "0", text: ":"),
+            // The vendor's own call id, not the block index — a `tool_result` has to address it.
+            Delta.ToolCallStart(id: "toolu_01T1x1fJ34qAmk2tNTrN7Up6", name: "get_weather"),
+            // The leading empty fragment is dropped: it carries nothing and would put a
+            // zero-length delta in the event stream.
+            Delta.ToolCallArgs(id: "toolu_01T1x1fJ34qAmk2tNTrN7Up6", fragment: "{\"location\":"),
+            Delta.ToolCallArgs(id: "toolu_01T1x1fJ34qAmk2tNTrN7Up6", fragment: " \"San"),
+            Delta.ToolCallArgs(id: "toolu_01T1x1fJ34qAmk2tNTrN7Up6", fragment: " Francisc"),
+            Delta.ToolCallArgs(id: "toolu_01T1x1fJ34qAmk2tNTrN7Up6", fragment: "o,"),
+            Delta.ToolCallArgs(id: "toolu_01T1x1fJ34qAmk2tNTrN7Up6", fragment: " CA\"}"),
+            Delta.Stop(reason: StopReason.ToolUse),
+            Delta.UsageDelta(usage: Usage { input_tokens: 472, output_tokens: 89 }),
+        ], "${deltas}")
+        assert(decoder.finish() == Ok(Usage { input_tokens: 472, output_tokens: 89 }))
+
+        reply = provider.fold(deltas, "")
+        assert(reply.stop == StopReason.ToolUse)
+        assert(reply.parts == [
+            Part.Text(text: "Okay, let's check the weather for San Francisco, CA:"),
+            Part.ToolCall(
+                id: "toolu_01T1x1fJ34qAmk2tNTrN7Up6",
+                name: "get_weather",
+                args: "{\"location\": \"San Francisco, CA\"}",
+            ),
+        ], "${reply.parts}")
+    }
+
+    // The captured thinking transcript. The signature arrives as its own delta after the prose,
+    // and it has to land on the same block — the vendor invalidates a thinking block that comes
+    // back without it.
+    fn a_captured_thinking_stream_decodes_frame_by_frame(): void {
+        decoder: dyn StreamDecoder = AnthropicStream.new()
+        deltas = stream_or_fail(decoder, captured_thinking_stream())
+        assert(deltas == [
+            Delta.ModelDelta(model: "claude-opus-5"),
+            Delta.ThinkingDelta(id: "0", text: "I need to find the GCD of 1071 and 462 using the Euclidean algorithm.\n\n1071 = 2 × 462 + 147"),
+            Delta.ThinkingDelta(id: "0", text: "\n462 = 3 × 147 + 21"),
+            Delta.ThinkingDelta(id: "0", text: "\n147 = 7 × 21 + 0"),
+            Delta.ThinkingDelta(id: "0", text: "\nThe remainder is 0, so GCD(1071, 462) = 21."),
+            Delta.ThinkingSignature(id: "0", signature: "EqQBCgIYAhIM1gbcDa9GJwZA2b3hGgxBdjrkzLoky3dl1pkiMOYds..."),
+            Delta.TextDelta(id: "1", text: "The greatest common divisor of 1071 and 462 is **21**."),
+            Delta.Stop(reason: StopReason.EndTurn),
+        ], "${deltas}")
+        // This transcript reports no tokens anywhere — no `usage` on `message_start` and none on
+        // `message_delta`. A decoder that required one would fail a real, published stream.
+        assert(decoder.finish() == Ok(Usage {}))
+
+        reply = provider.fold(deltas, "")
+        assert(reply.parts == [
+            Part.Thinking(
+                text: "I need to find the GCD of 1071 and 462 using the Euclidean algorithm.\n\n1071 = 2 × 462 + 147\n462 = 3 × 147 + 21\n147 = 7 × 21 + 0\nThe remainder is 0, so GCD(1071, 462) = 21.",
+                signature: "EqQBCgIYAhIM1gbcDa9GJwZA2b3hGgxBdjrkzLoky3dl1pkiMOYds...",
+            ),
+            Part.Text(text: "The greatest common divisor of 1071 and 462 is **21**."),
+        ], "${reply.parts}")
+    }
+
+    // The vendor sends `event: error` inside an already-successful 200 response, so the transport
+    // reports nothing wrong. `code` stays matchable; the status is `0` because there genuinely is
+    // none, which is more honest than inventing 529.
+    fn an_error_frame_is_the_vendors_typed_error(): void {
+        decoder: dyn StreamDecoder = AnthropicStream.new()
+        mut seen: ?AiError = none
+        for f in sse_frames(captured_interrupted_stream()) {
+            match decoder.push(f) {
+                Ok(_) => {},
+                Err(e) => {
+                    seen = some(e)
+                },
+            }
+        }
+        assert(match seen {
+            some(e) => match e {
+                AiError.Provider(status, code, message) => status == 0
+                    && code == "overloaded_error" && message == "Overloaded",
+                _ => false,
+            },
+            none => false,
+        }, "${seen}")
+    }
+
+    // **A truncated stream must not look like a complete answer.** This is what `finish` is for: the
+    // frames that did arrive decode perfectly well, and only the missing terminator says the reply
+    // is half of one.
+    fn a_truncated_stream_is_refused_rather_than_answered(): void {
+        full = captured_text_stream()
+        // Drop the trailing blank line, `event: message_stop`, and its data.
+        cut = full.slice(0, full.len() - 3)
+        decoder: dyn StreamDecoder = AnthropicStream.new()
+        deltas = stream_or_fail(decoder, cut)
+        assert(deltas.len() > 0, "the frames that arrived still decode")
+        match decoder.finish() {
+            Ok(u) => {
+                assert(false, "a stream with no `message_stop` is not a finished reply: ${u}")
+            },
+            Err(e) => {
+                assert("${e}".contains("message_stop"), "${e}")
+                assert("${e}".contains("truncated"), "${e}")
+            },
+        }
+    }
+
+    // A stream that carried nothing at all is the shape a vendor error status takes today, because
+    // `client.stream` gives no way to read the status back. The message says so rather than
+    // reporting an empty answer.
+    fn a_stream_that_never_started_says_what_probably_happened(): void {
+        probe: dyn StreamDecoder = AnthropicStream.new()
+        match probe.finish() {
+            Ok(u) => {
+                assert(false, "an empty stream is not a reply: ${u}")
+            },
+            Err(e) => {
+                assert("${e}".contains("message_start"), "${e}")
+                assert("${e}".contains("status"), "the message names the reason it cannot tell: ${e}")
+            },
+        }
+    }
+
+    // An unmodeled *block* is refused, exactly as in the buffered decode — it carries answer
+    // content, and dropping it turns a partial answer into a complete-looking one.
+    fn an_unmodeled_streamed_block_is_refused(): void {
+        frame = Frame {
+            event: "content_block_start",
+            data: "{\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"x\"}}",
+            id: "",
+            retry: none,
+        }
+        probe: dyn StreamDecoder = AnthropicStream.new()
+        match probe.push(frame) {
+            Ok(_) => {
+                assert(false, "an unmodeled block must not be skipped")
+            },
+            Err(e) => {
+                assert("${e}".contains("content[2].type"), "${e}")
+                assert("${e}".contains("server_tool_use"), "${e}")
+            },
+        }
+    }
+
+    // An unmodeled *event*, by contrast, is skipped — the vendor documents that new event types
+    // will appear and that a client should handle them gracefully. An envelope frame carries no
+    // answer content, so skipping one loses nothing.
+    fn an_unmodeled_event_is_skipped_where_an_unmodeled_block_is_not(): void {
+        decoder: dyn StreamDecoder = AnthropicStream.new()
+        frames = [
+            Frame { event: "ping", data: "{\"type\": \"ping\"}", id: "", retry: none },
+            Frame { event: "tomorrows_event", data: "{\"type\": \"tomorrows_event\", \"whatever\": 1}", id: "", retry: none },
+        ]
+        for f in frames {
+            assert(decoder.push(f) == Ok([]), "${f.event} should decode to nothing at all")
+        }
+    }
+
+    // The whole point of `decode_deltas`: the buffered door speaks the same vocabulary the
+    // streaming door does, so everything downstream of it is one implementation.
+    fn the_buffered_door_produces_deltas_too(): void {
+        match Anthropic.new("k").decode_deltas(captured_text_reply()) {
+            Ok(deltas) => {
+                assert(deltas == [
+                    Delta.ModelDelta(model: "claude-opus-5"),
+                    Delta.TextDelta(id: "0", text: "Hej! Hur mår du?"),
+                    Delta.Stop(reason: StopReason.EndTurn),
+                    Delta.UsageDelta(usage: Usage {
+                        input_tokens: 2095,
+                        output_tokens: 503,
+                        cached_input_tokens: 1024,
+                    }),
+                ], "${deltas}")
+            },
+            Err(e) => {
+                assert(false, "${e}")
+            },
+        }
     }
 }

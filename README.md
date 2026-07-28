@@ -4,17 +4,17 @@ An agent harness for Noeta: a **provider codec seam**, one run loop over `para/a
 
 The split that decides everything else: **a provider is a codec, not a client.** The thing that varies between model vendors is the wire format; auth headers, retries, timeouts, mocking, recording, and tracing are identical across all of them. So a `Provider` turns a neutral `ModelRequest` into a request description and a response body back into a neutral `ModelReply` — and never performs I/O. The transport is written once, over a `para.api.Api`, which means a 429 backoff is not para/ai code.
 
-> **Status: phase 2.** Core data model, the `Provider` seam, the Anthropic codec, the `Mock` provider, the run loop, errors, telemetry — and **tool calling**: `#[Tool]`/`#[Arg]`, `Type` → JSON Schema, argument coercion, `invoke` dispatch, the trust-boundary role, and bounded concurrent dispatch inside a multi-turn loop. Streaming, MCP, guardrails, context strategies, structured output, AG-UI, and the OpenAI/Google/OpenRouter/Ollama codecs are later phases; [DESIGN.md](DESIGN.md) is the whole plan and §18 is the order. What is *not* here is not stubbed — it is absent, and the seams it will attach to are marked in the source.
+> **Status: phase 3.** Core data model, the `Provider` seam, the Anthropic codec, the `Mock` provider, the run loop, errors, telemetry, **tool calling** — and **streaming**: `StreamDecoder`, the neutral `Event` enum, `agent.stream(conv, tx)`, and a scripted `FrameStream` so a streaming test needs no socket. AG-UI encoding and the SSE responder, MCP, guardrails, context strategies, structured output, `@prompt`, and the OpenAI/Google/OpenRouter/Ollama codecs are later phases; [DESIGN.md](DESIGN.md) is the whole plan and §18 is the order. What is *not* here is not stubbed — it is absent, and the seams it will attach to are marked in the source.
 
 ## What it provides
 
 | module | contents |
 | --- | --- |
-| `para.ai` | `Agent`, `AgentConfig`, `Conversation`, `Run`, `Message`, `Part`, `Role`, `AiError` — the data model, the run loop, and the errors |
-| `para.ai.provider` | `Provider`, `ModelRequest`, `ModelReply`, `Delta`, `Usage`, `StopReason`, `Wire`, `Framing` — the codec seam and the delta accumulator |
+| `para.ai` | `Agent`, `AgentConfig`, `Conversation`, `Run`, `Message`, `Part`, `Role`, `AiError` — the data model, the run loop, and the errors; plus `Event`, `EventSink`, `Frames`, and `Streamer` — the streaming surface |
+| `para.ai.provider` | `Provider`, `StreamDecoder`, `ModelRequest`, `ModelReply`, `Delta`, `Usage`, `StopReason`, `Wire`, `Framing` — the codec seam and the delta accumulator |
 | `para.ai.tools` | `Tool`, `Arg`, `ToolSpec`, `ToolSource`, `Local`, `Toolbox`, `dispatch` — the signature-is-the-spec pipeline |
 | `para.ai.providers.anthropic` | `Anthropic` — the Anthropic Messages API codec |
-| `para.ai.mock` | `Mock`, `Scripted`, `ScriptedCall` — the hermetic test double, codec *and* transport |
+| `para.ai.mock` | `Mock`, `Scripted`, `ScriptedCall`, `Collector`, `ScriptedFrames`, `Replay` — the hermetic test double, codec *and* both transports |
 
 ## Installation
 
@@ -250,26 +250,42 @@ A codec implements five functions and performs no I/O:
 pub trait Provider {
     fn name(): string                                             // "anthropic" — a span attribute
     fn encode(req: ModelRequest): Result<Wire, AiError>
-    fn decode_reply(body: string): Result<ModelReply, AiError>
+    fn decode_deltas(body: string): Result<List<Delta>, AiError>  // a whole body, as increments
+    fn decode_reply(body: string): Result<ModelReply, AiError>    // = fold(decode_deltas(body), "")
+    fn decoder(): dyn StreamDecoder                               // fresh and stateful, per request
     fn decode_error(status: int, body: string): AiError
     fn estimate_tokens(msgs: List<Message>): ?int
 }
 ```
 
-Two of those differ from [DESIGN.md](DESIGN.md) §2.1's sketch, and both are forced by decisions elsewhere in it:
+Three of those differ from [DESIGN.md](DESIGN.md) §2.1's sketch, and each is forced by a decision elsewhere in it:
 
 - **`encode` returns a `Result`.** §4 requires each codec to reject what its vendor cannot express — loudly, at `encode`, naming the part and the provider. A codec that silently drops an image is a bug we can prevent by construction, and that rejection needs somewhere to go (`AiError.Encode`).
 - **`decode_error` exists.** §13 requires a vendor's error *status* to become a typed `AiError.Provider(status, code, message)` with the vendor's own error body decoded, and that body's shape is vendor-specific.
-
-`decoder(): dyn StreamDecoder` joins the trait in phase 3.
+- **`decode_deltas` exists, and `decode_reply` is a fold over it.** The streaming path has to produce deltas — that is what a `StreamDecoder` is. If the buffered path produced a `ModelReply` directly, the two would accumulate separately and could disagree. Making the buffered door speak the same vocabulary means everything below it is one implementation.
 
 ### `estimate_tokens` returns `?int`, and `none` is a real answer
 
 A provider with no local tokenizer says so, rather than returning a number that will be trusted absolutely and is wrong by a few percent — a failure that otherwise surfaces as a vendor-side context error in the middle of a run, which is the worst possible place to learn about it. **Anthropic returns `none`**: it publishes no local tokenizer, and exact counts need its count-tokens endpoint, which is a network round trip and therefore not something a pure codec may do. A caller that needs a budget names its own margin instead of inheriting a constant we picked.
 
-### Deltas: one accumulator, shared with streaming
+### Deltas: one accumulator, both transports
 
-A `Delta` is one neutral increment of an assistant turn, and `provider.fold(deltas, model)` turns a list of them into a `ModelReply`. The non-streaming path goes through it too: `decode_reply` emits one delta per content block and folds them. That is deliberate — when phase 3 adds `StreamDecoder`, streaming and non-streaming share the accumulator rather than growing a second copy of it that can disagree.
+A `Delta` is one neutral increment of an assistant turn, and `provider.fold(deltas, fallback_model)` turns a list of them into a `ModelReply`. **Both transports produce deltas and nothing downstream of them knows which one ran** — a buffered body through `decode_deltas`, a streamed one through `decoder()`, and from there the event emission and the accumulation are the same code. A bug in "these increments make that message" cannot exist in only one of them, because there is only one of it.
+
+`Delta.ModelDelta(model)` is what makes a delta list a *complete* description of a reply rather than most of one: Anthropic names the served model in `message_start`, so the streaming path has to carry it somewhere, and putting it in the vocabulary rather than on the decoder keeps `StreamDecoder` at the two methods §2.1 specifies. `fold`'s `model` argument is now the fallback for a stream that named none.
+
+### `StreamDecoder`
+
+```noeta
+pub trait StreamDecoder {
+    fn push(frame: Frame): Result<List<Delta>, AiError>
+    fn finish(): Result<Usage, AiError>
+}
+```
+
+Stateful, and a fresh object per request, because every vendor's streaming protocol is: Anthropic's frames are indexed (`content_block_start` opens block 3; later deltas only say "3"), OpenAI accumulates `choices[].delta`, Google sends partial `candidates`.
+
+**`finish` is not a formality — it is where a truncated stream is caught.** The frames that did arrive decode perfectly well; only the missing terminator says the reply is half of one, and reporting half a reply as a complete answer is the worst failure this package could have. It returns the call's total usage for a second reason: a vendor that splits input and output token counts across two frames has no single frame to read them off, so the running total is the decoder's own state.
 
 ## The Anthropic codec
 
@@ -291,6 +307,92 @@ Anthropic.new(key).with_beta("…")           // the anthropic-beta header
 An error status is decoded into `AiError.Provider(429, "rate_limit_error", "…")`, so `code == "rate_limit_error"` is matchable and nobody has to regex a message string. A body that is *not* the documented envelope (an HTML error page from a proxy) is reported verbatim rather than swallowed.
 
 An unmodeled content block type is a **loud** `AiError.Decode` naming the path (`content[1].type`), not a silent drop: dropping a block would turn a partial answer into one that looks complete.
+
+## Streaming
+
+Three doors onto one run loop:
+
+```noeta
+agent.run_sync("What's the weather in Malmö?")?      // sync, string in, string out
+agent.run(conv).await?                               // async, events discarded
+agent.run_into(conv, sink).await?                    // async, events to a sink you supply
+agent.stream(conv, tx).await?                        // async, events down a channel
+```
+
+```noeta
+use para.ai.Event
+
+(tx, rx) = channel::<Event>(64)
+concurrent {
+    reader = spawn render(rx)
+    run = agent.stream(Conversation.of("Explain the Euclidean algorithm."), tx).await?
+    tx.close()
+    reader.await
+}
+
+async fn render(rx: Receiver<Event>): void {
+    mut going = true
+    while going {
+        match rx.recv().await {
+            some(e) => {
+                match e {
+                    Event.TextDelta(id, delta) => { print(delta) },
+                    _ => {},
+                }
+            },
+            none => { going = false },
+        }
+    }
+}
+```
+
+Every `Event` variant is a value type, so a `Sender<Event>` crosses tasks **and** isolates and the whole thing composes with parallel serving. The run loop emits `RunStarted`, the text / thinking / tool-call deltas with their block starts and ends, one `ToolCallResult` per dispatched call, and **exactly one** terminal `RunFinished` or `RunError` on every path out — including the failing ones. A stream that merely stops is indistinguishable from one still thinking.
+
+`StateSnapshot`, `StateDelta`, `StepStarted`, `StepFinished`, and `Custom` are in the enum but nothing in the loop emits one. They are there so that adding them in phase 7 does not break an exhaustive `match` a consumer wrote today; the step vocabulary is phase 7's to decide, with AG-UI in hand.
+
+### Which layers cover which path
+
+**This is the part to read before turning streaming on.** `std.http.client.stream` returns a `FrameStream`, and that is a type the `para/api` onion structurally cannot accept: `Retry` calls `next` again and a second call means a second body, `Cache` and `Record` would have to store one, and `Mock` answers with a whole buffered `Response`. Only `Header` and `Logging` are streaming-safe at all. So the two transports do not share a chain, and coverage is not blanket:
+
+| | buffered (`run_sync`, and `run` by default) | streamed (`stream`, and `run` with `AgentConfig.stream`) |
+| --- | --- | --- |
+| Transport | `para.api.Api` — `prepare` then `send` | `std.http.client.stream` through a `Streamer` |
+| Retry / `Retry-After` | `para/api`'s `Retry` middleware | **the run loop's own**, `AgentConfig.stream_retries` (2) and `stream_backoff_ms` (500, doubling) |
+| `Cache`, `Record` → `to_mock()` | yes | no — they need a whole `Response` |
+| `Mock` as transport | `para.api.Middleware` | `para.ai.Streamer`, replaying scripted frames |
+| Vendor error status | `AiError.Provider(status, code, message)` | **see the caveat below** |
+| Telemetry | identical — the `chat {model}` span and both GenAI metrics wrap either |
+| Events, accumulation, tool loop | identical — one implementation |
+
+Streaming is therefore **off by default**: `AgentConfig.stream` is `false`, so `run` and `run_sync` take the covered path, and turning it on is `cfg.streamed()` — a deliberate choice with the trade written down. `agent.stream(conv, tx)` streams regardless, because a caller who asked for events as they happen has said what they want.
+
+### The one caveat: a streamed vendor error has no status
+
+`client.stream` reads the response head and then hands back a reader; it exposes **no way to read the status back**. A 429 or a 400 therefore streams its JSON error body like any other body, and an SSE reader frames a plain JSON document into nothing at all — so a rate limit arrives at the decoder as an *empty stream* rather than as `AiError.Provider(429, "rate_limit_error", …)`.
+
+What this package does about it: each codec's `finish()` refuses an empty stream with a message that names the likely cause and says the status is unavailable, so the failure is loud and points at the right thing. What it cannot do is give you the matchable `code`. The streaming retry consequently fires on transport failures and on any status a `Streamer` *can* report — which the scripted one can, and the live one cannot yet. **Closing this needs `FrameStream.status()` in `std.http`**; until then, a workload that needs typed vendor errors should stay on the buffered path.
+
+### Testing a stream
+
+`Mock` is both transports. The middleware answers a buffered call; a `para.ai.Streamer` implementation replays scripted frames for a streamed one, derived from the same script so the two cannot drift. `Collector` is the event sink §11 asks for:
+
+```noeta
+m = Mock.new().chunked(4).reply_text("18°C and clear in Malmö.")
+c = Collector.new()
+run = m.agent(AgentConfig.new("test-model").streamed())
+    .run_into(Conversation.of("weather?"), c).await?
+
+assert(c.events() == [
+    Event.RunStarted(run_id: c.run_id(), thread_id: ""),
+    Event.TextStart(id: "0"),
+    Event.TextDelta(id: "0", delta: "18°C"),
+    …
+    Event.TextEnd(id: "0"),
+    Event.RunFinished(run_id: c.run_id(), usage: run.usage),
+])
+```
+
+`chunked(n)` delivers text and tool arguments in runs of `n` characters, so a scripted stream behaves like a real one — a sentence arriving as a dozen frames. `Replay` is the lower-level door for the shapes a script cannot express: a stream that stops mid-message, or one that carries nothing at all.
 
 ## Testing: the `Mock` provider
 
@@ -387,9 +489,9 @@ Three commitments:
 
 ## What the run loop does today
 
-`run(conv)` calls the model, and keeps calling while the model asks for tools — see [The loop](#the-loop) above for the shape and the three decisions in it. The guard stages and the context strategy attach to the same loop in phase 5; phase 3 replaces the single `call` with a fold over `stream`.
+`run(conv)` calls the model, and keeps calling while the model asks for tools — see [The loop](#the-loop) above for the shape and the three decisions in it. The guard stages and the context strategy attach to the same loop in phase 5.
 
-`run` is `async` and `run_sync` is not. That is deliberate in both directions: phase 3's streaming makes `run` genuinely async — its body becomes a fold over `stream` — and a caller written today should not have to change then; while `run_sync(text) -> Result<string, AiError>` stays synchronous because a plain string-in/string-out entry point is what makes a framework testable from an ordinary `fn`. In phase 1 the work inside is synchronous, because `para/api`'s transport is.
+`run`, `run_into`, and `stream` are `async`; `run_sync` is not. That is deliberate in both directions: streaming makes the loop genuinely async, while `run_sync(text) -> Result<string, AiError>` stays synchronous because a plain string-in/string-out entry point is what makes a framework testable from an ordinary `fn`. There is still only **one** loop — `run_sync` drives the async one to completion rather than duplicating it, and a second, synchronous copy is exactly where a divergence would live.
 
 ## Examples
 
