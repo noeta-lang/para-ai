@@ -57,7 +57,8 @@ use std.id.{uuid}
 use std.task.{map_bounded, sleep}
 use para.ai.{AiError, Message, Part, Role}
 use para.ai.provider
-use para.ai.tools.{ToolSource, ToolSpec}
+use para.ai.tools
+use para.ai.tools.{Arg, Local, Tool, Toolbox, ToolSource, ToolSpec}
 
 // --- The protocol ---------------------------------------------------------------------------------
 
@@ -1471,3 +1472,640 @@ fn probe_client(mode: string): McpClient {
     return McpClient.unstarted()
 }
 
+
+// The sampler the sampling tests hand to `connect_sampling`. Module level rather than inside the
+// `@test` block for the same reason the fixture is: a helper the tests call has to exist where a
+// `dyn` coercion can see it, and nothing here is `pub` or `#[Tool]`.
+class ProbeSampler {
+    mut seen: int
+
+    fn new(): ProbeSampler {
+        return ProbeSampler { seen: 0 }
+    }
+
+    fn calls(): int {
+        return self.seen
+    }
+
+    // Inline, for the `dyn`-coercion reason every other impl in this file is inline.
+    impl Sampler {
+        fn sample(params: string): Result<string, AiError> {
+            self.seen = self.seen + 1
+            answer: Map<string, dyn> = {
+                "content": {"text": "sampled", "type": "text"},
+                "model": "probe-model",
+                "role": "assistant",
+            }
+            return Ok(json.stringify(answer))
+        }
+    }
+}
+
+// A client whose transport carries a deadline — the hang case.
+fn probe_deadline(mode: string, ms: int): McpClient {
+    match McpClient.connect(Stdio.new("sh", [fixture_server(), mode]).with_deadline(ms)) {
+        Ok(c) => {
+            return c
+        },
+        Err(e) => {
+            assert(false, "connect failed: ${e}")
+        },
+    }
+    return McpClient.unstarted()
+}
+
+// A client with sampling on, bounded by `budget` calls.
+fn probe_sampling(s: dyn Sampler, budget: int): McpClient {
+    match McpClient.connect_sampling(Stdio.new("sh", [fixture_server(), "sample"]), s, budget) {
+        Ok(c) => {
+            return c
+        },
+        Err(e) => {
+            assert(false, "connect failed: ${e}")
+        },
+    }
+    return McpClient.unstarted()
+}
+
+fn specs_or_fail(c: McpClient): List<ToolSpec> {
+    match c.specs() {
+        Ok(s) => {
+            return s
+        },
+        Err(e) => {
+            assert(false, "specs failed: ${e}")
+        },
+    }
+    return []
+}
+
+fn names_of(specs: List<ToolSpec>): List<string> {
+    mut out: List<string> = []
+    for s in specs {
+        out = out ~ [s.name]
+    }
+    return out
+}
+
+fn call_or_fail(c: McpClient, name: string, args: string): string {
+    match c.call(name, args) {
+        Ok(text) => {
+            return text
+        },
+        Err(e) => {
+            assert(false, "`${name}` failed: ${e}")
+        },
+    }
+    return ""
+}
+
+fn call_error(c: McpClient, name: string, args: string): string {
+    match c.call(name, args) {
+        Ok(text) => {
+            assert(false, "`${name}` must not succeed, got `${text}`")
+        },
+        Err(e) => {
+            return "${e}"
+        },
+    }
+    return ""
+}
+
+fn toolbox_or_fail(src: dyn ToolSource): Toolbox {
+    match Toolbox.of(src) {
+        Ok(box) => {
+            return box
+        },
+        Err(e) => {
+            assert(false, "toolbox failed: ${e}")
+        },
+    }
+    return Toolbox.new()
+}
+
+fn resources_or_fail(c: McpClient): List<Resource> {
+    match c.resources() {
+        Ok(rs) => {
+            return rs
+        },
+        Err(e) => {
+            assert(false, "resources failed: ${e}")
+        },
+    }
+    return []
+}
+
+fn contents_or_fail(c: McpClient, uri: string): List<ResourceContent> {
+    match c.read(uri) {
+        Ok(cs) => {
+            return cs
+        },
+        Err(e) => {
+            assert(false, "read failed: ${e}")
+        },
+    }
+    return []
+}
+
+fn prompt_or_fail(c: McpClient, name: string, args: Map<string, string>): List<Message> {
+    match c.prompt(name, args) {
+        Ok(ms) => {
+            return ms
+        },
+        Err(e) => {
+            assert(false, "prompt failed: ${e}")
+        },
+    }
+    return []
+}
+
+fn specs_error(c: McpClient): string {
+    match c.specs() {
+        Ok(s) => {
+            assert(false, "specs must not succeed, got ${names_of(s)}")
+        },
+        Err(e) => {
+            return "${e}"
+        },
+    }
+    return ""
+}
+
+fn resources_error(c: McpClient): string {
+    match c.resources() {
+        Ok(rs) => {
+            assert(false, "resources must not succeed, got ${rs.len()}")
+        },
+        Err(e) => {
+            return "${e}"
+        },
+    }
+    return ""
+}
+
+fn prompt_error(c: McpClient, name: string): string {
+    empty: Map<string, string> = {}
+    match c.prompt(name, empty) {
+        Ok(ms) => {
+            assert(false, "prompt must not succeed, got ${ms.len()} message(s)")
+        },
+        Err(e) => {
+            return "${e}"
+        },
+    }
+    return ""
+}
+
+fn parse_or_fail(text: string): Map<string, dyn> {
+    match parse_doc(text, "test document") {
+        Ok(doc) => {
+            return doc
+        },
+        Err(e) => {
+            assert(false, "parse failed: ${e}")
+        },
+    }
+    return empty_object()
+}
+
+fn connect_error(t: dyn Transport): string {
+    match McpClient.connect(t) {
+        Ok(c) => {
+            c.close()
+            assert(false, "connect must not succeed")
+        },
+        Err(e) => {
+            return "${e}"
+        },
+    }
+    return ""
+}
+
+@test {
+    // A local tool named exactly as the fixture server's, so the collision test has two real
+    // sources to collide. In the **dev tier** with `#[std.test.Skip]`, for the reason `tools.noe`
+    // spells out at length: a module-level `#[Tool]` in library code is discovered from every
+    // consuming application and offered to that application's model.
+    // The model-facing name comes from `#[Tool(name: …)]` rather than from the function, because
+    // `echo` is a keyword and no Noeta function may be called that. A neat accident: it means this
+    // fixture also proves the collision check compares **model-facing** names rather than symbols.
+    #[std.test.Skip("a tool fixture for this module's suite, not a test")]
+    #[Tool(about: "A local tool whose name an MCP server also claims", name: "echo")]
+    fn say(#[Arg(help: "What to say back")] text: string): string {
+        return "local: ${text}"
+    }
+
+    // --- The wire format ---------------------------------------------------------------------------
+    //
+    // Asserted as exact bytes, the way the provider codecs' request bodies are. `json.stringify`
+    // sorts keys, so this is stable — and an exact-string assertion is the only kind that catches a
+    // document silently changing shape.
+
+    fn initialize_asks_for_exactly_these_bytes(): void {
+        doc = request_doc(1, "initialize", initialize_params(false))
+        assert(doc
+            == "{\"id\":1,\"jsonrpc\":\"2.0\",\"method\":\"initialize\",\"params\":{\"capabilities\":{},\"clientInfo\":{\"name\":\"para/ai\",\"title\":\"para/ai\",\"version\":\"0.1.0\"},\"protocolVersion\":\"2025-06-18\"}}",
+            doc)
+    }
+
+    // The capability is advertised **only** when a sampler was supplied. A client that advertises
+    // sampling and then refuses every request leaves a server waiting on an answer that is not
+    // coming, which is a hang with extra steps.
+    fn sampling_appears_in_initialize_only_when_it_is_on(): void {
+        off = request_doc(1, "initialize", initialize_params(false))
+        on = request_doc(1, "initialize", initialize_params(true))
+        assert(!off.contains("sampling"), off)
+        assert(on.contains("\"capabilities\":{\"sampling\":{}}"), on)
+    }
+
+    fn a_tool_call_is_exactly_these_bytes(): void {
+        args: Map<string, dyn> = {"text": "hi there"}
+        params: Map<string, dyn> = {"arguments": args, "name": "echo"}
+        doc = request_doc(7, "tools/call", params)
+        assert(doc
+            == "{\"id\":7,\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"arguments\":{\"text\":\"hi there\"},\"name\":\"echo\"}}",
+            doc)
+    }
+
+    // A notification is a request without an `id`, and that absence is the whole protocol
+    // difference — it is what tells the server not to answer.
+    fn a_notification_is_a_request_without_an_id(): void {
+        doc = notification_doc("notifications/initialized", empty_object())
+        assert(doc == "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\",\"params\":{}}", doc)
+        assert(!doc.contains("\"id\""), doc)
+    }
+
+    // A server→client request gets its id echoed back verbatim, including a string one — JSON-RPC
+    // allows those, and a client that renumbered one would be answering nobody.
+    fn a_server_request_is_answered_with_its_own_id(): void {
+        refusal = error_doc("s-1", -32601, "para/ai does not implement `roots/list`")
+        assert(refusal
+            == "{\"error\":{\"code\":-32601,\"message\":\"para/ai does not implement `roots/list`\"},\"id\":\"s-1\",\"jsonrpc\":\"2.0\"}",
+            refusal)
+        answered = result_doc(4, empty_object())
+        assert(answered == "{\"id\":4,\"jsonrpc\":\"2.0\",\"result\":{}}", answered)
+    }
+
+    // --- Decoding ------------------------------------------------------------------------------------
+
+    fn capabilities_are_read_off_what_the_server_advertised(): void {
+        doc = parse_or_fail("{\"tools\":{\"listChanged\":true},\"resources\":{\"subscribe\":true},\"logging\":{}}")
+        caps = capabilities_of(doc)
+        assert(caps.tools && caps.tools_list_changed, "${caps}")
+        assert(caps.resources && caps.resources_subscribe, "${caps}")
+        assert(caps.logging, "${caps}")
+        assert(!caps.prompts, "an absent capability is absent, not defaulted on: ${caps}")
+        assert(!caps.resources_list_changed, "${caps}")
+    }
+
+    // The server's `inputSchema` is the tool's schema. Passed through verbatim rather than
+    // re-derived: this process cannot see the function behind it, so anything it invented would be
+    // a guess the model would then be held to.
+    fn a_servers_input_schema_is_passed_through_verbatim(): void {
+        spec = tool_spec_of(parse_or_fail("{\"description\":\"Echo\",\"inputSchema\":{\"properties\":{\"text\":{\"type\":\"string\"}},\"required\":[\"text\"],\"type\":\"object\"},\"name\":\"echo\"}"))
+        assert(spec.name == "echo", "${spec}")
+        assert(spec.description == "Echo", "${spec}")
+        assert(spec.parameters
+            == "{\"properties\":{\"text\":{\"type\":\"string\"}},\"required\":[\"text\"],\"type\":\"object\"}",
+            spec.parameters)
+        // A server that sends no schema means "no arguments", which is the empty object schema.
+        bare = tool_spec_of(parse_or_fail("{\"name\":\"now\"}"))
+        assert(bare.parameters == "{\"type\":\"object\"}", bare.parameters)
+    }
+
+    fn a_tool_that_reports_is_error_is_a_failed_turn(): void {
+        result = parse_or_fail("{\"content\":[{\"text\":\"the tool exploded\",\"type\":\"text\"}],\"isError\":true}")
+        assert(match tool_result("boom", result) {
+            Ok(text) => false,
+            Err(e) => "${e}".contains("tool `boom` failed: the tool exploded"),
+        }, "${tool_result("boom", result)}")
+    }
+
+    // A tool with an `outputSchema` may answer structurally and leave `content` empty.
+    fn a_structured_answer_is_used_when_there_is_no_content(): void {
+        result = parse_or_fail("{\"content\":[],\"structuredContent\":{\"ok\":true}}")
+        assert(match tool_result("structured", result) {
+            Ok(text) => text == "{\"ok\":true}",
+            Err(e) => false,
+        }, "${tool_result("structured", result)}")
+    }
+
+    // `ToolSource.call` hands the model a string, so a block this package did not decode is passed
+    // through as its own JSON rather than described in words it never said.
+    fn a_non_text_content_block_is_passed_through_as_its_own_json(): void {
+        result = parse_or_fail("{\"content\":[{\"text\":\"see\",\"type\":\"text\"},{\"data\":\"aGk=\",\"mimeType\":\"image/png\",\"type\":\"image\"}]}")
+        text = match tool_result("shot", result) {
+            Ok(t) => t,
+            Err(e) => "${e}",
+        }
+        assert(text.contains("see"), text)
+        assert(text.contains("\"mimeType\":\"image/png\""), text)
+    }
+
+    // A reply is matched by id, and a *request* that happens to carry the same id is not a reply —
+    // which is what keeps a server→client request from being mistaken for the answer to ours.
+    fn a_reply_is_matched_to_its_own_id(): void {
+        assert(is_reply_to(parse_or_fail("{\"id\":3,\"result\":{}}"), 3))
+        assert(!is_reply_to(parse_or_fail("{\"id\":4,\"result\":{}}"), 3))
+        assert(!is_reply_to(parse_or_fail("{\"id\":3,\"method\":\"sampling/createMessage\"}"), 3),
+            "a server request is not our reply")
+        assert(!is_reply_to(parse_or_fail("{\"method\":\"notifications/message\"}"), 3))
+    }
+
+    fn a_json_rpc_error_reply_is_a_typed_failure(): void {
+        failed = result_of(parse_or_fail("{\"error\":{\"code\":-32602,\"message\":\"no tool named nope\"},\"id\":3}"), "mcp:probe", "tools/call")
+        assert(match failed {
+            Ok(r) => false,
+            Err(e) => "${e}".contains("JSON-RPC error -32602") && "${e}".contains("no tool named nope"),
+        }, "${failed}")
+        // Neither `result` nor `error` is a broken server, and it says so rather than decoding an
+        // empty result.
+        neither = result_of(parse_or_fail("{\"id\":3}"), "mcp:probe", "ping")
+        assert(match neither {
+            Ok(r) => false,
+            Err(e) => "${e}".contains("neither `result` nor `error`"),
+        }, "${neither}")
+    }
+
+    // The recoverable door. A server that emits one malformed line must not take the process down
+    // with it, which is exactly what `json.parse` would have done.
+    fn a_malformed_document_is_an_error_not_an_abort(): void {
+        assert(match parse_doc("{ nope", "reply") {
+            Ok(d) => false,
+            Err(e) => "${e}".contains("decode failed"),
+        })
+        // Well-formed JSON that is not an object is not a JSON-RPC message either.
+        assert(match parse_doc("[1, 2]", "reply") {
+            Ok(d) => false,
+            Err(e) => "${e}".contains("a JSON-RPC message is an object"),
+        })
+    }
+
+    // `os.spawn` aborts the whole process on a missing binary, so the lookup happens first.
+    fn resolve_command_finds_a_real_binary_and_refuses_a_missing_one(): void {
+        assert(resolve_command("sh").ends_with("/sh"), resolve_command("sh"))
+        assert(resolve_command("definitely-not-a-binary-xyz") == "")
+        // A path is taken literally rather than searched for.
+        assert(resolve_command("/definitely/not/here") == "")
+    }
+
+    // --- The round trip, over real pipes ---------------------------------------------------------
+    //
+    // Every test below spawns the fixture server as a subprocess and speaks real JSON-RPC to it.
+    // No network, no npm install, no published server: `fixture_lines` is the whole server.
+
+    fn the_handshake_names_the_server_and_records_its_protocol(): void {
+        c = probe_client("full")
+        // The source name comes from `serverInfo`, not from the command — `mcp:probe` rather than
+        // `mcp:sh`, which is what makes a collision message name something a reader recognizes.
+        assert(c.server_name() == "mcp:probe", c.server_name())
+        assert(c.server_info() == "mcp:probe 9.9", c.server_info())
+        assert(c.protocol() == "2025-06-18", c.protocol())
+        assert(c.capabilities().tools && c.capabilities().resources && c.capabilities().prompts,
+            "${c.capabilities()}")
+        assert(c.tool_type() == "mcp")
+        c.close()
+        assert(c.is_closed())
+    }
+
+    fn an_mcp_servers_tools_are_ordinary_tool_specs(): void {
+        c = probe_client("full")
+        specs = specs_or_fail(c)
+        assert(names_of(specs) == ["echo", "boom", "structured"], "${names_of(specs)}")
+        assert(specs[0].description == "Echo the text back", "${specs[0]}")
+        assert(specs[0].parameters.contains("\"required\":[\"text\"]"), specs[0].parameters)
+        c.close()
+    }
+
+    fn a_tool_call_round_trips_over_real_pipes(): void {
+        c = probe_client("full")
+        assert(call_or_fail(c, "echo", "{\"text\": \"hi there\"}") == "echo: hi there")
+        // A no-argument call is `{}` on the wire whether the model sent `""` or `"{}"`.
+        assert(call_or_fail(c, "structured", "") == "{\"ok\":true}")
+        c.close()
+    }
+
+    // The point of the whole module: an MCP tool and a local one are one vocabulary, and a failing
+    // one is a turn. `dispatch` is the *same* function the run loop calls for a local `#[Tool]`.
+    fn a_failing_mcp_tool_is_a_turn_not_an_outage(): void {
+        c = probe_client("full")
+        box = toolbox_or_fail(c)
+        results = tools.dispatch(box, [
+            Part.ToolCall(id: "c1", name: "echo", args: "{\"text\": \"one\"}"),
+            Part.ToolCall(id: "c2", name: "boom", args: "{}"),
+        ], 2)
+        assert(results[0] == Part.ToolResult(id: "c1", content: "echo: one", is_error: false), "${results[0]}")
+        assert(match results[1] {
+            Part.ToolResult(id, content, is_error) => is_error && content.contains("the tool exploded"),
+            _ => false,
+        }, "${results[1]}")
+        // And the telemetry attribute says where the tool came from.
+        assert(box.tool_type("echo") == "mcp")
+        c.close()
+    }
+
+    // An unknown tool is a JSON-RPC error from the server, and that too is a turn rather than an
+    // outage — reported as the *tool's* failure, because that is what the model can act on.
+    fn a_protocol_refusal_is_reported_as_the_tools_failure(): void {
+        c = probe_client("full")
+        message = call_error(c, "teleport", "{}")
+        assert(message.contains("tool `teleport` failed"), message)
+        assert(message.contains("-32602"), message)
+        c.close()
+    }
+
+    // DESIGN §6's rule, unweakened for MCP: a collision is a construction-time error naming both
+    // sources. The fixture server offers `echo`, and so does this module's dev-tier `#[Tool]`.
+    fn a_name_collision_across_a_local_and_an_mcp_source_names_both(): void {
+        c = probe_client("full")
+        match Toolbox.of(Local.new()) {
+            Err(e) => {
+                assert(false, "the local source alone must build: ${e}")
+            },
+            Ok(box) => {
+                match box.with(c) {
+                    Ok(merged) => {
+                        assert(false, "`echo` is claimed twice: ${merged.names()}")
+                    },
+                    Err(e) => {
+                        assert("${e}".contains("declared by both `local` and `mcp:probe`"), "${e}")
+                    },
+                }
+            },
+        }
+        c.close()
+    }
+
+    fn a_paginated_tool_list_is_followed_to_the_end(): void {
+        c = probe_client("paged")
+        found = names_of(specs_or_fail(c))
+        assert(found == ["echo", "boom"], "${found}")
+        c.close()
+    }
+
+    // A `list_changed` notification arrives *inside* someone else's exchange, so it invalidates the
+    // cache rather than refetching on the spot — nesting a request inside a request would put a
+    // reply in the wrong reader's hands.
+    fn a_list_changed_notification_invalidates_the_cached_list(): void {
+        c = probe_client("changed")
+        before = names_of(specs_or_fail(c))
+        assert(before == ["echo", "boom", "structured"], "${before}")
+        assert(call_or_fail(c, "echo", "{\"text\": \"x\"}") == "echo: x")
+        assert(c.notification_count() == 1, "${c.notification_count()}")
+        after = names_of(specs_or_fail(c))
+        assert(after == ["echo", "fresh"], "the next `specs()` refetches: ${after}")
+        c.close()
+    }
+
+    // Resources are handed over, and **nothing puts them in a context** — that is the caller's
+    // decision (DESIGN §7).
+    fn resources_are_listed_and_read_but_never_injected(): void {
+        c = probe_client("full")
+        found = resources_or_fail(c)
+        assert(found.len() == 1 && found[0].uri == "memo://notes", "${found}")
+        assert(found[0].mime == "text/plain", "${found}")
+        contents = contents_or_fail(c, "memo://notes")
+        assert(contents.len() == 1 && contents[0].text == "the kettle is in the cupboard", "${contents}")
+        // The tool vocabulary is untouched by any of it.
+        assert(names_of(specs_or_fail(c)) == ["echo", "boom", "structured"])
+        c.close()
+    }
+
+    fn a_prompt_comes_back_as_an_ordinary_conversation_prefix(): void {
+        c = probe_client("full")
+        args: Map<string, string> = {"topic": "kettles"}
+        messages = prompt_or_fail(c, "summarize", args)
+        assert(messages.len() == 2, "${messages}")
+        assert(messages[0].role == Role.Assistant && messages[0].text() == "You summarize things.", "${messages[0]}")
+        assert(messages[1].role == Role.User && messages[1].text() == "Summarize kettles", "${messages[1]}")
+        c.close()
+    }
+
+    // Refused loudly rather than dropped: this package has no base64 decoder, and a prompt quietly
+    // missing its image is a prompt that no longer says what the server wrote.
+    fn a_non_text_prompt_block_is_refused_by_name(): void {
+        c = probe_client("image")
+        message = prompt_error(c, "summarize")
+        assert(message.contains("`image` prompt content block"), message)
+        assert(message.contains("client.read(uri)"), "it names the door that does work: ${message}")
+        c.close()
+    }
+
+    // A capability the server never advertised is a question it never said it could answer, and an
+    // empty list would read exactly like "this server has nothing".
+    fn a_capability_the_server_never_advertised_is_refused(): void {
+        c = probe_client("notools")
+        message = specs_error(c)
+        assert(message.contains("advertises no `tools` capability"), message)
+        assert(message.contains("mcp:probe"), "the message names the server: ${message}")
+        // The same client's resources still work, so this is a per-capability refusal rather than a
+        // broken session.
+        assert(resources_or_fail(c).len() == 1)
+        c.close()
+    }
+
+    // --- Lifecycle ---------------------------------------------------------------------------------
+
+    // A missing server binary is a configuration error, and `os.spawn` would have aborted the
+    // process rather than reporting it.
+    fn a_missing_server_binary_is_an_error_rather_than_an_abort(): void {
+        message = connect_error(Stdio.new("definitely-not-a-binary-xyz", []))
+        assert(message.contains("no such command"), message)
+        assert(message.contains("definitely-not-a-binary-xyz"), message)
+    }
+
+    // The crash case, end to end: the server exits mid-call, the call in flight becomes a typed
+    // failure carrying the exit status, and the session stays dead instead of being written to
+    // again — which matters because a write to a dead child aborts the process.
+    fn a_server_that_dies_mid_call_is_typed_and_stays_dead(): void {
+        c = probe_client("crash")
+        first = call_error(c, "echo", "{\"text\": \"hello\"}")
+        assert(first.contains("server_exited"), first)
+        assert(first.contains("status 3"), "the exit status is in the message: ${first}")
+        second = call_error(c, "echo", "{\"text\": \"again\"}")
+        assert(second.contains("server_exited"), "a dead session fails fast rather than blocking: ${second}")
+        c.close()
+    }
+
+    // The hang case. The fixture reads the call and answers nothing at all; without the deadline
+    // this test would never return.
+    fn a_hanging_server_is_bounded_by_the_deadline(): void {
+        c = probe_deadline("hang", 400)
+        message = call_error(c, "echo", "{\"text\": \"anyone there?\"}")
+        assert(message.contains("timeout"), message)
+        assert(message.contains("400ms"), message)
+        assert(message.contains("terminated"), "the deadline is terminal, and says so: ${message}")
+        c.close()
+    }
+
+    // A server that talks without answering runs out of budget rather than looping forever. Same
+    // guarantee as the deadline, at a different layer: this one needs no watchdog and no kill,
+    // because the documents keep coming.
+    fn a_chatty_server_runs_out_of_read_budget(): void {
+        c = probe_client("chatty")
+        message = call_error(c, "echo", "{\"text\": \"talk to me\"}")
+        assert(message.contains("without answering"), message)
+        assert(c.notification_count() >= 60, "${c.notification_count()}")
+        c.close()
+    }
+
+    // --- Sampling ------------------------------------------------------------------------------------
+
+    // Off by default, and the server is *told* rather than left waiting. The fixture reports what
+    // the client answered back inside the tool result, so this asserts the reply that went out on
+    // the wire and not merely the client's internal state.
+    fn sampling_is_refused_unless_it_was_turned_on(): void {
+        c = probe_client("sample")
+        answer = call_or_fail(c, "echo", "{}")
+        assert(answer.contains("error:"), answer)
+        assert(answer.contains("-32601"), answer)
+        assert(c.sampling_calls() == 0, "${c.sampling_calls()}")
+        c.close()
+    }
+
+    // On explicitly, and budgeted. The first call is served through the seam; the second is refused
+    // because the budget was one, which is the whole point of budgeting it.
+    fn sampling_answers_through_the_seam_and_stops_at_its_budget(): void {
+        sampler = ProbeSampler.new()
+        c = probe_sampling(sampler, 1)
+        served = call_or_fail(c, "echo", "{}")
+        assert(served.contains("result:"), served)
+        assert(served.contains("sampled"), served)
+        assert(sampler.calls() == 1, "${sampler.calls()}")
+        spent = call_or_fail(c, "echo", "{}")
+        assert(spent.contains("-32000"), spent)
+        assert(spent.contains("budget"), spent)
+        assert(sampler.calls() == 1, "the sampler is not reached past the budget: ${sampler.calls()}")
+        assert(c.sampling_calls() == 1, "${c.sampling_calls()}")
+        c.close()
+    }
+
+    // --- Housekeeping ------------------------------------------------------------------------------
+
+    fn ping_costs_one_round_trip_and_close_is_idempotent(): void {
+        c = probe_client("full")
+        // `_` rather than `Ok(…)`: `ping` answers `Result<void, AiError>`, whose `Ok` carries no
+        // payload at all, so a one-argument `Ok(x)` pattern matches nothing.
+        assert(match c.ping() {
+            Err(e) => false,
+            _ => true,
+        }, "ping failed")
+        c.close()
+        c.close()
+        assert(c.is_closed())
+        // A closed session answers rather than reaching for a transport that is gone.
+        message = call_error(c, "echo", "{}")
+        assert(message.contains("closed"), message)
+    }
+
+    // stdio has no way to probe for a pending message — every read door blocks — so `listen` is
+    // honest about delivering nothing there rather than pretending to poll.
+    fn listen_delivers_nothing_over_stdio(): void {
+        c = probe_client("full")
+        assert(match c.listen(4) {
+            Ok(n) => n == 0,
+            Err(e) => false,
+        })
+        c.close()
+    }
+}
