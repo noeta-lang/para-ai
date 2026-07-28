@@ -35,10 +35,11 @@ So a provider implements a **pure codec**:
 ```noeta
 trait Provider {
     fn name(): string                                       // "anthropic" | "openai" | "ollama" | …
-    fn encode(req: ModelRequest): Wire                      // → { url, headers, body, framing }
+    fn encode(req: ModelRequest): Result<Wire, AiError>     // → { url, headers, body, framing }
     fn decode_reply(body: string): Result<ModelReply, AiError>
+    fn decode_error(status: int, body: string): AiError     // the vendor's own typed error body
     fn decoder(): dyn StreamDecoder                         // fresh, stateful, per request
-    fn estimate_tokens(msgs: List<Message>): int
+    fn estimate_tokens(msgs: List<Message>): ?int
 }
 
 trait StreamDecoder {
@@ -53,6 +54,8 @@ Everything that follows falls out of this:
 - **A provider is trivially testable.** `encode` and `decode_reply` are pure string-in/string-out functions. A provider's whole test suite is a table of fixtures with no network and no clock.
 - **Adding a fourth provider is a pure-Noeta afternoon.** No async, no HTTP, no telemetry, no guard plumbing to re-implement.
 - **The Mock provider is not a special case.** It is a `Provider` whose `encode` ignores the request and whose `decode_reply` returns a scripted reply.
+
+Two of those signatures were corrected by building it. `encode` returns a `Result` because §4 requires a codec to reject what its vendor cannot express, loudly, naming the part — which is an encode-side failure the original sketch had nowhere to put (hence the `AiError.Encode` variant in §13). And `decode_error` joined the trait because a vendor's typed error body is codec-shaped knowledge like any other: without it, §13's promise that `code == "rate_limit_error"` is matchable would have had to be met by the run loop guessing at three different error envelopes.
 
 `StreamDecoder` is stateful because every provider's streaming protocol is (Anthropic's indexed `content_block_delta`, OpenAI's `choices[].delta` accumulation, Google's partial `candidates`). It is a fresh object per request, lives inside the run loop's task, and never crosses a boundary.
 
@@ -112,6 +115,8 @@ reply = match env.get("AI_PROVIDER") ?? "anthropic" {
 
 This is the pattern the README leads with, so nobody discovers the constraint by hitting E0007. It works because `run`/`run_sync`/`stream` all return provider-independent types — the generic parameter never escapes into a result. If a use case ever appears where the arms *cannot* re-converge, adding a `DynProvider` wrapper later is additive and breaks nothing.
 
+**This decision was, it turned out, unimplementable when it was made.** A type parameter did not satisfy the bounds its own declaration gives it, so inside `Agent<P: Provider>` one method calling another failed the callee's `P: Provider` bound against the very declaration that states it — `Agent<P>` could not have had more than one method. Fixed in the toolchain while building phase 1. The design was right and the language did not support it yet; nothing about the sketch revealed that, and only writing the code did.
+
 A note on the two spellings, since the distinction is not obvious and it decided this section. `Provider` is one interface; **`<P: Provider>` and `dyn Provider` are two ways of holding a value that satisfies it** — a bound resolves the concrete type at the call site, a trait object defers it to runtime. Noeta requires the `dyn` keyword in type position precisely so the two are never confused (the same reason Rust added it in 2018). Beyond `Send`, the choice turned out to have teeth: `async` trait methods currently work correctly under a bound and are **unsound** through `dyn` (§17, O-2). The spelling this package standardized on is the one that already works.
 
 ---
@@ -127,6 +132,8 @@ One package, keyed `para`, addressing as `para.ai.*`:
 | `para.ai.providers.anthropic` / `.google` | the two bespoke codecs |
 | `para.ai.providers.openai` | `OpenAiCompat` (the parameterized family codec) plus `OpenAi`, `OpenRouter`, and `Ollama` as configurations of it |
 | `para.ai.providers.ollama` | the native `/api/chat` codec, for the Ollama features `/v1` does not expose |
+
+> **Namespaces are nested; files are flat.** `anthropic.noe` at the repo root declares `namespace para.ai.providers.anthropic`. A `providers/` subdirectory would be wrong: an entry file's sibling scan is **flat**, so a `.noe` one level down can neither see its siblings above it nor link when run as an entry — its `@test` blocks would silently never run. (Recursive walking applies to a *consuming* package's view of a dependency, not to the package's own test run.) Since a namespace is declared rather than derived from the path, nothing public changes. Discovered building phase 1.
 | `para.ai.tools` | `Tool`, `Arg`, `Toolbox`, `ToolSource`, schema derivation, dispatch |
 | `para.ai.mcp` | `McpClient`, `Stdio`, `Http`, MCP-as-`ToolSource`, approval seam |
 | `para.ai.guard` | `Guard`, `Verdict`, `Stage`, the standard guards |
@@ -572,6 +579,7 @@ pub enum AiError {
     Transport(inner: HttpError)
     Provider(status: int, code: string, message: string)
     Decode(path: string, message: string)
+    Encode(provider: string, message: string)   // the codec refused to express a part
     Refused(reason: string)
     Guard(stage: Stage, guard: string, reason: string)
     Tool(name: string, message: string)
@@ -580,6 +588,8 @@ pub enum AiError {
     Cancelled
 }
 ```
+
+`impl From<HttpError>` on an enum turned out not to work at all: the reserved built-in `Enum.from(string)` shadowed it in the checker, the compiler and the interpreter alike, so `?` resolved the conversion while an explicit `AiError.from(e)` was rejected as "not assignable to `string`" and the program aborted at runtime. Fixed upstream while building phase 1 — the builtin now yields to a declared method of that name. Worth recording because §13's error type is the reason it was found.
 
 A language constraint shapes this: **a type carries at most one `From` impl** (a second is a coherence conflict, E0027). So `AiError` declares `impl From<HttpError>` — the conversion that appears at the most `?` sites — and `JsonError` is mapped explicitly at its handful of decode points into `Decode(path, message)`, preserving the path. Worth writing down so the first contributor who reaches for a second `From` knows it was a decision, not an omission.
 
@@ -693,6 +703,16 @@ API keys come from `std.env`; para/ai never reads a config file and never writes
 | O-5 | `estimate_tokens(): ?int` — `none` is a real answer and forces an explicit `Budget.headroom`. | §10 |
 | O-6 | para/ai composes over para/api; a second `[trust]` line beats a duplicated retry/mock/record. | §16 |
 | O-7 | `Provider` is a bound only. Runtime selection is the caller's `match`, and the README leads with it. | §2.3 |
+
+### Landed upstream
+
+| | what | state |
+| --- | --- | --- |
+| U-1 | `DirectiveCtx.fields` — an expand hook sees the decorated declaration's shape | **merged** (`21ca0362`), unblocks `@schema` and phase 5 |
+| U-2 | `async` through `dyn` typed correctly, plus the impl↔declaration parity rule | **merged** (`95ad4ab8`) |
+| U-3 | streaming HTTP bodies + `server.sse` | in flight |
+| U-4 | a cross-module type cannot be a positional enum payload | in flight |
+| — | three checker fixes found building phase 1 (see §2.3, §13) | **merged** |
 
 ### O-1, O-2, O-4 — answered by inspection, and all three become build items
 

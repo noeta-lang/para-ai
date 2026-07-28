@@ -254,11 +254,14 @@ impl Provider for Mock {
             stop: List<dyn> = req.stop.map(fn(s) => s)
             body = body.set("stop", stop)
         }
-        // The host is unroutable on purpose (RFC 6761 reserves `.invalid`): if this mock is ever
-        // wired into a chain that does reach the network, the failure is instant and obvious
-        // rather than a real request to a real vendor.
+        // The target is unreachable on purpose: if this mock is ever wired into a chain that does
+        // reach the network, the failure is instant and obvious rather than a real request to a
+        // real vendor. Loopback port 1 rather than a reserved `.invalid` host because it involves
+        // **no resolver at all** — a `.invalid` lookup is only NXDOMAIN if the resolver honors RFC
+        // 6761, and a hijacking one that answers with a parking page would turn a transport failure
+        // into a decode failure and flake the suite.
         return Ok(Wire {
-            url: "https://mock.invalid/v1/messages",
+            url: "http://127.0.0.1:1/v1/messages",
             method: "post",
             headers: {"content-type": "application/json"},
             body: json.stringify(body),
@@ -467,14 +470,14 @@ impl Middleware for Mock {
     // that cannot leave the machine surfaces as `AiError.Transport` through `impl From<HttpError>`
     // — the one conversion `?` performs implicitly in the run loop.
     //
-    // `mock.invalid` is reserved by RFC 6761 precisely so it can never resolve, so this is a local
-    // DNS failure rather than a request to anything: the only assertion in the suite that touches
-    // the resolver, and the only way to exercise this arm without one.
+    // The mock codec addresses loopback port 1, so the connection is refused by the local kernel
+    // without a resolver, a route, or a socket to anywhere. Fully hermetic: this passes identically
+    // on a machine with no network at all.
     fn a_transport_failure_becomes_an_ai_error(): void {
         naked = Agent.over(AgentConfig.new("test-model"), Mock.new(), Api.new(client.new()))
         match naked.run_sync("hi") {
             Ok(_) => {
-                assert(false, "an unresolvable host cannot answer")
+                assert(false, "a refused connection cannot answer")
             },
             Err(e) => {
                 assert(match e { AiError.Transport(inner) => true, _ => false },
@@ -505,7 +508,7 @@ impl Middleware for Mock {
         }
         match Mock.new().encode(req) {
             Ok(w) => {
-                assert(w.url == "https://mock.invalid/v1/messages", "unroutable by construction")
+                assert(w.url == "http://127.0.0.1:1/v1/messages", "unreachable by construction")
                 assert(w.body.contains("\"type\":\"thinking\""), w.body)
                 assert(w.body.contains("\"signature\":\"sig\""), w.body)
                 assert(w.body.contains("\"type\":\"tool_result\""), w.body)
