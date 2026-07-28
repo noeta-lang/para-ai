@@ -28,15 +28,26 @@ use para.api.{Api, Middleware, Next}
 use para.ai.{Agent, AgentConfig, AiError, Conversation, Message, Part, Role}
 use para.ai.provider
 use para.ai.provider.{Delta, ModelReply, ModelRequest, Provider, StopReason, Usage, Wire}
+use para.ai.tools.{Arg, Local, Tool, ToolSource}
+
+// One tool call in a scripted turn. `args` is a raw JSON blob, exactly as a vendor would stream
+// one, so a test can script a malformed blob and watch the dispatcher refuse it.
+@derive(Equatable, Display)
+pub struct ScriptedCall {
+    pub id: string
+    pub name: string
+    pub args: string = "{}"
+}
 
 // One scripted answer. The script is consumed in order, one entry per model call.
 @derive(Equatable, Display)
 pub enum Scripted {
     // A plain assistant answer; the run finishes.
     Text(text: string)
-    // The model asks for a tool. Phase 1 ends the run and hands the call back in `Run.messages`;
-    // phase 2 dispatches it and continues.
-    Tool(id: string, name: string, args: string)
+    // The model asks for one or more tools **in a single turn**. A list rather than a single call
+    // because parallel tool use is the interesting case: it is what every current vendor emits, and
+    // a run that dispatches two calls at once is the only one that exercises the concurrency bound.
+    Tools(calls: List<ScriptedCall>)
     // The model declines — surfaces as `AiError.Refused`, never as a decode failure.
     Refusal(reason: string)
     // The vendor answers with an error status — surfaces as `AiError.Provider`.
@@ -121,10 +132,18 @@ fn one_part(m: Map<string, dyn>): List<dyn> {
     return out
 }
 
+fn call_parts(calls: List<ScriptedCall>): List<dyn> {
+    mut out: List<dyn> = []
+    for c in calls {
+        out = out ~ [part_to_json(Part.ToolCall(id: c.id, name: c.name, args: c.args))]
+    }
+    return out
+}
+
 fn scripted_parts(s: Scripted): List<dyn> {
     return match s {
         Scripted.Text(text) => one_part(part_to_json(Part.Text(text: text))),
-        Scripted.Tool(id, name, args) => one_part(part_to_json(Part.ToolCall(id: id, name: name, args: args))),
+        Scripted.Tools(calls) => call_parts(calls),
         Scripted.Refusal(reason) => one_part(part_to_json(Part.Text(text: reason))),
         // Never reached: a failure is an error status, which the run loop routes to `decode_error`
         // before `decode_reply` is consulted.
@@ -135,7 +154,7 @@ fn scripted_parts(s: Scripted): List<dyn> {
 fn scripted_stop(s: Scripted): StopReason {
     return match s {
         Scripted.Text(text) => StopReason.EndTurn,
-        Scripted.Tool(id, name, args) => StopReason.ToolUse,
+        Scripted.Tools(calls) => StopReason.ToolUse,
         Scripted.Refusal(reason) => StopReason.Refusal,
         Scripted.Failure(status, code, message) => StopReason.EndTurn,
     }
@@ -178,8 +197,16 @@ pub class Mock {
         return self
     }
 
+    // One tool call in a turn.
     fn reply_tool(id: string, name: string, args: string): Mock {
-        self.script = self.script ~ [Scripted.Tool(id: id, name: name, args: args)]
+        self.script = self.script ~ [Scripted.Tools(calls: [ScriptedCall { id: id, name: name, args: args }])]
+        return self
+    }
+
+    // Several tool calls in **one** turn — the parallel case, and the one that exercises
+    // `AgentConfig.tool_concurrency`.
+    fn reply_tools(calls: List<ScriptedCall>): Mock {
+        self.script = self.script ~ [Scripted.Tools(calls: calls)]
         return self
     }
 
@@ -225,6 +252,12 @@ pub class Mock {
     fn agent(cfg: AgentConfig): Agent<Mock> {
         return Agent.over(cfg, self, self.api())
     }
+
+    // The same, with a source of tools attached — the full tool loop with no socket in it.
+    // `Result` because attaching a source derives every schema and checks every name.
+    fn tool_agent(cfg: AgentConfig, src: dyn ToolSource): Result<Agent<Mock>, AiError> {
+        return self.agent(cfg).tools(src)
+    }
 }
 
 impl Provider for Mock {
@@ -238,6 +271,21 @@ impl Provider for Mock {
             msgs = msgs ~ [message_to_json(m)]
         }
         mut body: Map<string, dyn> = {"model": req.model, "messages": msgs}
+        // The tools the agent offered, rendered flat so a test can assert that the derived schema
+        // actually reached the wire — which is the difference between "the toolbox has a schema"
+        // and "the model was told about it".
+        if req.tools.len() > 0 {
+            mut tools: List<dyn> = []
+            for t in req.tools {
+                entry: Map<string, dyn> = {
+                    "name": t.name,
+                    "description": t.description,
+                    "schema": t.parameters,
+                }
+                tools = tools ~ [entry]
+            }
+            body = body.set("tools", tools)
+        }
         match req.max_tokens {
             some(n) => {
                 body = body.set("max_tokens", n)
@@ -423,9 +471,10 @@ impl Middleware for Mock {
         }
     }
 
-    // Phase 1 sends no tools, so a tool-use stop ends the run rather than looping against a
-    // dispatcher that does not exist yet — and the requested call is handed back intact.
-    async fn a_tool_call_ends_the_run_and_is_handed_back(): void {
+    // An agent with **no** toolbox cannot dispatch, so a tool-use stop finishes the run and hands
+    // the requested call back intact rather than spinning. That is the only behavior that cannot
+    // loop, and it is what phase 1 did.
+    async fn a_tool_call_without_a_toolbox_ends_the_run(): void {
         m = Mock.new().reply_tool("call_1", "weather", "{\"city\":\"Malmö\"}")
         agent = m.agent(AgentConfig.new("test-model"))
         match agent.run(Conversation.of("weather?")).await {
@@ -433,11 +482,122 @@ impl Middleware for Mock {
                 assert(run.stop == StopReason.ToolUse)
                 calls = run.messages[run.messages.len() - 1].tool_calls()
                 assert(calls == [Part.ToolCall(id: "call_1", name: "weather", args: "{\"city\":\"Malmö\"}")])
+                assert(m.call_count() == 1, "and it does not go round again")
             },
             Err(e) => {
                 assert(false, "${e}")
             },
         }
+    }
+
+    // --- The tool loop ---------------------------------------------------------------------------
+    //
+    // The tools these drive are the `#[Tool]` functions declared at the bottom of *this* file, and
+    // every assertion goes through `run_sync` plus `calls()` rather than through `run`. Both are
+    // deliberate; both are worked around toolchain bugs, and both are recorded in AGENTS.md:
+    //
+    //   * `attributes_of::<T>()` sees only the **entry module's** annotations, so a `#[Tool]` in a
+    //     sibling module is invisible to a suite rooted here.
+    //   * an `async fn` in a `@test` block is called but **never driven**, so every assertion in one
+    //     passes vacuously.
+    //
+    // `calls()` is not a lesser assertion, as it happens: it is the exact bytes the codec produced
+    // for the *second* model call, which is to say the whole conversation including the tool turn.
+
+    // The full cycle, with no socket in it: the model asks for a tool, the dispatcher calls the real
+    // Noeta function, the result goes back as a turn, and the model answers.
+    fn a_scripted_tool_call_dispatches_and_the_run_continues(): void {
+        m = Mock.new()
+            .reply_tool("call_1", "mock_shout", "{\"text\": \"hej\"}")
+            .reply_text("It said HEJ.")
+        assert(tool_agent_or_fail(m).run_sync("shout hej") == Ok("It said HEJ."))
+        assert(m.call_count() == 2, "two model calls: the ask, then the answer")
+        assert(m.remaining() == 0)
+        // The second request carries the whole exchange — and `HEJ` is what the real `mock_shout`
+        // returned, not anything the script said.
+        second = m.calls()[1]
+        assert(second.contains("\"role\":\"tool\""), second)
+        assert(second.contains("{\"content\":\"HEJ\",\"id\":\"call_1\",\"is_error\":false,\"type\":\"tool_result\"}"),
+            "the real function's return value went back to the model: ${second}")
+    }
+
+    // Parallel tool use in one turn: three calls, one tool turn carrying all three results, in call
+    // order. One turn rather than three is load-bearing — several vendors reject consecutive
+    // same-role turns, and a context strategy that split a `ToolCall` from its `ToolResult` would
+    // produce the same rejection. Keeping them in one message makes that unrepresentable.
+    fn parallel_tool_calls_come_back_as_one_turn_in_order(): void {
+        m = Mock.new()
+            .reply_tools([
+                ScriptedCall { id: "a", name: "mock_shout", args: "{\"text\": \"one\"}" },
+                ScriptedCall { id: "b", name: "mock_add", args: "{\"a\": 2, \"b\": 3}" },
+                ScriptedCall { id: "c", name: "mock_shout", args: "{\"text\": \"three\"}" },
+            ])
+            .reply_text("done")
+        assert(tool_agent_or_fail(m).run_sync("go") == Ok("done"))
+        second = m.calls()[1]
+        assert(second.contains("{\"parts\":[{\"content\":\"ONE\",\"id\":\"a\",\"is_error\":false,\"type\":\"tool_result\"},{\"content\":\"5\",\"id\":\"b\",\"is_error\":false,\"type\":\"tool_result\"},{\"content\":\"THREE\",\"id\":\"c\",\"is_error\":false,\"type\":\"tool_result\"}],\"role\":\"tool\"}"),
+            "one tool turn, three results, in call order: ${second}")
+    }
+
+    // A concurrency cap of one is the sequential path through the same dispatcher, and it has to
+    // produce byte-identical results — order comes from `map_bounded`, not from timing.
+    fn the_concurrency_cap_does_not_change_the_answer(): void {
+        assert(two_call_results(4) == two_call_results(1))
+        assert(two_call_results(4).contains("\"content\":\"A\""), two_call_results(4))
+    }
+
+    // **A failing tool is a turn, not an outage.** An unknown name, an argument that will not
+    // coerce, and a tool that returns `Err` all reach the model as `is_error: true` prose it can act
+    // on — and the run finishes normally rather than aborting.
+    fn a_failing_tool_is_a_turn_the_model_can_recover_from(): void {
+        m = Mock.new()
+            .reply_tools([
+                ScriptedCall { id: "x", name: "nonexistent", args: "{}" },
+                ScriptedCall { id: "y", name: "mock_add", args: "{\"a\": \"not a number\"}" },
+                ScriptedCall { id: "z", name: "mock_add", args: "{\"a\": 9999999}" },
+            ])
+            .reply_text("I will try something else.")
+        assert(tool_agent_or_fail(m).run_sync("go") == Ok("I will try something else."))
+        second = m.calls()[1]
+        assert(second.contains("no such tool"), second)
+        assert(second.contains("expected an integer"), second)
+        assert(second.contains("unreasonably large"), second)
+        // All three came back flagged, so the model can tell them from answers.
+        assert(!second.contains("\"is_error\":false"), "every result is a failure here: ${second}")
+    }
+
+    // The derived schema has to reach the wire, which is the difference between "the toolbox has a
+    // schema" and "the model was told about it".
+    fn the_derived_schema_reaches_the_request(): void {
+        m = Mock.new().reply_text("ok")
+        one = tool_agent_or_fail(m).run_sync("hi")
+        sent = m.calls()[0]
+        assert(sent.contains("\"name\":\"mock_shout\""), sent)
+        assert(sent.contains("Echo a string back, uppercased"), sent)
+        assert(sent.contains("The text to shout"), "the `#[Arg(help)]` too: ${sent}")
+        assert(sent.contains("\\\"required\\\":[\\\"text\\\"]"), "and the derived requirements: ${sent}")
+    }
+
+    // The loop's hard rail. A model that keeps asking for tools is an error naming the limit, never
+    // a truncated answer that looks complete.
+    fn a_runaway_tool_loop_stops_at_max_turns(): void {
+        again = "{\"text\": \"again\"}"
+        m = Mock.new()
+            .reply_tool("r0", "mock_shout", again)
+            .reply_tool("r1", "mock_shout", again)
+            .reply_tool("r2", "mock_shout", again)
+            .reply_tool("r3", "mock_shout", again)
+        agent = tool_agent_or_fail_with(m, AgentConfig.new("test-model").with_max_turns(3))
+        match agent.run_sync("loop") {
+            Ok(answer) => {
+                assert(false, "a run that never finished is not an answer: ${answer}")
+            },
+            Err(e) => {
+                assert(match e { AiError.MaxTurns(turns) => turns == 3, _ => false }, "${e}")
+                assert("${e}".contains("max_turns"), "the message names the knob: ${e}")
+            },
+        }
+        assert(m.call_count() == 3, "exactly the budget, not one more")
     }
 
     // A run that outlasts its script fails loudly rather than answering something plausible.
@@ -533,4 +693,61 @@ impl Middleware for Mock {
         long = Mock.new().estimate_tokens([Message.user("hi".repeat(200))]) ?? 0
         assert(long > short)
     }
+}
+
+// --- Test helpers -----------------------------------------------------------------------------
+//
+// Unwrap-or-fail for the two fallible doors a tool test goes through. A `match` arm cannot both
+// fail an assertion and produce a value, so the unwrapping lives out here.
+
+fn tool_agent_or_fail_with(m: Mock, cfg: AgentConfig): Agent<Mock> {
+    match m.tool_agent(cfg, Local.new()) {
+        Ok(a) => {
+            return a
+        },
+        Err(e) => {
+            assert(false, "attaching tools failed: ${e}")
+        },
+    }
+    return m.agent(cfg)
+}
+
+fn tool_agent_or_fail(m: Mock): Agent<Mock> {
+    return tool_agent_or_fail_with(m, AgentConfig.new("test-model"))
+}
+
+// The full conversation a two-call tool turn sends back, dispatched with `cap` calls in flight. The
+// cap is the only thing that differs between the two runs a concurrency test compares.
+fn two_call_results(cap: int): string {
+    m = Mock.new()
+        .reply_tools([
+            ScriptedCall { id: "one", name: "mock_shout", args: "{\"text\": \"a\"}" },
+            ScriptedCall { id: "two", name: "mock_shout", args: "{\"text\": \"b\"}" },
+        ])
+        .reply_text("done")
+    agent = tool_agent_or_fail_with(m, AgentConfig.new("test-model").with_tool_concurrency(cap))
+    one = agent.run_sync("go")
+    return m.calls()[1]
+}
+
+// --- The tools these tests drive ------------------------------------------------------------------
+//
+// Declared **here** rather than borrowed from `para.ai.tools`, because `attributes_of::<T>()` sees
+// only the entry module's annotations (AGENTS.md). Named `mock_*` so that when that is fixed
+// upstream they simply join the other module's rather than colliding with them.
+
+#[Tool(about: "Echo a string back, uppercased")]
+fn mock_shout(#[Arg(help: "The text to shout")] text: string): string {
+    return text.upper()
+}
+
+#[Tool(about: "Add two integers")]
+fn mock_add(
+    #[Arg(help: "The left operand")] a: int,
+    #[Arg(help: "The right operand")] b: int = 1,
+): Result<int, string> {
+    if a > 1000000 {
+        return Err("`a` is unreasonably large")
+    }
+    return Ok(a + b)
 }

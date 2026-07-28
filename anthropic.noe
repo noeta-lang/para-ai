@@ -22,6 +22,7 @@ use std.{env, json}
 use para.ai.{AiError, Message, Part, Role}
 use para.ai.provider
 use para.ai.provider.{Delta, ModelReply, ModelRequest, Provider, StopReason, Usage, Wire}
+use para.ai.tools.{ToolSpec}
 
 // The Anthropic Messages API, as a codec.
 //
@@ -174,19 +175,66 @@ fn wire_role(r: Role): string {
 // A system turn anywhere in the conversation is hoisted, not just a leading one: some flows append
 // a system reminder mid-conversation, and silently leaving it in `messages` is a vendor-side 400
 // far from the cause.
+//
+// Adjacent turns of the same wire role are **merged into one**, because the Messages API requires
+// user and assistant turns to alternate. That is not a nicety once tools exist: `Role.Tool` encodes
+// as `user`, so a user question followed by a tool result — or a hoisted system turn splitting two
+// user turns — would otherwise produce two consecutive `user` entries and a 400 whose message says
+// nothing about tools. Merging here keeps the neutral model free to say what it means.
 fn encode_messages(msgs: List<Message>): Result<(List<dyn>, List<dyn>), AiError> {
     mut system: List<dyn> = []
     mut turns: List<dyn> = []
+    mut last_role = ""
     for m in msgs {
         blocks = encode_parts(m.parts)?
         if m.role == Role.System {
             system = system ~ blocks
+        } else if wire_role(m.role) == last_role && turns.len() > 0 {
+            at = turns.len() - 1
+            turns = turns.set(at, merged_turn(turns[at], last_role, blocks))
         } else {
-            turn: Map<string, dyn> = {"role": wire_role(m.role), "content": blocks}
+            role = wire_role(m.role)
+            turn: Map<string, dyn> = {"role": role, "content": blocks}
             turns = turns ~ [turn]
+            last_role = role
         }
     }
     return Ok((system, turns))
+}
+
+fn merged_turn(previous: dyn, role: string, blocks: List<dyn>): Map<string, dyn> {
+    prev = previous.as<Map<string, dyn>>() ?? {}
+    empty: List<dyn> = []
+    before = (prev.get("content") ?? empty).as<List<dyn>>() ?? empty
+    out: Map<string, dyn> = {"role": role, "content": before ~ blocks}
+    return out
+}
+
+// Every tool the request offers, as the vendor's `tools` array.
+//
+// `parameters` is raw JSON Schema text, so it is embedded as real JSON rather than as a quoted
+// string — the same reason a tool call's `args` is, and the same failure if it were not: the vendor
+// would see one string-typed parameter named nothing.
+fn encode_tools(specs: List<ToolSpec>): Result<List<dyn>, AiError> {
+    mut out: List<dyn> = []
+    for t in specs {
+        mut schema: dyn = 0
+        match provider.parse_value(t.parameters, "tool `${t.name}` schema") {
+            Ok(s) => {
+                schema = s
+            },
+            Err(e) => {
+                return Err(AiError.Encode(provider: "anthropic", message: "${e}"))
+            },
+        }
+        entry: Map<string, dyn> = {
+            "name": t.name,
+            "description": t.description,
+            "input_schema": schema,
+        }
+        out = out ~ [entry]
+    }
+    return Ok(out)
 }
 
 // --- Decoding ----------------------------------------------------------------------------------
@@ -273,6 +321,11 @@ impl Provider for Anthropic {
         }
         if system.len() > 0 {
             body = body.set("system", system)
+        }
+        // No tools, no key. An empty `tools` array is not the same request as an absent one, and a
+        // vendor is entitled to treat it differently.
+        if req.tools.len() > 0 {
+            body = body.set("tools", encode_tools(req.tools)?)
         }
         match req.temperature {
             some(t) => {
@@ -500,6 +553,95 @@ fn captured_tool_use_reply(): string {
                 assert(false, "${e}")
             },
         }
+    }
+
+    // A tool's schema is raw JSON Schema text, so it has to reach the vendor as real JSON — a
+    // quoted string here would read as one string-typed parameter named nothing.
+    fn encode_sends_the_tools_as_input_schema(): void {
+        req = ModelRequest {
+            model: "m",
+            messages: [Message.user("weather?")],
+            tools: [ToolSpec {
+                name: "weather",
+                description: "Current weather for a city",
+                parameters: "{\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"}",
+            }],
+        }
+        wire = encode_or_fail(Anthropic.new("k"), req)
+        assert(wire.body.contains("\"tools\":[{\"description\":\"Current weather for a city\",\"input_schema\":{\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"name\":\"weather\"}]"),
+            wire.body)
+    }
+
+    // No tools, no key: an empty `tools` array is not the same request as an absent one, and a
+    // vendor is entitled to treat it differently.
+    fn encode_omits_the_tools_key_when_there_are_none(): void {
+        req = ModelRequest { model: "m", messages: [Message.user("hi")] }
+        assert(!encode_or_fail(Anthropic.new("k"), req).body.contains("\"tools\""))
+    }
+
+    // A schema that is not JSON at all is caught at encode, naming the tool, rather than becoming
+    // an opaque vendor 400.
+    fn encode_rejects_a_tool_whose_schema_is_not_json(): void {
+        req = ModelRequest {
+            model: "m",
+            messages: [Message.user("hi")],
+            tools: [ToolSpec { name: "broken", description: "", parameters: "{oops" }],
+        }
+        match Anthropic.new("k").encode(req) {
+            Ok(_) => {
+                assert(false, "a malformed schema must not encode")
+            },
+            Err(e) => {
+                assert("${e}".contains("broken"), "${e}")
+                assert("${e}".contains("anthropic"), "${e}")
+            },
+        }
+    }
+
+    // The Messages API requires user and assistant turns to alternate, and `Role.Tool` encodes as
+    // `user` — so a tool turn following a user turn would be two consecutive `user` entries and a
+    // 400 whose message says nothing about tools. Adjacent same-role turns are merged.
+    fn encode_merges_adjacent_turns_of_the_same_role(): void {
+        req = ModelRequest {
+            model: "m",
+            messages: [
+                Message.user("first"),
+                Message.user("second"),
+            ],
+        }
+        wire = encode_or_fail(Anthropic.new("k"), req)
+        assert(wire.body.contains("\"messages\":[{\"content\":[{\"text\":\"first\",\"type\":\"text\"},{\"text\":\"second\",\"type\":\"text\"}],\"role\":\"user\"}]"),
+            "one user turn carrying both: ${wire.body}")
+    }
+
+    // The shape a tool loop actually produces: a user question, an assistant turn with two parallel
+    // tool calls, and one tool turn carrying both results. Three wire turns, strictly alternating.
+    fn encode_round_trips_a_parallel_tool_turn(): void {
+        req = ModelRequest {
+            model: "m",
+            messages: [
+                Message.user("weather in both?"),
+                Message {
+                    role: Role.Assistant,
+                    parts: [
+                        Part.ToolCall(id: "t1", name: "weather", args: "{\"city\":\"Malmo\"}"),
+                        Part.ToolCall(id: "t2", name: "weather", args: "{\"city\":\"Lund\"}"),
+                    ],
+                },
+                Message {
+                    role: Role.Tool,
+                    parts: [
+                        Part.ToolResult(id: "t1", content: "18C", is_error: false),
+                        Part.ToolResult(id: "t2", content: "17C", is_error: false),
+                    ],
+                },
+            ],
+        }
+        wire = encode_or_fail(Anthropic.new("k"), req)
+        assert(wire.body.contains("\"tool_use_id\":\"t1\""), wire.body)
+        assert(wire.body.contains("\"tool_use_id\":\"t2\""), wire.body)
+        // Strict alternation: user, assistant, user — and no run of two same-role entries.
+        assert(!wire.body.contains("\"role\":\"user\"},{\"content\":[{\"content\":"), wire.body)
     }
 
     // The signature has to come back or the vendor invalidates the block; nothing here reads it.
