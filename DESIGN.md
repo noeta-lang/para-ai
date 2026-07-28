@@ -710,7 +710,7 @@ API keys come from `std.env`; para/ai never reads a config file and never writes
 | --- | --- | --- |
 | U-1 | `DirectiveCtx.fields` — an expand hook sees the decorated declaration's shape | **merged** (`21ca0362`), unblocks `@schema` and phase 5 |
 | U-2 | `async` through `dyn` typed correctly, plus the impl↔declaration parity rule | **merged** (`95ad4ab8`) |
-| U-3 | streaming HTTP bodies + `server.sse` | in flight |
+| U-3 | streaming HTTP bodies + `server.sse` | **merged** (`f90f9053`) — `client.stream(req, framing)`, `Framing { Sse; Ndjson; Lines }`, `FrameStream`, `server.sse`; unblocks phases 3 and 7 |
 | U-4 | a cross-module type cannot be a positional enum payload | in flight |
 | — | three checker fixes found building phase 1 (see §2.3, §13) | **merged** |
 
@@ -739,7 +739,15 @@ The bound path is right. The `dyn` path drops the `async_return` wrap during tra
 
 It also independently vindicates O-7: the spelling para/ai standardized on is the one that already works correctly.
 
-**O-4 — the question does not arise yet, because `std.http` has no streaming at all.** There is no incremental body read anywhere in `noeta-stdlib` (`http_client.rs` reads whole bodies; the only `chunk` hits in the crate are SIMD loops). So there is nothing for para/api's onion to fail to wrap. The retry-over-streaming question becomes answerable only after U-3, and its answer is a design input to U-3 rather than a discovery afterwards. → **U-3.**
+**O-4 — asked too early (`std.http` had no streaming at all), and now answered by U-3: a streaming response cannot flow through the para/api onion.**
+
+`Middleware.handle` is `(Request, Next) -> Result<Response, HttpError>`, and `Response` is a buffered value — cloneable, content-equal, storable in a map. Four of the six standard layers structurally require that: `Retry` calls `next` repeatedly and would discard a body mid-flight, `Cache` and `Record` store and re-serve the same `Response`, and `Mock` needs a whole buffered one to answer with. Only `Header` and `Logging` are streaming-safe. Pagination is worse still — it reads the body twice, once as the page and once for the strategy.
+
+So `client.stream` returns `Result<FrameStream, HttpError>`, a type the onion cannot accept, which makes the incompatibility **a compile error rather than a runtime surprise**. Three consequences for phase 3:
+
+- **The streaming path owns its retry.** It cannot inherit para/api's, so the run loop applies backoff for streamed calls itself, and the README states which layers cover which path instead of implying blanket coverage.
+- **`Mock` cannot double as the streaming transport** the way it does for phase 1. Phase 3 needs a scripted `FrameStream` — a `Frame` list replayed through the real `StreamDecoder` — so streaming tests stay as hermetic as the buffered ones.
+- **A layered streaming onion, if ever wanted, is a parallel `StreamMiddleware`** where the header-only layers work and the buffering ones structurally cannot be written. That is para's call; nothing in std presumes it.
 
 ### 17.1 Upstream work items
 
