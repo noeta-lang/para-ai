@@ -37,7 +37,11 @@ use para.ai.provider.{Delta, ModelRequest, ModelReply, Provider, StopReason, Str
 // declares the block syntax exists.
 use para.ai.prompt.{Prompt, Resolved}
 use para.ai.tools
-use para.ai.tools.{Toolbox, ToolSource}
+use para.ai.tools.{Output, Toolbox, ToolSource}
+// The typed decode `extract` bottoms out in. `json.try_parse::<T>` is the recoverable door **and**
+// the one that runs `Validate` — see `extract` for why that matters more than it looks.
+use std.json
+use std.json.JsonError
 
 // --- The data model -------------------------------------------------------------------------------
 //
@@ -745,6 +749,225 @@ fn operation_duration_histogram(): dyn {
     return metrics.histogram("gen_ai.client.operation.duration")
 }
 
+// --- Structured responses -------------------------------------------------------------------------
+//
+// DESIGN §8: ask for a type, get a type.
+//
+//     @derive(Deserialize<Json>)
+//     struct Extraction {
+//         company: string
+//         confidence: float
+//
+//         impl Validate {
+//             fn validate(): Result<void, string> {
+//                 if self.confidence < 0.0 || self.confidence > 1.0 {
+//                     return Err("confidence out of range: ${self.confidence}")
+//                 }
+//                 return Ok()
+//             }
+//         }
+//     }
+//
+//     out = Output.of(type_name::<Extraction>())?
+//     e   = extract::<Extraction>(agent, conv, out)?
+//
+// **The best output guardrail is already in the language, and para/ai does not implement it.**
+// `json.try_parse::<T>` runs `Validate` automatically, bottom-up, at the decode door — so a
+// structured reply is validated before this package ever sees the value, and the failure arrives as
+// a path-carrying `JsonError` reading `items[2]: confidence out of range: 1.4`. That message is
+// also an excellent repair prompt, which is exactly what `extract` does with it.
+
+// One structured model call — the provider-erased seam `extract` drives. `Agent<P>` implements it
+// inline; the comment on that impl says why the erasure is load-bearing rather than tidy.
+pub trait Structured {
+    // Ask for one document in `out`'s shape, and hand back its raw JSON text.
+    //
+    // Synchronous, like `ToolSource.call` and for the same reason: it is held as `dyn`. That also
+    // makes `extract` callable from a plain `fn`, which is what keeps its tests real — an `async fn`
+    // in a `@test` block is never driven on a released toolchain, so an async extraction's
+    // assertions would be vacuous exactly where they matter most.
+    fn ask_json(conv: Conversation, out: Output): Result<string, AiError>
+}
+
+// Ask for a value of type `T`, and get one — or a typed error saying why not.
+//
+// **A top-level function rather than `agent.extract::<T>(conv)`**, which DESIGN §8.1 sketches and no
+// spelling of this language can provide: a generic method cannot forward its parameter into
+// `json.try_parse::<T>` (E0058, measured), and a turbofish must name every parameter of the function
+// it instantiates, so the provider is erased behind `dyn Structured` to leave exactly one. The
+// argument order still reads left to right as "extract this, from that agent, over this
+// conversation, in this shape".
+//
+// **Bounded repair** (§8.3). On a decode or validation failure the `JsonError`'s own message goes
+// back as a correction turn and the call is made again, `repair` times, defaulting to 1. One repair
+// fixes the overwhelming majority of real failures; an unbounded loop against a model that has
+// misunderstood the schema is a way to spend money. Every attempt is a span event, so a run that
+// repaired shows it in the trace instead of hiding it in latency.
+//
+// **A refusal is not a decode failure** (§8.4). `StopReason.Refusal` has already become
+// `AiError.Refused` inside the run loop, and it comes back out of here unchanged and unretried —
+// repairing a refusal would spend the budget arguing with a model that declined on purpose, and
+// reporting it as a `JsonError` would send the reader to debug a schema that is fine.
+//
+// **A repair that gives up returns a typed error, not a half-built value** (§10's rule, which
+// applies here too). The last failure is reported with its path intact.
+pub fn extract<T>(a: dyn Structured, conv: Conversation, out: Output, repair: int = 1): Result<T, AiError> {
+    budget = at_least(repair, 0)
+    span = tracing.span("extract ${out.name}")
+    span.set_attribute("gen_ai.operation.name", "extract")
+    span.set_attribute("para.ai.output.type", out.target)
+    span.set_attribute("para.ai.output.repair_budget", budget)
+
+    mut so_far = conv
+    mut attempt = 0
+    mut outcome: Result<T, AiError> = no_attempt(out)
+    mut settled = false
+    while !settled && attempt <= budget {
+        if attempt > 0 {
+            // The trace is where a repair belongs. A run that quietly costs two model calls instead
+            // of one is a cost nobody can see until the invoice arrives.
+            span.add_event("para.ai.output.repair")
+        }
+        match a.ask_json(so_far, out) {
+            Ok(text) => {
+                // The one decode, and the one place `Validate` runs. Nothing in this package
+                // inspects the document first: a pre-check would be a second, weaker copy of a
+                // validation the language already performs completely.
+                match json.try_parse::<T>(text) {
+                    Ok(value) => {
+                        outcome = decoded(value)
+                        settled = true
+                    },
+                    Err(e) => {
+                        outcome = undecoded::<T>(out, e)
+                        so_far = so_far.assistant(text).user(correction(e))
+                    },
+                }
+            },
+            Err(e) => {
+                // A refusal, a transport failure, a vendor error: none of them is a malformed
+                // document, and none of them is repaired by telling the model its JSON was wrong.
+                outcome = failed::<T>(e)
+                settled = true
+            },
+        }
+        attempt = attempt + 1
+    }
+    span.set_attribute("para.ai.output.attempts", attempt)
+    match outcome {
+        Ok(v) => {},
+        Err(e) => {
+            span.record_error("${e}")
+        },
+    }
+    span.end()
+    return outcome
+}
+
+// The three `Result` constructors `extract` assigns through.
+//
+// Written as functions with declared return types because a bare `Ok(v)`/`Err(e)` assigned to an
+// already-annotated `mut` is E0023 — the declaration's annotation is not consulted for the
+// assignment's expected type, and the diagnostic's help suggests the annotation that is already
+// there. The same workaround `mcp.noe` uses, and for the same reason (AGENTS.md).
+//
+// The two **return-only** ones are called `failed::<T>(e)` rather than `failed(e)`, and the
+// turbofish is required rather than decorative: expected-type seeding fills a return-only parameter
+// from an *annotation* (`no_attempt(out)` in the initializer infers fine) but not from a
+// **reassignment**, which reports `cannot assign Result<dyn, AiError> to outcome`. Forwarding the
+// enclosing `T` into a user generic's turbofish is what closes it — a capability the name-keyed
+// reflection turbofishes deliberately do not have, and the difference is worth knowing.
+fn decoded<T>(v: T): Result<T, AiError> {
+    return Ok(v)
+}
+
+fn failed<T>(e: AiError): Result<T, AiError> {
+    return Err(e)
+}
+
+// A decode or validation failure, with the path the language handed us kept intact. `path` is what
+// makes `items[2].confidence` a location rather than a paragraph, and flattening it into the message
+// would throw away the only part a program can branch on.
+fn undecoded<T>(out: Output, e: JsonError): Result<T, AiError> {
+    return Err(AiError.Decode(path: e.path(), message: "`${out.target}`: ${e.message()}"))
+}
+
+fn no_attempt<T>(out: Output): Result<T, AiError> {
+    return Err(AiError.Decode(
+        path: "",
+        message: "`${out.target}`: no extraction attempt was made — the repair budget was negative",
+    ))
+}
+
+// The correction turn a failed decode becomes.
+//
+// It is the `JsonError`'s own message and nothing else, because that message is already the best
+// prompt available: `Validate` runs bottom-up at the door, so a nested failure arrives as
+// `items[2]: confidence out of range: 1.4` — the field, its path, and the invariant it broke, in the
+// words the type's author wrote. Paraphrasing it here would lose the path and add nothing.
+fn correction(e: JsonError): string {
+    return "That did not decode: ${e.message()}. Answer again with the same schema, correcting exactly that."
+}
+
+// The document a structured run produced, from wherever this vendor put it.
+//
+// Two places, because the vendors genuinely differ: OpenAI, Google and Ollama constrain the ordinary
+// assistant text, while Anthropic forces a tool and the document arrives as that call's arguments.
+// The tool call is checked first and by name, so an agent that also has real tools cannot have one
+// of *their* calls mistaken for the answer.
+fn structured_json(run: Run, out: Output): Result<string, AiError> {
+    last = run.conversation().last()
+    match last {
+        some(m) => {
+            for p in m.parts {
+                match p {
+                    Part.ToolCall(id, name, args) => {
+                        if name == out.name {
+                            return Ok(args)
+                        }
+                    },
+                    _ => {},
+                }
+            }
+            text = m.text().trim()
+            if text != "" {
+                return Ok(text)
+            }
+        },
+        none => {},
+    }
+    // Empty is its own failure, and a different one from malformed. A vendor that answered with
+    // nothing at all did not produce a document with a bad field in it, and reporting it as a
+    // decode failure would send the reader looking for a schema mistake.
+    return Err(AiError.Decode(
+        path: "",
+        message: "`${out.target}`: the reply carried no `${out.name}` tool call and no text — the model was asked for a structured answer and produced nothing to decode",
+    ))
+}
+
+// The tool calls the loop should actually dispatch: every one that is not this run's output tool.
+fn dispatchable_calls(calls: List<Part>, output: ?Output): List<Part> {
+    name = match output {
+        some(out) => out.name,
+        none => "",
+    }
+    if name == "" {
+        return calls
+    }
+    mut out: List<Part> = []
+    for p in calls {
+        match p {
+            Part.ToolCall(id, called, args) => {
+                if called != name {
+                    out = out ~ [p]
+                }
+            },
+            _ => {},
+        }
+    }
+    return out
+}
+
 // --- The agent ------------------------------------------------------------------------------------
 
 // An agent: a configuration, a provider codec, and the transport chain to send through.
@@ -769,6 +992,14 @@ pub struct Agent<P: Provider> {
     // `Streamer`. Defaults to the real client; `frames` swaps in a scripted replay.
     pub transport: dyn Streamer
     pub toolbox: Toolbox = Toolbox.new()
+    // The shape this agent's next reply must take, when one was asked for.
+    //
+    // On the `Agent` rather than on `AgentConfig` because it is a **per-call** decision, not a
+    // standing one: the same agent answers `run_sync` with prose and `extract` with a document, and
+    // a config field would make "which of my agents is the structured one" a thing to keep track of.
+    // `expecting` returns a new agent, so nothing is mutated and a structured call cannot leak into
+    // the next ordinary one.
+    pub output: ?Output = none
 
     // An agent over the default transport: a plain client wrapped in `Retry`, which honors a
     // vendor's `Retry-After` and backs off on 429/502/503/504. `retry(0)` on the client is
@@ -807,6 +1038,30 @@ pub struct Agent<P: Provider> {
         return Agent { ...self, toolbox: box }
     }
 
+    // The same agent, asked to answer in a declared shape. `extract` uses this; a caller who wants
+    // the raw document rather than a typed value can use it directly and read `Run.text()`.
+    fn expecting(out: Output): Agent<P> {
+        return Agent { ...self, output: some(out) }
+    }
+
+    // One structured model call, erased over the provider.
+    //
+    // **The erasure is what makes `extract::<T>` writable at all**, and the reason is measured
+    // rather than aesthetic. A generic *method* cannot forward its type parameter into a
+    // call-site-typed position — `json.try_parse::<T>` inside one is E0058, "call-site-typed
+    // forwarding is supported in top-level generic functions only" — so DESIGN §8.1's
+    // `agent.extract::<Extraction>(conv)` cannot exist in any form. A top-level `fn extract<T>` can
+    // forward, but a turbofish must supply *every* type parameter (a partial one is E0058), so an
+    // `extract<T, P: Provider>` would have to be written `extract::<Extraction, Anthropic>(…)`.
+    // Erasing the provider behind this trait leaves exactly one parameter to name, which is the one
+    // the caller actually cares about. See §8.1's divergence note.
+    impl Structured {
+        fn ask_json(conv: Conversation, out: Output): Result<string, AiError> {
+            run = drive_sync(self.expecting(out), conv)?
+            return structured_json(run, out)
+        }
+    }
+
     // The neutral request for a conversation, with the config's system prompt prepended.
     //
     // **This is where the cache breakpoint is placed.** The system prompt arrives already split at
@@ -830,6 +1085,7 @@ pub struct Agent<P: Provider> {
             model: self.config.model,
             messages: msgs,
             tools: self.toolbox.specs(),
+            output: self.output,
             max_tokens: self.config.max_tokens,
             temperature: self.config.temperature,
             stop: self.config.stop,
@@ -1147,7 +1403,14 @@ pub struct Agent<P: Provider> {
                 return Err(AiError.Refused(reason: refusal_text(reply)))
             }
             so_far = so_far.with(Message { role: Role.Assistant, parts: reply.parts })
-            calls = tool_calls_of(reply.parts)
+            // **The output tool is an answer, not a call.** Anthropic has no `response_format`, so a
+            // structured request goes out as a forced tool and the document comes back as a
+            // `tool_use` block with `stop_reason: tool_use` — indistinguishable, at this point, from
+            // the model asking for a real tool. Dispatching it would look up a tool no `ToolSource`
+            // declares, feed the model "unknown tool", and spin the loop for a reply that already
+            // arrived. Withholding it here finishes the run with the document in `Run.messages`,
+            // where `structured_json` reads it.
+            calls = dispatchable_calls(tool_calls_of(reply.parts), self.output)
             if reply.stop != StopReason.ToolUse || calls.len() == 0 || self.toolbox.is_empty() {
                 return Ok(Run {
                     messages: so_far.messages,

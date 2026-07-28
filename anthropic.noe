@@ -30,7 +30,7 @@ use std.{env, json}
 use para.ai.{AiError, Message, Part, Role}
 use para.ai.provider
 use para.ai.provider.{Delta, ModelReply, ModelRequest, Provider, StopReason, StreamDecoder, Usage, Wire}
-use para.ai.tools.{ToolSpec}
+use para.ai.tools.{Output, ToolSpec}
 
 // The Anthropic Messages API, as a codec.
 //
@@ -294,6 +294,36 @@ fn encode_tools(specs: List<ToolSpec>): Result<List<dyn>, AiError> {
         out = out ~ [entry]
     }
     return Ok(out)
+}
+
+// Structured output, Anthropic's way: **the schema is a tool, and the tool is forced.**
+//
+// The Messages API has no `response_format`. What it has is `tool_choice`, and a `tool` choice
+// naming one tool makes the model answer with exactly that `tool_use` block — whose `input` is a
+// document the vendor shaped against `input_schema`. So the schema goes out as a tool and the
+// answer comes back as a tool *call*, which is why `structured_json` in the run loop reads a
+// `ToolCall` part before it reads text: on this vendor there is no text to read.
+//
+// The output tool is appended to whatever tools the request already carries rather than replacing
+// them, so the encoding is the same whether or not the agent has a toolbox — and `tool_choice`
+// forces this one, which makes a structured call the last turn of a run by construction.
+fn encode_output(out: Output): Result<(Map<string, dyn>, Map<string, dyn>), AiError> {
+    mut schema: dyn = 0
+    match provider.parse_value(out.schema, "output schema `${out.name}`") {
+        Ok(s) => {
+            schema = s
+        },
+        Err(e) => {
+            return Err(AiError.Encode(provider: "anthropic", message: "${e}"))
+        },
+    }
+    tool: Map<string, dyn> = {
+        "name": out.name,
+        "description": if out.description == "" then "Answer with a value of this shape." else out.description,
+        "input_schema": schema,
+    }
+    choice: Map<string, dyn> = {"type": "tool", "name": out.name}
+    return Ok((tool, choice))
 }
 
 // --- Decoding ----------------------------------------------------------------------------------
@@ -598,8 +628,17 @@ impl Provider for Anthropic {
         }
         // No tools, no key. An empty `tools` array is not the same request as an absent one, and a
         // vendor is entitled to treat it differently.
-        if req.tools.len() > 0 {
-            body = body.set("tools", encode_tools(req.tools)?)
+        mut tools = if req.tools.len() > 0 then encode_tools(req.tools)? else []
+        match req.output {
+            some(out) => {
+                (tool, choice) = encode_output(out)?
+                tools = tools ~ [tool]
+                body = body.set("tool_choice", choice)
+            },
+            none => {},
+        }
+        if tools.len() > 0 {
+            body = body.set("tools", tools)
         }
         match req.temperature {
             some(t) => {
@@ -1195,6 +1234,39 @@ fn captured_tool_use_reply(): string {
         wire = encode_or_fail(Anthropic.new("k"), req)
         assert(wire.body.contains("\"tools\":[{\"description\":\"Current weather for a city\",\"input_schema\":{\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"name\":\"weather\"}]"),
             wire.body)
+    }
+
+    // Structured output has no `response_format` here, so it goes out as a tool and `tool_choice`
+    // forces it. The exact bytes, because "the schema became a tool" is the whole claim.
+    fn a_requested_output_shape_becomes_a_forced_tool(): void {
+        req = ModelRequest {
+            model: "m",
+            messages: [Message.user("read this")],
+            output: some(Output {
+                name: "Extraction",
+                target: "app.Extraction",
+                schema: "{\"properties\":{\"company\":{\"type\":\"string\"}},\"required\":[\"company\"],\"type\":\"object\"}",
+            }),
+        }
+        wire = encode_or_fail(Anthropic.new("k"), req)
+        assert(wire.body.contains("\"tool_choice\":{\"name\":\"Extraction\",\"type\":\"tool\"}"), wire.body)
+        assert(wire.body.contains("\"input_schema\":{\"properties\":{\"company\":{\"type\":\"string\"}},\"required\":[\"company\"],\"type\":\"object\"},\"name\":\"Extraction\""),
+            "the schema is real JSON and not a quoted string: ${wire.body}")
+    }
+
+    // The output tool is *appended* to whatever tools the request already carries rather than
+    // replacing them, so the encoding is one shape whether or not the agent has a toolbox.
+    fn a_requested_output_shape_joins_the_tools_already_offered(): void {
+        req = ModelRequest {
+            model: "m",
+            messages: [Message.user("read this")],
+            tools: [ToolSpec { name: "weather", description: "w", parameters: "{\"type\":\"object\"}" }],
+            output: some(Output { name: "Extraction", target: "app.Extraction", schema: "{\"type\":\"object\"}" }),
+        }
+        wire = encode_or_fail(Anthropic.new("k"), req)
+        assert(wire.body.contains("\"name\":\"weather\""), wire.body)
+        assert(wire.body.contains("\"name\":\"Extraction\""), wire.body)
+        assert(wire.body.contains("\"tool_choice\""), wire.body)
     }
 
     // No tools, no key: an empty `tools` array is not the same request as an absent one, and a

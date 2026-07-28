@@ -30,7 +30,7 @@ use std.{env, json}
 use para.ai.{AiError, Message, Part, Role}
 use para.ai.provider
 use para.ai.provider.{Delta, ModelReply, ModelRequest, Provider, StopReason, StreamDecoder, Usage, Wire}
-use para.ai.tools.{ToolSpec}
+use para.ai.tools.{Output, ToolSpec}
 
 // The Gemini Generative Language API, as a codec.
 //
@@ -265,6 +265,97 @@ fn encode_tools(specs: List<ToolSpec>): Result<List<dyn>, AiError> {
     }
     kind: Map<string, dyn> = {"functionDeclarations": decls}
     return Ok([kind])
+}
+
+// Structured output, Gemini's way: `responseSchema` alongside `responseMimeType`.
+//
+// **Both, always, and never one without the other.** `responseSchema` is honored only when the mime
+// type says JSON; setting the schema alone gets prose shaped by nothing, which is the silent
+// degradation this package refuses everywhere else.
+//
+// `responseSchema` is **not** JSON Schema — it is a subset of OpenAPI 3.0's Schema object, and a key
+// it does not know is a 400 rather than an ignored hint. So the derived schema is translated rather
+// than passed through, and the translation is the honest kind: what maps, maps; what does not is
+// refused by name at `encode`, with the path to the offending field.
+fn to_gemini_schema(path: string, v: dyn): Result<dyn, AiError> {
+    obj = v.as<Map<string, dyn>>() ?? {}
+    if obj.keys().len() == 0 {
+        // `{}` is JSON Schema's "any value", which the derivation emits for a `dyn` field. Gemini's
+        // Schema has no such shape — one with no `type` is rejected — and inventing a type would
+        // constrain a field the declaration deliberately left open.
+        return Err(refuse("`${path}` is `dyn`, and Gemini's `responseSchema` has no \"any value\" shape — every schema there needs a `type`; declare the field"))
+    }
+    mut out: Map<string, dyn> = {}
+    for k in obj.keys() {
+        if k == "type" {
+            // Gemini spells the type as an upper-case `Type` enum member, not as JSON Schema's
+            // lower-case keyword.
+            out = out.set("type", "${obj[k]}".upper())
+        } else if k == "properties" {
+            out = out.set("properties", gemini_properties(path, obj[k])?)
+        } else if k == "items" {
+            out = out.set("items", to_gemini_schema("${path}[]", obj[k])?)
+        } else if k == "anyOf" {
+            out = out.set("anyOf", gemini_branches(path, obj[k])?)
+        } else if k == "additionalProperties" {
+            // Two different things wear this key. `false` is the closed-object marker, which Gemini
+            // implies for a declared `properties` set and has no spelling for — dropping it changes
+            // nothing. A *schema* here is an open map of typed values (`Map<string, T>`), which
+            // Gemini genuinely cannot express, and dropping that would send an unconstrained object
+            // where the caller asked for a typed one.
+            if !is_false(obj[k]) {
+                return Err(refuse("`${path}` is a `Map`, and Gemini's `responseSchema` has no open-ended object with typed values (there is no `additionalProperties`); declare the keys as fields, or take the map as a JSON `string` field"))
+            }
+        } else if k == "uniqueItems" {
+            // A `Set` becomes an array. Gemini has no uniqueness constraint, and the declared type
+            // deduplicates on the way back in anyway, so the guarantee survives where it matters.
+        } else {
+            // `enum`, `description`, `required`, `format`, `nullable`, `minItems`, `maxItems` — the
+            // keys whose spelling the two dialects already share.
+            out = out.set(k, obj[k])
+        }
+    }
+    return Ok(out)
+}
+
+fn is_false(v: dyn): bool {
+    return match v.as<bool>() {
+        some(b) => !b,
+        none => false,
+    }
+}
+
+fn gemini_properties(path: string, v: dyn): Result<Map<string, dyn>, AiError> {
+    props = v.as<Map<string, dyn>>() ?? {}
+    mut out: Map<string, dyn> = {}
+    for k in props.keys() {
+        out = out.set(k, to_gemini_schema(if path == "" then k else "${path}.${k}", props[k])?)
+    }
+    return Ok(out)
+}
+
+fn gemini_branches(path: string, v: dyn): Result<List<dyn>, AiError> {
+    empty: List<dyn> = []
+    mut out: List<dyn> = []
+    for b in (v.as<List<dyn>>() ?? empty) {
+        out = out ~ [to_gemini_schema(path, b)?]
+    }
+    return Ok(out)
+}
+
+fn encode_output(out: Output): Result<Map<string, dyn>, AiError> {
+    mut schema: dyn = 0
+    match provider.parse_value(out.schema, "output schema `${out.name}`") {
+        Ok(s) => {
+            schema = s
+        },
+        Err(e) => {
+            return Err(refuse("${e}"))
+        },
+    }
+    translated = to_gemini_schema(out.name, schema)?
+    cfg: Map<string, dyn> = {"responseMimeType": "application/json", "responseSchema": translated}
+    return Ok(cfg)
 }
 
 // --- Decoding -------------------------------------------------------------------------------------
@@ -556,6 +647,15 @@ impl Provider for Google {
             stop: List<dyn> = req.stop.map(fn(s) => s)
             config = config.set("stopSequences", stop)
         }
+        match req.output {
+            some(out) => {
+                shaped = encode_output(out)?
+                for k in shaped.keys() {
+                    config = config.set(k, shaped[k])
+                }
+            },
+            none => {},
+        }
         if config.keys().len() > 0 {
             body = body.set("generationConfig", config)
         }
@@ -657,6 +757,19 @@ fn encode_or_fail(codec: Google, req: ModelRequest): Wire {
         },
     }
     return Wire { url: "" }
+}
+
+// The refusal an unencodable request produces, or a loud failure if it encoded anyway.
+fn encode_error(codec: Google, req: ModelRequest): string {
+    match codec.encode(req) {
+        Ok(w) => {
+            assert(false, "this request must not encode, got ${w.body}")
+        },
+        Err(e) => {
+            return "${e}"
+        },
+    }
+    return ""
 }
 
 fn decode_or_fail(codec: Google, body: string): ModelReply {
@@ -775,6 +888,54 @@ fn captured_function_call_reply(): string {
             wire.url)
         assert(wire.body == "{\"contents\":[{\"parts\":[{\"text\":\"Say hello.\"}],\"role\":\"user\"}],\"generationConfig\":{\"maxOutputTokens\":64,\"stopSequences\":[\"\\n\\n\"],\"temperature\":0.0},\"systemInstruction\":{\"parts\":[{\"text\":\"Answer in Swedish.\"}]}}",
             "exact request body, got: ${wire.body}")
+    }
+
+    // Gemini's `responseSchema` is a subset of OpenAPI 3.0, not JSON Schema: the type is an
+    // upper-case enum member and `additionalProperties` does not exist. So the derived schema is
+    // *translated*, and the mime type goes with it — a schema without one is not honored.
+    fn a_requested_output_shape_is_translated_into_the_openapi_subset(): void {
+        req = ModelRequest {
+            model: "gemini-2.5-flash",
+            messages: [Message.user("read this")],
+            output: some(Output {
+                name: "Extraction",
+                target: "app.Extraction",
+                schema: "{\"additionalProperties\":false,\"properties\":{\"company\":{\"type\":\"string\"},\"tags\":{\"items\":{\"type\":\"integer\"},\"type\":\"array\",\"uniqueItems\":true}},\"required\":[\"company\"],\"type\":\"object\"}",
+            }),
+        }
+        wire = encode_or_fail(Google.new("k"), req)
+        assert(wire.body.contains("\"responseMimeType\":\"application/json\""), wire.body)
+        // Upper-cased types, no `additionalProperties`, no `uniqueItems`, everything else verbatim.
+        assert(wire.body.contains("\"responseSchema\":{\"properties\":{\"company\":{\"type\":\"STRING\"},\"tags\":{\"items\":{\"type\":\"INTEGER\"},\"type\":\"ARRAY\"}},\"required\":[\"company\"],\"type\":\"OBJECT\"}"),
+            wire.body)
+    }
+
+    // Two shapes this dialect genuinely cannot express are refused at `encode`, naming the field —
+    // rather than being dropped into a request that silently constrains less than it was asked to.
+    fn a_shape_gemini_cannot_express_is_refused_at_encode(): void {
+        open_map = ModelRequest {
+            model: "m",
+            messages: [Message.user("x")],
+            output: some(Output {
+                name: "M",
+                target: "app.M",
+                schema: "{\"properties\":{\"counts\":{\"additionalProperties\":{\"type\":\"integer\"},\"type\":\"object\"}},\"type\":\"object\"}",
+            }),
+        }
+        assert(encode_error(Google.new("k"), open_map).contains("M.counts"), encode_error(Google.new("k"), open_map))
+        assert(encode_error(Google.new("k"), open_map).contains("no open-ended object"))
+
+        anything = ModelRequest {
+            model: "m",
+            messages: [Message.user("x")],
+            output: some(Output {
+                name: "M",
+                target: "app.M",
+                schema: "{\"properties\":{\"blob\":{}},\"type\":\"object\"}",
+            }),
+        }
+        assert(encode_error(Google.new("k"), anything).contains("M.blob"), encode_error(Google.new("k"), anything))
+        assert(encode_error(Google.new("k"), anything).contains("\"any value\" shape"))
     }
 
     fn encode_sends_the_key_as_a_header(): void {

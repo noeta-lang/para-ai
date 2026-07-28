@@ -32,7 +32,7 @@ use std.{env, json}
 use para.ai.{AiError, Message, Part, Role}
 use para.ai.provider
 use para.ai.provider.{Delta, ModelReply, ModelRequest, Provider, StopReason, StreamDecoder, Usage, Wire}
-use para.ai.tools.{ToolSpec}
+use para.ai.tools.{Output, ToolSpec}
 
 // Ollama's native chat API, as a codec.
 //
@@ -498,6 +498,25 @@ impl Provider for Ollama {
         if req.tools.len() > 0 {
             body = body.set("tools", encode_tools(req.tools)?)
         }
+        // Structured output, Ollama's way: a bare `format` holding the JSON Schema itself — no
+        // wrapper object, no name, no `strict` flag. The server constrains *sampling* to the grammar
+        // the schema induces, which is why it needs none of those: there is nothing to be strict
+        // about when a token that would violate the schema is never drawn. (`format: "json"` is the
+        // older schema-less spelling; this codec always sends the schema, because a caller who named
+        // a type asked for that type and not merely for JSON.)
+        match req.output {
+            some(out) => {
+                match provider.parse_value(out.schema, "output schema `${out.name}`") {
+                    Ok(schema) => {
+                        body = body.set("format", schema)
+                    },
+                    Err(e) => {
+                        return Err(AiError.Encode(provider: "ollama", message: "${e}"))
+                    },
+                }
+            },
+            none => {},
+        }
         opts = encode_options(self, req)?
         if opts.keys().len() > 0 {
             body = body.set("options", opts)
@@ -703,6 +722,33 @@ fn captured_tool_call_reply(): string {
         assert(streamed.streamed())
         // The one place in this package where the cut is not server-sent events.
         assert(streamed.ndjson(), "Ollama's native stream is newline-delimited JSON")
+    }
+
+    // Structured output here is a bare `format` holding the schema itself — no wrapper, no name, no
+    // `strict` flag. The server constrains sampling to the grammar the schema induces, so there is
+    // nothing to be strict about: a token that would violate the schema is never drawn.
+    fn a_requested_output_shape_becomes_a_bare_format(): void {
+        req = ModelRequest {
+            model: "m",
+            messages: [Message.user("read this")],
+            output: some(Output {
+                name: "Extraction",
+                target: "app.Extraction",
+                schema: "{\"properties\":{\"company\":{\"type\":\"string\"}},\"required\":[\"company\"],\"type\":\"object\"}",
+            }),
+        }
+        wire = encode_or_fail(Ollama.local(), req)
+        assert(wire.body.contains("\"format\":{\"properties\":{\"company\":{\"type\":\"string\"}},\"required\":[\"company\"],\"type\":\"object\"}"),
+            wire.body)
+        // The schema itself, not the older schema-less `format: "json"`: a caller who named a type
+        // asked for that type and not merely for JSON.
+        assert(!wire.body.contains("\"format\":\"json\""), wire.body)
+    }
+
+    // No shape asked for, no key.
+    fn encode_omits_format_when_no_shape_was_asked_for(): void {
+        wire = encode_or_fail(Ollama.local(), ModelRequest { model: "m", messages: [Message.user("hi")] })
+        assert(!wire.body.contains("\"format\""), wire.body)
     }
 
     // No credential of any kind, which is what makes this the one provider CI can exercise for real.
