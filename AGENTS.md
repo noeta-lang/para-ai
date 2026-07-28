@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Guidance for coding agents working in this repo — the standalone repo of the **para/ai** Noeta package (an agent harness: the provider codec seam, the run loop, and GenAI telemetry; pure Noeta). Toolchain issues (the language, the `noeta` binary, `std.*`) belong in the monorepo at github.com/noeta-lang/noeta, not here; `para/api` issues belong in its own repo.
+Guidance for coding agents working in this repo — the standalone repo of the **para/ai** Noeta package (an agent harness: the provider codec seam, the run loop, tool calling, and GenAI telemetry; pure Noeta). Toolchain issues (the language, the `noeta` binary, `std.*`) belong in the monorepo at github.com/noeta-lang/noeta, not here; `para/api` issues belong in its own repo.
 
 **`DESIGN.md` is the spec.** It is the whole plan, phase by phase, with the reasoning behind each decision and the questions that were settled. Read the section you are about to touch before touching it, and if a language limitation forces a change, say so rather than diverging quietly.
 
@@ -9,9 +9,10 @@ Guidance for coding agents working in this repo — the standalone repo of the *
 - `noeta.toml` — the package manifest (`name = "para/ai"`). **No `native` key: this package is pure Noeta.** The `[trust] native = ["para/api"]` line authorizes the *dependency's* native half, not ours.
 - `ai.noe` — `para.ai`: the data model (`Message`/`Part`/`Role`/`Conversation`/`Run`), `AgentConfig`, `Agent<P: Provider>`, the run loop, `AiError`, and the GenAI telemetry emitted from the loop.
 - `provider.noe` — `para.ai.provider`: the `Provider` trait, `ModelRequest`/`ModelReply`/`Wire`/`Framing`/`Usage`/`StopReason`, the `Delta` accumulator (`fold`), and the shared codec utilities (recoverable JSON, base64).
+- `tools.noe` — `para.ai.tools`: the `Tool`/`Arg` attributes, `ToolSpec`, the `ToolSource` trait, `Local` (reflection over `#[Tool]`), `Toolbox`, `Type` → JSON Schema, argument coercion, and bounded concurrent `dispatch`.
 - `anthropic.noe` — `para.ai.providers.anthropic`: the Anthropic Messages API codec.
 - `mock.noe` — `para.ai.mock`: the scripted `Mock`, which is both a `Provider` and a `para.api.Middleware`.
-- `examples/*/` — each a standalone package depending on this repo via `para = { path = "../.." }`, with its own committed `noeta.lock`.
+- `examples/*/` — each a standalone package depending on this repo via `para = { path = "../.." }`, with its own committed `noeta.lock`. `ask` is the phase-1 surface; `tools` is the phase-2 tool loop.
 - `.github/workflows/` — CI (`ci.yml`) and the tag-triggered registry publish (`release.yml`).
 
 ### Why the files are flat
@@ -48,13 +49,26 @@ Collected here because each one cost a debugging round the first time:
 - **A block-bodied `match` arm produces no value.** In value position every arm must be a single expression (E0055). Extract a helper rather than opening a block.
 - **A `match` whose arms all `return` still "falls off the end"** (E0048). Write `return match { … }` with expression arms, or add a trailing `return`.
 - **A method that never mentions `self` is an associated function** (E0047) and cannot be called on a value. Make it a module-level `fn` instead.
-- **`.await` is not allowed in a synchronous `fn`.** A test that awaits `agent.run(...)` must be an `async fn` — `@test` supports them.
+- **`.await` is not allowed in a synchronous `fn`.** A test that awaits `agent.run(...)` must be an `async fn` — and note the bug below: an `async fn` test is never driven, so its assertions are currently vacuous.
 - **`json.parse` aborts on malformed input** and `json.try_parse::<T>` cannot build a `Map<string, dyn>`, so recoverable dynamic decoding goes through `provider.parse_object` / `provider.parse_value`. Never call `json.parse` on a body that came off the wire.
 - **A whole-module import binds its last segment as a local name**, which collides with a field of the same name (E0020) — hence `use para.ai.provider.{Wire, …}` in `ai.noe`, where `Agent` has a `provider` field.
+- **Reflection keys are qualified.** Under `namespace para.ai.tools`, `attributes_of` reports a free function's target as `para.ai.tools.shout`, and that is exactly the string `params_of`/`invoke` take — a bare `shout` finds nothing. So "does this target contain a dot?" says nothing about whether it is a method; what does is whether the key minus its last segment names a declared type (`field_specs_of(owner).len() > 0`), which is `is_method_target` in `tools.noe`.
+- **`invoke` takes a positional `List<dyn>` and nothing else.** Unlike `construct`, it has no named-map form, so a *gap* — a defaulted parameter omitted while a later one is supplied — is not expressible. `bind` in `tools.noe` refuses it by name rather than guessing at the default, which reflection does not expose either.
+- **`invoke` validates a callable's name and arity, and not its argument types.** `invoke("f", ["seven"])` against `fn f(n: int)` returns `Ok` and aborts *inside* the body. That is why `tools.noe` coerces every argument to its declared type first: the coercion layer is the type check, and nothing may reach `invoke` around it.
+
+## Toolchain bugs this package works around
+
+Each was reproduced minimally against `lang` at `7575aece`. They are worked around here rather than papered over; when one lands upstream, delete the workaround and the note together. Two have fixes on branches in the `lang` repo, unmerged at the time of writing.
+
+- **An `async fn` in a `@test` block is never driven.** The runner calls it, gets a `Future`, and drops it — so `assert(false)` in one *passes*. Every assertion in an async test is vacuous. Phase 2's tool-loop tests are therefore written synchronously, over `run_sync` plus `Mock.calls()`, which sees the exact bytes of the second model call and so the whole conversation including the tool turn. `ai.noe` and `mock.noe` still carry two phase-1 `async` tests; under a stock toolchain they are vacuous. *Fixed on `lang` branch `test-runner-drives-async-tests`* — the runner now `.await`s the synthesized call when the root is `async`; with that toolchain the whole suite here is still green and the two async tests genuinely run.
+- **`attributes_of::<T>()` sees only what the entry module *links*.** Reflection is documented as whole-program and closed-world, but the program it reflects is the merged one, and the loader merges an entry's imports rather than every sibling. Measured: with `demo.lib` holding three `#[Marked]` functions, `attributes_of::<Marked>()` — queried from inside `demo.lib` itself — reports only the entry's own and the one the entry imported by name; a `pub` but unimported function and a module-private one are both absent. So `tools.noe` and `mock.noe` each declare their own `#[Tool]` fixtures, named distinctly (`shout` vs `mock_shout`) so that when this is fixed they join rather than collide, and the README tells a consumer to keep tools in the entry module or `use` them by name.
+- **`break`/`continue` clobber a `mut` local assigned in the same block, inside a named `fn`.** `mut a = []; for x in xs { if p(x) { a = a ~ [x]; continue } }` leaves `a` unit on the next iteration, in both `for` and `while`, for scalars and heap values alike. Correct at top level. The drop pass reclaims the accumulator on the exit edge (`Move r0 <- r5; Drop r5; Drop r0; Jump`). `encode_messages` in `anthropic.noe` is written with `if`/`else if`/`else` for this reason; **do not add a `break`/`continue` after an assignment** while the workaround stands. *Fixed on `lang` branch `drops-early-exit-keeps-live-values`* — the early-exit path now applies the same `live_out` exclusion the fall-through path always had.
+- **The prelude `Type` and `Semantic` enums have no expression form at runtime.** `Type.Unit` and `Semantic.TrustBoundary` type-check clean and then abort with E0005 at run time (`Ordering.Less`, seeded by both backends, works). So a role query is `match r.role { Semantic.TrustBoundary => … }`, never `==`, and the schema-refusal tests read their `Type` values off `params_of` of real declarations rather than building them.
+- **`noeta mcp`'s `reflect` does not report a role conferred by a *dependency's* `@role` attribute.** The in-language `roles_of::<Semantic>()` does see it (the example asserts this), and `reflect` reports the `#[Tool]` attribute itself — but the `role` list comes back empty, because the prepared program the MCP server reflects over does not include the package where `Tool` is declared. A same-file `@role` attribute reports correctly.
 
 ## Telemetry
 
-The GenAI attribute and metric names live in one place — the run loop in `ai.noe` — and the README states the pinned semantic-conventions version. If you add a span or a metric, add it to the README's tables in the same commit, and keep every metric attribute low-cardinality: `error.type` is an error's *class*, never its message.
+The GenAI attribute and metric names live in two places — the run loop in `ai.noe` (`invoke_agent`, `chat`, the two histograms) and `dispatch` in `tools.noe` (`execute_tool`, `para.ai.tool.calls`) — and the README states the pinned semantic-conventions version. **A `#[Tool]` function contains no telemetry code**: dispatch is the instrumentation point precisely so it cannot be forgotten at the tool. If you add a span or a metric, add it to the README's tables in the same commit, and keep every metric attribute low-cardinality: `error.type` is an error's *class*, never its message.
 
 ## CI
 

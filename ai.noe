@@ -25,6 +25,8 @@ use std.{env, metrics, time, tracing}
 use para.api.Api
 use para.api.middleware.Retry
 use para.ai.provider.{ModelRequest, ModelReply, Provider, StopReason, Usage, Wire}
+use para.ai.tools
+use para.ai.tools.{Toolbox, ToolSource}
 
 // --- The data model -------------------------------------------------------------------------------
 //
@@ -210,8 +212,18 @@ pub enum AiError {
     // The model declined. Never a decode failure: conflating the two makes "the model declined"
     // look like "your schema is wrong", which sends people debugging the wrong thing.
     Refused(reason: string)
-    // A tool failed in a way the model cannot be asked to recover from. Constructed from phase 2.
+    // A tool failed in a way the model cannot be asked to recover from: an underivable schema, a
+    // name collision across sources, a source that could not be listed. A tool that merely *fails*
+    // is not this — it is a `ToolResult(is_error: true)` turn, and the model gets to try again.
     Tool(name: string, message: string)
+    // The run asked for more model calls than `AgentConfig.max_turns` allows.
+    //
+    // An error rather than a truncated `Ok`: a run that stops mid-tool-loop has an assistant turn
+    // whose last word was a tool call nobody answered, and handing that back as an answer is the
+    // silent-truncation failure DESIGN §10 refuses for context strategies, for the same reason. The
+    // `MaxTurns` *guard* of phase 5 is a different thing at a different layer — a policy a caller
+    // opts into, reported as `Guard(...)`; this is the loop's own hard rail, which is always on.
+    MaxTurns(turns: int)
     // The conversation does not fit the budget and no context strategy was configured to fit it.
     // Constructed from phase 5.
     ContextOverflow(needed: int, budget: int)
@@ -226,7 +238,8 @@ pub enum AiError {
                 AiError.Encode(provider, message) => "${provider} cannot encode this request: ${message}",
                 AiError.Decode(path, message) => if path == "" then "decode failed: ${message}" else "decode failed at ${path}: ${message}",
                 AiError.Refused(reason) => "the model refused: ${reason}",
-                AiError.Tool(name, message) => "tool `${name}` failed: ${message}",
+                AiError.Tool(name, message) => if name == "" then "tool call failed: ${message}" else "tool `${name}` failed: ${message}",
+                AiError.MaxTurns(turns) => "the run reached its ${turns}-turn limit with the model still asking for tools — raise `AgentConfig.max_turns` if the task genuinely needs more",
                 AiError.ContextOverflow(needed, budget) => "context overflow: ${needed} tokens needed, budget is ${budget} — configure a context strategy",
                 AiError.Cancelled => "cancelled",
             }
@@ -255,6 +268,15 @@ pub struct AgentConfig {
     pub max_tokens: ?int = none
     pub temperature: ?float = none
     pub stop: List<string> = []
+    // How many model calls one run may make. The tool loop is the only thing that continues it, so
+    // this is what stops a model that keeps asking for tools from spending an afternoon and a
+    // budget. Eight is enough for the multi-step tasks tools exist for and small enough that a loop
+    // costs pennies to discover; exceeding it is `AiError.MaxTurns`, never a truncated answer.
+    pub max_turns: int = 8
+    // How many tool calls may be in flight at once. **Unbounded parallel dispatch is a good way to
+    // get rate-limited by your own agent** — a model that asks for twelve web fetches should not
+    // open twelve sockets — so `std.task.map_bounded` caps it here rather than in each tool.
+    pub tool_concurrency: int = 4
     // Names the run's root span (`invoke_agent {name}`) and its `gen_ai.agent.name` attribute. Keep
     // it low-cardinality — it is a span attribute, not an identifier.
     pub name: string = "agent"
@@ -281,6 +303,14 @@ pub struct AgentConfig {
 
     fn with_stop(stop: List<string>): AgentConfig {
         return AgentConfig { ...self, stop: stop }
+    }
+
+    fn with_max_turns(n: int): AgentConfig {
+        return AgentConfig { ...self, max_turns: n }
+    }
+
+    fn with_tool_concurrency(n: int): AgentConfig {
+        return AgentConfig { ...self, tool_concurrency: n }
     }
 
     fn named(name: string): AgentConfig {
@@ -329,10 +359,14 @@ fn operation_duration_histogram(): dyn {
 // caller's `match`, pushed to the outermost point where the arms still agree — which works because
 // `run`/`run_sync` return provider-independent types. The README leads with that pattern so nobody
 // discovers the constraint by hitting a type error.
+// A populated `toolbox` holds `List<dyn ToolSource>`, so an agent with tools is `!Send` — the same
+// trade `api`'s middleware stack already makes. Ship the `AgentConfig`, build the `Agent` per
+// worker.
 pub struct Agent<P: Provider> {
     pub config: AgentConfig
     pub provider: P
     pub api: Api
+    pub toolbox: Toolbox = Toolbox.new()
 
     // An agent over the default transport: a plain client wrapped in `Retry`, which honors a
     // vendor's `Retry-After` and backs off on 429/502/503/504. `retry(0)` on the client is
@@ -348,6 +382,23 @@ pub struct Agent<P: Provider> {
         return Agent { config: cfg, provider: p, api: api }
     }
 
+    // Give the agent a source of tools.
+    //
+    // **A `Result`, where DESIGN §6's sketch is not.** Adding a source derives every schema and
+    // checks every name against what is already there, and both can fail — a name collision across
+    // sources is a construction-time error naming both, never a last-one-wins. Chains:
+    // `Agent.from(cfg, p).tools(Local.new())?.tools(mcp)?`.
+    fn tools(src: dyn ToolSource): Result<Agent<P>, AiError> {
+        grown = self.toolbox.with(src)?
+        return Ok(Agent { ...self, toolbox: grown })
+    }
+
+    // Attach a `Toolbox` you assembled yourself — the infallible door, for a caller that would
+    // rather handle the collision error once at construction than at each `tools` call.
+    fn with_toolbox(box: Toolbox): Agent<P> {
+        return Agent { ...self, toolbox: box }
+    }
+
     // The neutral request for a conversation, with the config's system prompt prepended when the
     // conversation does not open with one of its own.
     fn request(conv: Conversation): ModelRequest {
@@ -361,6 +412,7 @@ pub struct Agent<P: Provider> {
         return ModelRequest {
             model: self.config.model,
             messages: msgs,
+            tools: self.toolbox.specs(),
             max_tokens: self.config.max_tokens,
             temperature: self.config.temperature,
             stop: self.config.stop,
@@ -460,12 +512,8 @@ pub struct Agent<P: Provider> {
 
     // The run loop.
     //
-    // Phase 1 performs exactly one model call, because the only thing that continues the loop is a
-    // tool-use stop and phase 1 sends no tools. When the model *does* answer `ToolUse` — a scripted
-    // `Mock`, or a vendor that volunteers one — the run finishes and hands the requested calls back
-    // in `Run.messages` rather than looping forever against a dispatcher that does not exist yet.
-    // Phase 2 replaces that arm with dispatch-and-continue, and this is where the guard stages and
-    // the context strategy attach.
+    // This is where the guard stages (phase 5) and the context strategy (phase 5) attach, and where
+    // phase 3 replaces `call` with a fold over `stream`.
     fn drive(conv: Conversation): Result<Run, AiError> {
         root = tracing.span("invoke_agent ${self.config.name}")
         root.set_attribute("gen_ai.operation.name", "invoke_agent")
@@ -473,7 +521,7 @@ pub struct Agent<P: Provider> {
         root.set_attribute("gen_ai.provider.name", self.provider.name())
         root.set_attribute("gen_ai.request.model", self.config.model)
 
-        outcome: Result<Run, AiError> = self.one_turn(conv)
+        outcome: Result<Run, AiError> = self.turns(conv)
         match outcome {
             Ok(run) => {
                 root.set_attribute("gen_ai.usage.input_tokens", run.usage.input_tokens)
@@ -489,19 +537,68 @@ pub struct Agent<P: Provider> {
         return outcome
     }
 
-    fn one_turn(conv: Conversation): Result<Run, AiError> {
-        reply = self.call(self.request(conv))?
-        if reply.stop == StopReason.Refusal {
-            return Err(AiError.Refused(reason: refusal_text(reply)))
+    // Call, and keep calling while the model asks for tools.
+    //
+    // The shape, in full:
+    //
+    //   1. encode the conversation and send it (`call`, which owns the `chat {model}` span)
+    //   2. a refusal is `AiError.Refused`, immediately — never a decode failure, never a retry
+    //   3. append the assistant turn
+    //   4. if the model did not ask for a tool, finish
+    //   5. dispatch the requested calls concurrently and bounded, append **one** tool turn
+    //      carrying every result, and go round again
+    //
+    // Two details in step 5 are decisions rather than convenience:
+    //
+    //   * **One turn, all the results.** A separate message per result would produce consecutive
+    //     same-role turns, which several vendors reject outright — and it would make it possible
+    //     for a context strategy to split a `ToolCall` from its `ToolResult`, the single most
+    //     common bug in hand-rolled trimming (DESIGN §10). Keeping them in one message makes that
+    //     unrepresentable.
+    //   * **A tool-use stop with nothing to dispatch finishes the run**, rather than looping. An
+    //     agent with no toolbox, or a model naming a tool in a reply that carries no call block,
+    //     hands the requested calls back in `Run.messages` — which is exactly what phase 1 did, and
+    //     the only behavior that cannot spin.
+    fn turns(conv: Conversation): Result<Run, AiError> {
+        mut so_far = conv
+        mut usage = Usage {}
+        mut turn = 0
+        while turn < self.config.max_turns {
+            reply = self.call(self.request(so_far))?
+            turn = turn + 1
+            usage = usage + reply.usage
+            if reply.stop == StopReason.Refusal {
+                return Err(AiError.Refused(reason: refusal_text(reply)))
+            }
+            so_far = so_far.with(Message { role: Role.Assistant, parts: reply.parts })
+            calls = tool_calls_of(reply.parts)
+            if reply.stop != StopReason.ToolUse || calls.len() == 0 || self.toolbox.is_empty() {
+                return Ok(Run {
+                    messages: so_far.messages,
+                    usage: usage,
+                    turns: turn,
+                    stop: reply.stop,
+                })
+            }
+            results = tools.dispatch(self.toolbox, calls, self.config.tool_concurrency)
+            so_far = so_far.with(Message { role: Role.Tool, parts: results })
         }
-        answered = conv.with(Message { role: Role.Assistant, parts: reply.parts })
-        return Ok(Run {
-            messages: answered.messages,
-            usage: reply.usage,
-            turns: 1,
-            stop: reply.stop,
-        })
+        return Err(AiError.MaxTurns(turns: self.config.max_turns))
     }
+}
+
+// The `ToolCall` parts of an assistant turn, in order.
+fn tool_calls_of(parts: List<Part>): List<Part> {
+    mut out: List<Part> = []
+    for p in parts {
+        match p {
+            Part.ToolCall(id, name, args) => {
+                out = out ~ [p]
+            },
+            _ => {},
+        }
+    }
+    return out
 }
 
 // Record one call's token usage on `gen_ai.client.token.usage`, split by token type — the shape
@@ -524,6 +621,7 @@ fn error_type(e: AiError): string {
         AiError.Decode(path, m) => "decode",
         AiError.Refused(reason) => "refusal",
         AiError.Tool(name, m) => "tool",
+        AiError.MaxTurns(turns) => "max_turns",
         AiError.ContextOverflow(needed, budget) => "context_overflow",
         AiError.Cancelled => "cancelled",
     }
@@ -594,6 +692,35 @@ fn refusal_text(reply: ModelReply): string {
         assert(tuned.temperature == some(0.0))
         assert(tuned.name == "brief")
         assert(tuned.model == "m")
+    }
+
+    // The two loop bounds have defaults a caller never has to think about, and both are reachable
+    // when they do. Unbounded is not an option for either: a runaway tool loop spends money, and
+    // unbounded parallel dispatch is a good way to get rate-limited by your own agent.
+    fn the_loop_bounds_have_defaults_and_builders(): void {
+        base = AgentConfig.new("m")
+        assert(base.max_turns == 8)
+        assert(base.tool_concurrency == 4)
+        tuned = base.with_max_turns(2).with_tool_concurrency(1)
+        assert(base.max_turns == 8, "the original is untouched")
+        assert(tuned.max_turns == 2)
+        assert(tuned.tool_concurrency == 1)
+    }
+
+    // A run that never finished is not an answer. The message names the knob rather than leaving a
+    // reader to find it.
+    fn exhausting_the_turn_budget_is_its_own_error(): void {
+        e = AiError.MaxTurns(turns: 8)
+        assert("${e}".contains("8-turn limit"), "${e}")
+        assert("${e}".contains("max_turns"), "${e}")
+        assert(error_type(e) == "max_turns")
+    }
+
+    // The unnamed form is the fallback for a failure that belongs to no particular tool.
+    fn a_tool_error_reads_correctly_with_and_without_a_name(): void {
+        assert("${AiError.Tool(name: "weather", message: "no such city")}"
+            == "tool `weather` failed: no such city")
+        assert("${AiError.Tool(name: "", message: "no such city")}" == "tool call failed: no such city")
     }
 
     fn errors_render_their_own_sentence(): void {

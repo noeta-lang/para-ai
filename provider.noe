@@ -28,6 +28,7 @@ namespace para.ai.provider
 
 use std.json
 use para.ai.{Message, Part, AiError}
+use para.ai.tools.{ToolSpec}
 
 // --- The wire ------------------------------------------------------------------------------------
 
@@ -67,11 +68,14 @@ pub struct Wire {
 // It is a map of **raw JSON fragments** merged into the request body by the codec, and it is
 // documented as unchecked: a malformed fragment is the caller's bug, surfaced at `encode`.
 //
-// Phase 2 adds `tools`, phase 5 adds `output` — both defaulted, so adding them breaks no caller.
+// `tools` is what the model is allowed to ask for; a codec that receives an empty list sends no
+// tools key at all, because "no tools" and "an empty tools array" are not the same request to every
+// vendor. Phase 5 adds `output` — defaulted, so adding it breaks no caller.
 @derive(Equatable, Display)
 pub struct ModelRequest {
     pub model: string
     pub messages: List<Message>
+    pub tools: List<ToolSpec> = []
     pub max_tokens: ?int = none
     pub temperature: ?float = none
     pub stop: List<string> = []

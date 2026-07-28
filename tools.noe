@@ -1,0 +1,1515 @@
+// `para.ai.tools` — the function signature is the tool spec.
+//
+//     use para.ai.tools.{Tool, Arg, Local}
+//
+//     #[Tool(about: "Current weather for a city")]
+//     fn weather(
+//         #[Arg(help: "City name, e.g. 'Malmö'")] city: string,
+//         #[Arg(help: "metric or imperial")] units: string = "metric",
+//     ): Result<string, string> {
+//         return Ok("18°C, clear")
+//     }
+//
+//     agent = Agent.from(cfg, provider).tools(Local.new())?
+//
+// There is no tool-definition DSL and no codegen, because the language already answers every
+// question one would ask. The whole pipeline is four reflection primitives:
+//
+//   * `attributes_of::<Tool>()` — every `#[Tool]` in the *consumer's* program, materialized as a
+//     real `Tool` struct paired with the annotated function's name. Whole-program reflection is
+//     closed-world, so this crosses the package boundary: the query runs here, the tools live over
+//     there, and it still sees them.
+//   * `params_of(target)`       — each parameter's name, declared `Type`, whether it is `optional`
+//     (it declared a default), and its own `#[Arg(...)]` metadata. That is the JSON Schema.
+//   * `field_specs_of(name)`    — used only to tell a struct-typed parameter from an enum-typed one
+//     so the two get different, accurate rejections.
+//   * `invoke(target, args)`    — call it by name. It returns `Result<dyn, dyn>` and **never aborts
+//     on a resolution failure**, which is what makes a bad tool call a turn instead of an outage.
+//
+// **Tools are a trust boundary, and the package says so.** `Tool` carries
+// `@role(Semantic.TrustBoundary)`, which turns "which functions in this program can a language
+// model reach?" into a query — `roles_of::<Semantic>()` in-language, and the architectural graph
+// `noeta mcp` serves to an editor or an agent. For a program where a model can call code that is
+// not a nicety; it is the review surface.
+//
+// **A failing tool is a turn, not an outage.** An unknown name, a missing argument, an argument
+// that will not coerce, and a tool that returns `Err` all become `Part.ToolResult(is_error: true)`
+// fed back to the model, which then gets to try something else. A panic *inside* a tool body is
+// still a panic, and that is correct: `invoke` catches by-name resolution, not the callee.
+//
+// `McpClient` joins `ToolSource` in phase 6 and is otherwise indistinguishable to the agent; the
+// tool-call and tool-result guard stages attach around `dispatch` in phase 5.
+namespace para.ai.tools
+
+use std.json
+use std.{metrics, tracing}
+use std.task.{map_bounded}
+use para.ai.{AiError, Part}
+use para.ai.provider
+
+// --- The attributes ---------------------------------------------------------------------------
+
+// Marks a function as reachable by a language model. `about` is the description the model reads —
+// it is the whole prompt for *when* to call this, so it is worth writing well. `name` overrides the
+// model-facing name, which otherwise is the function's own.
+//
+// `@role(Semantic.TrustBoundary)` is the load-bearing line. It is indexed at build time at zero
+// runtime cost, and it is what makes the set of model-reachable functions answerable by a query
+// rather than by a bespoke linter.
+//
+// `Method` is in the target list because `invoke(recv, name, args)` can dispatch one and a future
+// `ToolSource` over an object is a real shape — but `Local` has no receiver to supply, so it
+// rejects a `#[Tool]` method loudly rather than silently omitting it.
+@attribute(Function, Method)
+@role(Semantic.TrustBoundary)
+pub struct Tool {
+    pub about: string = ""
+    pub name: string = ""
+}
+
+// Per-parameter metadata. `help` becomes the parameter's `description` in the derived JSON Schema,
+// which is the only place a model learns what a bare `string` is *for* — an enum-valued parameter
+// spelled as a string names its accepted values here.
+@attribute(Param)
+pub struct Arg {
+    pub help: string = ""
+}
+
+// --- What a provider is told ---------------------------------------------------------------------
+
+// One tool, as a vendor-neutral description. `parameters` is a **JSON Schema object as raw JSON
+// text**, the same choice `Part.ToolCall.args` makes and for the same reason: it keeps the
+// parse/serialize boundary in one place, and it keeps `ToolSpec` a plain value struct that derives
+// `Equatable` and `Display` — so a test can assert on the exact schema a signature produced.
+@derive(Equatable, Display)
+pub struct ToolSpec {
+    pub name: string
+    pub description: string = ""
+    pub parameters: string
+}
+
+// --- The source seam ------------------------------------------------------------------------------
+
+// Where tools come from. Local `#[Tool]` functions and an MCP server are the same thing to the
+// agent, which holds a `Toolbox` of these and never asks which is which.
+//
+// **`specs` returns a `Result`, where DESIGN §6's sketch does not.** Deriving a schema can fail —
+// a parameter whose declared type has no JSON representation is a bug in the tool, and reporting it
+// as an empty schema would send a model arguments the function cannot accept. This is the same
+// amendment phase 1 made to `Provider.encode`, for the same reason: a source has to be able to
+// refuse what it cannot express, loudly, naming the offending part. It also happens to be what
+// phase 6 needs — an MCP `tools/list` is a network call.
+pub trait ToolSource {
+    // A stable, low-cardinality identity — `"local"`, `"mcp:memory"`. It appears in the collision
+    // error naming both sources, so it has to be recognizable in a message.
+    fn source_name(): string
+
+    // `gen_ai.tool.type` for every tool from this source: `"function"` or `"mcp"`.
+    fn tool_type(): string
+
+    // Every tool this source offers, with its derived schema.
+    fn specs(): Result<List<ToolSpec>, AiError>
+
+    // Run one, by its model-facing name, with its raw JSON argument blob. `Err` is not fatal: the
+    // agent turns it into `ToolResult(is_error: true)` and lets the model try again.
+    fn call(name: string, args: string): Result<string, AiError>
+}
+
+// --- Local: reflection over `#[Tool]` --------------------------------------------------------------
+
+// Every `#[Tool]` function in the program. Stateless — the reflection index is compile-time, so
+// there is nothing to build and nothing to keep.
+pub struct Local {
+    fn new(): Local {
+        return Local {}
+    }
+}
+
+// A discovered `#[Tool]`, flattened out of the reflection view.
+struct Declared {
+    // The model-facing name: `#[Tool(name: …)]`, or the function's own name.
+    name: string
+    // The reflection key `params_of` and `invoke` take.
+    target: string
+    about: string
+}
+
+fn declared_tools(): List<Declared> {
+    mut out: List<Declared> = []
+    for a in attributes_of::<Tool>() {
+        out = out ~ [Declared {
+            name: if a.value.name == "" then last_segment(a.target) else a.value.name,
+            target: a.target,
+            about: a.value.about,
+        }]
+    }
+    return out
+}
+
+// A reflection key's last segment. The model-facing name defaults to this rather than to the whole
+// key, because a key is **qualified** — a `#[Tool] fn weather` inside `namespace app.tools` is keyed
+// `app.tools.weather`, and every vendor constrains a tool name to `[A-Za-z0-9_-]`, which a dotted
+// path is not. Two tools that shorten to the same name are a collision, and `specs` refuses it
+// naming both declarations.
+fn last_segment(target: string): string {
+    parts = target.split(".")
+    return parts[parts.len() - 1]
+}
+
+fn target_of(name: string): ?string {
+    for d in declared_tools() {
+        if d.name == name {
+            return some(d.target)
+        }
+    }
+    return none
+}
+
+// Everything before a reflection key's last segment: `para.ai.tools` for the free function
+// `para.ai.tools.shout`, `para.ai.tools.Toolbox` for the method `para.ai.tools.Toolbox.call`.
+fn owner_of(target: string): string {
+    parts = target.split(".")
+    if parts.len() < 2 {
+        return ""
+    }
+    mut prefix: List<string> = []
+    mut i = 0
+    while i < parts.len() - 1 {
+        prefix = prefix ~ [parts[i]]
+        i = i + 1
+    }
+    return prefix.join(".")
+}
+
+// Does this reflection key name a method rather than a top-level function?
+//
+// Not "does it contain a dot": a reflection key is **qualified**, so a namespaced module's own free
+// function is keyed `para.ai.tools.shout` and has plenty of dots. What distinguishes a method is its
+// owner — the key without its last segment names a declared type, which has a field schema. A
+// method on a fieldless struct or on an enum slips past this and is caught one layer down, where
+// `invoke` reports it by name ("a qualified name dispatches through the three-argument `invoke`").
+fn is_method_target(target: string): bool {
+    owner = owner_of(target)
+    return owner != "" && field_specs_of(owner).len() > 0
+}
+
+impl ToolSource for Local {
+    fn source_name(): string {
+        return "local"
+    }
+
+    fn tool_type(): string {
+        return "function"
+    }
+
+    fn specs(): Result<List<ToolSpec>, AiError> {
+        all = declared_tools()
+        mut out: List<ToolSpec> = []
+        mut claimed: List<string> = []
+        for d in all {
+            // `invoke(name, args)` searches the top-level function namespace and nothing else, and
+            // a `Local` source holds no receiver to reach a method through. Loud rather than
+            // silently absent: a tool the model was never told about is indistinguishable, from the
+            // outside, from a tool it decided not to call.
+            if is_method_target(d.target) {
+                return Err(AiError.Tool(
+                    name: d.name,
+                    message: "`#[Tool]` on the method `${d.target}` has no dispatch path: `invoke(name, args)` resolves top-level functions only, and `Local` has no receiver to supply — make it a top-level `fn`",
+                ))
+            }
+            // Two `#[Tool]` functions of the same short name in different namespaces would collide
+            // in the model's vocabulary, and one would silently shadow the other. Same rule as a
+            // cross-source collision, and for the same reason — but the two *declarations* are what
+            // a reader needs here, since both are the one source.
+            if claimed.contains(d.name) {
+                return Err(AiError.Tool(
+                    name: d.name,
+                    message: "two `#[Tool]` declarations claim the name `${d.name}` — one of them is `${d.target}`; give one an explicit `#[Tool(name: …)]`",
+                ))
+            }
+            claimed = claimed ~ [d.name]
+            mut schema = ""
+            match schema_of(d.target) {
+                Ok(s) => {
+                    schema = s
+                },
+                Err(e) => {
+                    return Err(AiError.Tool(name: d.name, message: e))
+                },
+            }
+            out = out ~ [ToolSpec { name: d.name, description: d.about, parameters: schema }]
+        }
+        return Ok(out)
+    }
+
+    fn call(name: string, args: string): Result<string, AiError> {
+        target = match target_of(name) {
+            some(t) => t,
+            none => "",
+        }
+        if target == "" {
+            return Err(AiError.Tool(name: name, message: "no `#[Tool]` function is named `${name}`"))
+        }
+        params = params_of(target)
+        supplied = parse_arguments(name, args)?
+        bound = bind(name, params, supplied)?
+        // Every resolution failure is an `Err` here, never an abort — an arity mismatch, a name
+        // that vanished between `specs()` and now. It becomes a tool-result turn like any other.
+        return match invoke(target, bound) {
+            Ok(v) => outcome(name, v),
+            Err(e) => Err(AiError.Tool(name: name, message: "${e}")),
+        }
+    }
+}
+
+// A tool call's raw argument blob as a map. An empty blob is the no-arguments call, which some
+// vendors send as `""` rather than `"{}"`.
+fn parse_arguments(name: string, args: string): Result<Map<string, dyn>, AiError> {
+    trimmed = args.trim()
+    if trimmed == "" {
+        empty: Map<string, dyn> = {}
+        return Ok(empty)
+    }
+    return match provider.parse_object(trimmed, "tool `${name}` arguments") {
+        Ok(o) => Ok(o),
+        // Re-labeled as a tool failure rather than a decode failure: it is the *model's* JSON that
+        // was malformed, so the model is who needs to be told.
+        Err(e) => Err(AiError.Tool(name: name, message: "${e}")),
+    }
+}
+
+// What `invoke` handed back, as the string the model will read.
+//
+// A tool declared `Result<T, E>` is unwrapped: `Ok(v)` is the answer, `Err(e)` is a failed turn.
+// That is the whole of "a failing tool is a turn, not an outage" — the model sees the error text
+// and gets to try something else.
+fn outcome(tool: string, v: dyn): Result<string, AiError> {
+    return match v.as<Result<dyn, dyn>>() {
+        some(r) => match r {
+            Ok(x) => Ok(render(x)),
+            Err(e) => Err(AiError.Tool(name: tool, message: render(e))),
+        },
+        none => Ok(render(v)),
+    }
+}
+
+// A returned value as text. A `string` is itself; everything else is JSON, because a struct, a
+// list, or a map is far more useful to a model as `{"temp":18,"sky":"clear"}` than as a Noeta
+// `Display` rendering it has never seen the grammar of.
+fn render(v: dyn): string {
+    return match v.as<string>() {
+        some(s) => s,
+        none => json.stringify(v),
+    }
+}
+
+// --- `Type` → JSON Schema ----------------------------------------------------------------------
+//
+// **Total over the `Type` ADT.** Every variant is either derived or refused with a message naming
+// the parameter, the type, and what to write instead. Nothing emits `{}` for a shape it did not
+// understand: a schema that silently says "any value" is how a model learns to send arguments the
+// function cannot accept, and the resulting failure lands three layers from its cause.
+
+// The whole object schema for one callable, as JSON text. Keys come out in `json.stringify`'s
+// sorted order, which is what makes an exact-string assertion on a derived schema stable.
+pub fn schema_of(target: string): Result<string, string> {
+    mut props: Map<string, dyn> = {}
+    mut required: List<dyn> = []
+    for p in params_of(target) {
+        mut schema: Map<string, dyn> = {}
+        match param_schema(p) {
+            Ok(s) => {
+                schema = s
+            },
+            Err(e) => {
+                return Err("parameter `${p.name}`: ${e}")
+            },
+        }
+        props = props.set(p.name, schema)
+        // A parameter that declared a default may be omitted, and so may an `?T` — an absent
+        // optional *is* `none`. Everything else is required.
+        if !p.optional && !is_option(p.type) {
+            required = required ~ [p.name]
+        }
+    }
+    obj: Map<string, dyn> = {
+        "type": "object",
+        "properties": props,
+        "required": required,
+        // The dispatcher rejects an argument no parameter accepts, so the schema says so too. A
+        // model that is told the object is closed sends fewer invented keys.
+        "additionalProperties": false,
+    }
+    return Ok(json.stringify(obj))
+}
+
+fn param_schema(p: ParamInfo): Result<Map<string, dyn>, string> {
+    mut s = json_schema(p.type)?
+    help = help_of(p)
+    if help != "" {
+        s = s.set("description", help)
+    }
+    return Ok(s)
+}
+
+// The `#[Arg(help: …)]` on a parameter, narrowed off the heterogeneous `attrs` list.
+fn help_of(p: ParamInfo): string {
+    for a in p.attrs {
+        if a is Arg {
+            return a.help
+        }
+    }
+    return ""
+}
+
+fn scalar(kind: string): Map<string, dyn> {
+    out: Map<string, dyn> = {"type": kind}
+    return out
+}
+
+// One declared type as a JSON Schema fragment, or the reason it has none.
+pub fn json_schema(t: Type): Result<Map<string, dyn>, string> {
+    return match t {
+        Type.Int => Ok(scalar("integer")),
+        Type.Float => Ok(scalar("number")),
+        Type.Bool => Ok(scalar("boolean")),
+        Type.String => Ok(scalar("string")),
+        // A `dyn` parameter is *declared* to accept anything, so the empty schema is the honest
+        // reading rather than a shrug — JSON Schema spells "any value" exactly that way.
+        Type.Dyn => Ok(any_schema()),
+        // An `?T` parameter is `T`'s schema and an absence from `required`; JSON has no separate
+        // "optional" shape, and a `null` argument coerces back to `none` at dispatch.
+        Type.Option(inner) => json_schema(inner),
+        Type.List(inner) => array_schema(inner, false),
+        Type.Set(inner) => array_schema(inner, true),
+        Type.Map(key, value) => map_schema(key, value),
+        Type.Union(members) => union_schema(members),
+        Type.Named(name, args) => Err(nominal_refusal(name)),
+        Type.Struct(name, args) => Err(nominal_refusal(name)),
+        Type.Class(name, args) => Err(nominal_refusal(name)),
+        Type.Enum(name, args) => Err(nominal_refusal(name)),
+        // The fixed-width numerics are a physically distinct storage slot in container position
+        // (`List<i32>` is packed), and a value built from JSON is not one. Rejecting is honest;
+        // handing a boxed int to a packed list is a wrong answer with no error.
+        Type.IntN(bits, signed) => Err("a fixed-width integer is not a tool-argument shape — its packed storage cannot be built from JSON; declare `int`"),
+        Type.F32 => Err("`f32` is not a tool-argument shape — its packed storage cannot be built from JSON; declare `float`"),
+        Type.F64 => Err("`f64` is not a tool-argument shape in container position — declare `float`"),
+        Type.Bytes => Err("`bytes` has no tool-argument encoding yet: para/ai can base64-*encode* an image onto a request but ships no decoder, so a `bytes` parameter cannot be built from a model's JSON — take a `string` and decode it in the tool"),
+        Type.Unit => Err("`void` is not a value a model can send"),
+        Type.Result(ok, err) => Err("a `Result` parameter cannot be sent by a model — a tool *returns* a `Result`, it does not take one"),
+        Type.Fn(params, ret) => Err("a function-typed parameter has no JSON representation"),
+        Type.DynTrait(name) => Err("a `dyn ${name}` parameter has no JSON representation — a model can only send data"),
+    }
+}
+
+// JSON Schema's "any value". A real, deliberate schema, not an empty one that got away.
+fn any_schema(): Map<string, dyn> {
+    out: Map<string, dyn> = {}
+    return out
+}
+
+fn array_schema(inner: Type, unique: bool): Result<Map<string, dyn>, string> {
+    items = json_schema(inner)?
+    mut out: Map<string, dyn> = {"type": "array", "items": items}
+    if unique {
+        out = out.set("uniqueItems", true)
+    }
+    return Ok(out)
+}
+
+fn map_schema(key: Type, value: Type): Result<Map<string, dyn>, string> {
+    if !is_string(key) {
+        return Err("a `Map` argument must be keyed by `string` — a JSON object's keys are strings")
+    }
+    values = json_schema(value)?
+    out: Map<string, dyn> = {"type": "object", "additionalProperties": values}
+    return Ok(out)
+}
+
+fn union_schema(members: List<Type>): Result<Map<string, dyn>, string> {
+    mut branches: List<dyn> = []
+    for m in members {
+        branch = json_schema(m)?
+        branches = branches ~ [branch]
+    }
+    out: Map<string, dyn> = {"anyOf": branches}
+    return Ok(out)
+}
+
+// The two nominal refusals, told apart by whether the name has a field schema. They are different
+// gaps with different fixes, and one message for both would send half the readers the wrong way.
+//
+//   * A **struct or class** has fields, and `field_specs_of` can see them — but a nested object
+//     schema is DESIGN §8.5's slice, which `@schema` closes, and half-deriving it here would put a
+//     second, divergent copy of that logic in the package.
+//   * An **enum** has variants, and nothing at runtime can see them: there is no `variants_of` to
+//     mirror `field_specs_of`, so the `{"enum": […]}` DESIGN §6 sketches is not derivable today.
+fn nominal_refusal(name: string): string {
+    if field_specs_of(name).len() > 0 {
+        return "`${name}` is a struct or class, and a nested-object argument schema is not derived yet (DESIGN §8.5 — `@schema` closes it); declare its fields as separate parameters"
+    }
+    return "`${name}` is an enum (or a name nothing declares), and an enum's variants are not reflectable at runtime — there is no `variants_of` to mirror `field_specs_of`; declare the parameter `string` and name the accepted values in `#[Arg(help: …)]`"
+}
+
+fn is_option(t: Type): bool {
+    return match t {
+        Type.Option(inner) => true,
+        _ => false,
+    }
+}
+
+fn is_string(t: Type): bool {
+    return match t {
+        Type.String => true,
+        _ => false,
+    }
+}
+
+// --- Coercion ------------------------------------------------------------------------------------
+//
+// The decoded JSON argument for each parameter, coerced to its declared type. This is the package's
+// own type check and it is load-bearing: `invoke` validates a callable's *name* and *arity* and
+// nothing else, so an `int` parameter handed a string reaches the function body and aborts there —
+// which is a crashed process, not a tool-result turn. Nothing reaches `invoke` that did not come
+// through here.
+//
+// Deliberately lenient in one direction only: a scalar that a model sent in the neighboring JSON
+// type (`"5"` for an `int`, `5` for a `string`, `2.0` for an `int`) is accepted, because models do
+// that constantly and refusing costs a round trip for nothing. A *lossy* conversion is refused.
+
+fn is_null(v: dyn): bool {
+    return match type_of(v) {
+        Type.Unit => true,
+        _ => false,
+    }
+}
+
+fn coerce(t: Type, v: dyn): Result<dyn, string> {
+    if is_null(v) {
+        // JSON `null` for an `?T` is exactly `none`. For anything else it is a missing argument
+        // wearing a value's clothes.
+        return match t {
+            Type.Option(inner) => Ok(none),
+            _ => Err("expected ${spelling(t)}, got null"),
+        }
+    }
+    return match t {
+        Type.Int => coerce_int(v),
+        Type.Float => coerce_float(v),
+        Type.Bool => coerce_bool(v),
+        Type.String => coerce_string(v),
+        Type.Dyn => Ok(v),
+        Type.Option(inner) => coerce_option(inner, v),
+        Type.List(inner) => coerce_list(inner, v),
+        Type.Set(inner) => coerce_set(inner, v),
+        Type.Map(key, value) => coerce_map(value, v),
+        Type.Union(members) => coerce_union(members, v),
+        // Unreachable by construction: every remaining variant is refused by `json_schema`, so no
+        // tool carrying one ever reaches a `Toolbox`, let alone a dispatch. Loud anyway.
+        _ => Err("no coercion for ${spelling(t)}"),
+    }
+}
+
+fn coerce_int(v: dyn): Result<dyn, string> {
+    match v.as<int>() {
+        some(n) => {
+            return Ok(n)
+        },
+        none => {},
+    }
+    // JSON has one number type, so a whole `2.0` is an integer that took the scenic route. A
+    // fractional one is not, and rounding it silently would answer a question nobody asked.
+    match v.as<float>() {
+        some(f) => {
+            if f == f.to_int().to_float() {
+                return Ok(f.to_int())
+            }
+            return Err("expected an integer, got the fractional number ${f}")
+        },
+        none => {},
+    }
+    match v.as<string>() {
+        some(s) => {
+            match s.to_int() {
+                some(n) => {
+                    return Ok(n)
+                },
+                none => {},
+            }
+        },
+        none => {},
+    }
+    return Err("expected an integer, got `${v}`")
+}
+
+fn coerce_float(v: dyn): Result<dyn, string> {
+    match v.as<float>() {
+        some(f) => {
+            return Ok(f)
+        },
+        none => {},
+    }
+    match v.as<int>() {
+        some(n) => {
+            return Ok(n.to_float())
+        },
+        none => {},
+    }
+    match v.as<string>() {
+        some(s) => {
+            match s.to_float() {
+                some(f) => {
+                    return Ok(f)
+                },
+                none => {},
+            }
+        },
+        none => {},
+    }
+    return Err("expected a number, got `${v}`")
+}
+
+fn coerce_bool(v: dyn): Result<dyn, string> {
+    match v.as<bool>() {
+        some(b) => {
+            return Ok(b)
+        },
+        none => {},
+    }
+    match v.as<string>() {
+        some(s) => {
+            if s == "true" || s == "1" {
+                return Ok(true)
+            }
+            if s == "false" || s == "0" {
+                return Ok(false)
+            }
+        },
+        none => {},
+    }
+    return Err("expected a boolean, got `${v}`")
+}
+
+fn coerce_string(v: dyn): Result<dyn, string> {
+    match v.as<string>() {
+        some(s) => {
+            return Ok(s)
+        },
+        none => {},
+    }
+    // A scalar sent for a string parameter reads back as its own text. An object or an array does
+    // not: stringifying those would hand the tool a JSON blob where it expected prose.
+    if is_scalar(v) {
+        return Ok("${v}")
+    }
+    return Err("expected a string, got `${v}`")
+}
+
+fn is_scalar(v: dyn): bool {
+    return match type_of(v) {
+        Type.Int => true,
+        Type.Float => true,
+        Type.Bool => true,
+        _ => false,
+    }
+}
+
+fn coerce_option(inner: Type, v: dyn): Result<dyn, string> {
+    value = coerce(inner, v)?
+    return Ok(some(value))
+}
+
+fn coerce_elements(inner: Type, v: dyn): Result<List<dyn>, string> {
+    items = match v.as<List<dyn>>() {
+        some(xs) => xs,
+        none => [],
+    }
+    match v.as<List<dyn>>() {
+        some(_) => {},
+        none => {
+            return Err("expected an array, got `${v}`")
+        },
+    }
+    mut out: List<dyn> = []
+    for (i, item) in items.enumerate() {
+        match coerce(inner, item) {
+            Ok(c) => {
+                out = out ~ [c]
+            },
+            Err(e) => {
+                return Err("[${i}]: ${e}")
+            },
+        }
+    }
+    return Ok(out)
+}
+
+fn coerce_list(inner: Type, v: dyn): Result<dyn, string> {
+    items = coerce_elements(inner, v)?
+    return Ok(items)
+}
+
+fn coerce_set(inner: Type, v: dyn): Result<dyn, string> {
+    items = coerce_elements(inner, v)?
+    return Ok(items.to_set())
+}
+
+fn coerce_map(value: Type, v: dyn): Result<dyn, string> {
+    obj = match v.as<Map<string, dyn>>() {
+        some(o) => o,
+        none => {},
+    }
+    match v.as<Map<string, dyn>>() {
+        some(_) => {},
+        none => {
+            return Err("expected an object, got `${v}`")
+        },
+    }
+    mut out: Map<string, dyn> = {}
+    for k in obj.keys() {
+        match coerce(value, obj[k]) {
+            Ok(c) => {
+                out = out.set(k, c)
+            },
+            Err(e) => {
+                return Err(".${k}: ${e}")
+            },
+        }
+    }
+    return Ok(out)
+}
+
+// The first branch that accepts wins, in declaration order — which is why a union's members are
+// worth writing most-specific-first.
+fn coerce_union(members: List<Type>, v: dyn): Result<dyn, string> {
+    for m in members {
+        match coerce(m, v) {
+            Ok(c) => {
+                return Ok(c)
+            },
+            Err(_) => {},
+        }
+    }
+    mut wanted: List<string> = []
+    for m in members {
+        wanted = wanted ~ [spelling(m)]
+    }
+    return Err("`${v}` matches no member of the union: expected ${wanted.join(" or ")}")
+}
+
+// A type as a short phrase for an error message. `Type`'s own `Display` is the ADT's spelling
+// (`Type.List(Type.String)`), which is right for a reflection dump and wrong in a sentence aimed at
+// a language model.
+fn spelling(t: Type): string {
+    return match t {
+        Type.Int => "an integer",
+        Type.Float => "a number",
+        Type.Bool => "a boolean",
+        Type.String => "a string",
+        Type.Bytes => "a byte string",
+        Type.Dyn => "any value",
+        Type.Unit => "nothing",
+        Type.List(inner) => "an array of ${spelling(inner)}",
+        Type.Set(inner) => "an array of distinct ${spelling(inner)}",
+        Type.Option(inner) => "${spelling(inner)} or null",
+        Type.Map(key, value) => "an object of ${spelling(value)}",
+        _ => "${t}",
+    }
+}
+
+// --- Binding -------------------------------------------------------------------------------------
+
+fn has_param(params: List<ParamInfo>, name: string): bool {
+    for p in params {
+        if p.name == name {
+            return true
+        }
+    }
+    return false
+}
+
+fn param_names(params: List<ParamInfo>): string {
+    mut names: List<string> = []
+    for p in params {
+        names = names ~ [p.name]
+    }
+    if names.len() == 0 {
+        return "no arguments"
+    }
+    return names.join(", ")
+}
+
+// The model's arguments as the positional list `invoke` takes, in declaration order.
+//
+// Three things are decided here, and each one is a message the model can act on:
+//
+//   * An **unknown argument** is refused rather than dropped. The schema said the object is closed;
+//     quietly ignoring a key the model believed it sent produces an answer to a different question.
+//   * A **missing required argument** is refused, naming it.
+//   * A **gap** — a defaulted parameter left out while a later one is supplied — is refused,
+//     naming both. `invoke` takes a positional list and nothing else (unlike `construct`, whose
+//     named-map form can express a gap), so a skipped middle parameter is not expressible. The
+//     message asks for the skipped one rather than guessing at its default, which reflection does
+//     not expose.
+fn bind(tool: string, params: List<ParamInfo>, supplied: Map<string, dyn>): Result<List<dyn>, AiError> {
+    for k in supplied.keys() {
+        if !has_param(params, k) {
+            return Err(AiError.Tool(
+                name: tool,
+                message: "unknown argument `${k}` — this tool takes ${param_names(params)}",
+            ))
+        }
+    }
+    mut bound: List<dyn> = []
+    mut skipped = ""
+    for p in params {
+        match supplied.get(p.name) {
+            some(raw) => {
+                if skipped != "" {
+                    return Err(AiError.Tool(
+                        name: tool,
+                        message: "`${p.name}` was supplied but `${skipped}` was not — arguments are positional, so a parameter with a default cannot be skipped over; send `${skipped}` too",
+                    ))
+                }
+                match coerce(p.type, raw) {
+                    Ok(v) => {
+                        bound = bound ~ [v]
+                    },
+                    Err(e) => {
+                        return Err(AiError.Tool(name: tool, message: "argument `${p.name}`: ${e}"))
+                    },
+                }
+            },
+            none => {
+                if p.optional {
+                    // Leave the list short and let the callee fill its own default. Defaults are
+                    // trailing-only, so once one is absent every parameter after it is defaulted
+                    // too — and a later *supplied* one is the gap the check above catches.
+                    if skipped == "" {
+                        skipped = p.name
+                    }
+                } else if is_option(p.type) {
+                    // An `?T` with no default is positionally required, and an omitted optional
+                    // argument means exactly `none`. Binding it keeps the position filled.
+                    if skipped != "" {
+                        return Err(AiError.Tool(
+                            name: tool,
+                            message: "`${p.name}` follows the skipped `${skipped}` — arguments are positional; send `${skipped}` too",
+                        ))
+                    }
+                    bound = bound ~ [none]
+                } else {
+                    return Err(AiError.Tool(name: tool, message: "missing required argument `${p.name}`"))
+                }
+            },
+        }
+    }
+    return Ok(bound)
+}
+
+// --- The toolbox ------------------------------------------------------------------------------
+
+// One tool in a `Toolbox`, with the source it came from.
+struct Entry {
+    spec: ToolSpec
+    // The declaring source's `source_name()`, kept for the collision message.
+    origin: string
+    tool_type: string
+    // Index into the toolbox's `sources`.
+    at: int
+}
+
+fn find_entry(entries: List<Entry>, name: string): ?Entry {
+    for e in entries {
+        if e.spec.name == name {
+            return some(e)
+        }
+    }
+    return none
+}
+
+// Every tool an agent can reach, across every source.
+//
+// **A name collision is a construction-time error naming both sources**, never a last-one-wins. A
+// silently shadowed tool is the kind of bug that shows up as a wrong answer three weeks later, and
+// the two sources involved are exactly what a reader needs to fix it.
+//
+// A value struct holding `List<dyn ToolSource>`: that makes a populated `Toolbox` — and therefore
+// the `Agent` holding it — `!Send`, the same trade `para/api`'s middleware stack makes. Build it
+// per worker from the `Send` `AgentConfig`.
+pub struct Toolbox {
+    sources: List<dyn ToolSource> = []
+    entries: List<Entry> = []
+
+    fn new(): Toolbox {
+        return Toolbox {}
+    }
+
+    // The one-source toolbox — the common case, and what `Agent.tools(src)` builds.
+    fn of(src: dyn ToolSource): Result<Toolbox, AiError> {
+        return Toolbox.new().with(src)
+    }
+
+    // Add a source, collision-checked. Chains: `Toolbox.of(a)?.with(b)?`.
+    fn with(src: dyn ToolSource): Result<Toolbox, AiError> {
+        specs = src.specs()?
+        origin = src.source_name()
+        kind = src.tool_type()
+        at = self.sources.len()
+        mut entries = self.entries
+        for s in specs {
+            match find_entry(entries, s.name) {
+                some(clash) => {
+                    return Err(AiError.Tool(
+                        name: s.name,
+                        message: "declared by both `${clash.origin}` and `${origin}` — a shadowed tool is a wrong answer three weeks later, so this is a construction-time error rather than a last-one-wins",
+                    ))
+                },
+                none => {},
+            }
+            entries = entries ~ [Entry { spec: s, origin: origin, tool_type: kind, at: at }]
+        }
+        return Ok(Toolbox { sources: self.sources ~ [src], entries: entries })
+    }
+
+    // What goes on the request. Infallible: every schema was derived (and every collision refused)
+    // when the source was added.
+    fn specs(): List<ToolSpec> {
+        mut out: List<ToolSpec> = []
+        for e in self.entries {
+            out = out ~ [e.spec]
+        }
+        return out
+    }
+
+    fn names(): List<string> {
+        mut out: List<string> = []
+        for e in self.entries {
+            out = out ~ [e.spec.name]
+        }
+        return out
+    }
+
+    fn len(): int {
+        return self.entries.len()
+    }
+
+    fn is_empty(): bool {
+        return self.entries.len() == 0
+    }
+
+    fn has(name: string): bool {
+        return match find_entry(self.entries, name) {
+            some(_) => true,
+            none => false,
+        }
+    }
+
+    // `gen_ai.tool.type` for one tool — `"function"` for a local `#[Tool]`, `"mcp"` for a server's.
+    fn tool_type(name: string): string {
+        return match find_entry(self.entries, name) {
+            some(e) => e.tool_type,
+            none => "function",
+        }
+    }
+
+    // Route one call to the source that declared it. An unknown name is an `Err` listing what the
+    // agent does have, which is a far better correction turn than "not found".
+    fn call(name: string, args: string): Result<string, AiError> {
+        return match find_entry(self.entries, name) {
+            some(e) => self.sources[e.at].call(name, args),
+            none => Err(AiError.Tool(
+                name: name,
+                message: "no such tool — this agent has ${offered(self.names())}",
+            )),
+        }
+    }
+}
+
+fn offered(names: List<string>): string {
+    if names.len() == 0 {
+        return "no tools at all"
+    }
+    return names.join(", ")
+}
+
+// --- Dispatch -----------------------------------------------------------------------------------
+
+// One pending call, packaged so `map_bounded` can drive it. The combinator takes a plain async
+// function rather than a closure, so everything the dispatch needs — the toolbox included — travels
+// in the item.
+struct Pending {
+    box: Toolbox
+    id: string
+    name: string
+    args: string
+}
+
+fn tool_calls_counter(): dyn {
+    return metrics.counter("para.ai.tool.calls")
+}
+
+// Run one tool call, wrapped in the `execute_tool {name}` span the OTel GenAI conventions specify.
+//
+// **The telemetry is here and not in the tool.** That is the whole point of instrumenting dispatch:
+// a `#[Tool]` function contains zero telemetry code and still shows up as a child span of the model
+// call that requested it, with its outcome on `para.ai.tool.calls`.
+async fn execute(p: Pending): Part {
+    span = tracing.span("execute_tool ${p.name}")
+    span.set_attribute("gen_ai.operation.name", "execute_tool")
+    span.set_attribute("gen_ai.tool.name", p.name)
+    span.set_attribute("gen_ai.tool.call.id", p.id)
+    span.set_attribute("gen_ai.tool.type", p.box.tool_type(p.name))
+
+    mut part = Part.ToolResult(id: p.id, content: "", is_error: false)
+    mut outcome_label = "ok"
+    match p.box.call(p.name, p.args) {
+        Ok(content) => {
+            part = Part.ToolResult(id: p.id, content: content, is_error: false)
+        },
+        Err(e) => {
+            outcome_label = "error"
+            span.record_error("${e}")
+            part = Part.ToolResult(id: p.id, content: "${e}", is_error: true)
+        },
+    }
+    // Keyed by tool name and outcome, and by nothing else: a call id or an argument blob here would
+    // turn one counter into one series per request.
+    tool_calls_counter().add_with(1, {
+        "gen_ai.tool.name": p.name,
+        "para.ai.tool.outcome": outcome_label,
+    })
+    span.end()
+    return part
+}
+
+fn at_least_one(n: int): int {
+    return if n < 1 then 1 else n
+}
+
+// Dispatch every requested call, **concurrently and bounded**, and return the results in call
+// order.
+//
+// `std.task.map_bounded(calls, n, f)` gives both properties for free: at most `n` in flight, results
+// in item order. Unbounded parallel dispatch is a good way to get rate-limited by your own agent —
+// a model that asks for twelve web fetches at once should not open twelve sockets — so the cap is a
+// configuration knob (`AgentConfig.tool_concurrency`, default 4) rather than a constant.
+//
+// Total: a non-`ToolCall` part is ignored, and every call produces exactly one `ToolResult`, so the
+// conversation this feeds can never separate a call from its answer.
+pub fn dispatch(box: Toolbox, calls: List<Part>, concurrency: int): List<Part> {
+    mut jobs: List<Pending> = []
+    for c in calls {
+        match c {
+            Part.ToolCall(id, name, args) => {
+                jobs = jobs ~ [Pending { box: box, id: id, name: name, args: args }]
+            },
+            _ => {},
+        }
+    }
+    return map_bounded(jobs, at_least_one(concurrency), execute)
+}
+
+// --- The package's own tools, for its own tests -------------------------------------------------
+//
+// These are `#[Tool]` functions in this package, which means `attributes_of::<Tool>()` finds them
+// from anywhere in the program — including from a consumer's suite. That is the closed-world
+// reflection the whole design rides on, demonstrated on itself.
+
+#[Tool(about: "Echo a string back, uppercased")]
+fn shout(#[Arg(help: "The text to shout")] text: string): string {
+    return text.upper()
+}
+
+#[Tool(about: "Add two integers", name: "add")]
+fn add_ints(
+    #[Arg(help: "The left operand")] a: int,
+    #[Arg(help: "The right operand")] b: int = 1,
+): Result<int, string> {
+    if a > 1000000 {
+        return Err("`a` is unreasonably large")
+    }
+    return Ok(a + b)
+}
+
+#[Tool(about: "Every declared parameter shape that has a schema")]
+fn shapes(
+    flag: bool,
+    ratio: float,
+    tags: List<string>,
+    uniq: Set<int>,
+    lookup: Map<string, int>,
+    maybe: ?string,
+    anything: dyn,
+    either: int|string,
+): string {
+    return "${flag}/${ratio}/${tags.len()}/${uniq.len()}/${lookup.len()}/${maybe ?? "-"}/${anything}/${either}"
+}
+
+// --- The shapes that have no schema, as real declarations ---------------------------------------
+//
+// Deliberately **not** `#[Tool]`: they exist so the refusal path is exercised against genuinely
+// declared signatures — what `params_of` actually reports — rather than against `Type` values
+// assembled by hand. That is the stricter test, and it is also the only one available: the prelude
+// `Type` enum cannot be constructed in expression position today (`Type.Unit` type-checks and then
+// aborts at runtime with E0005), so a synthesized-`Type` test could not run at all.
+
+fn refuses_bytes(blob: bytes): void {
+    return
+}
+
+fn refuses_result(r: Result<int, string>): void {
+    return
+}
+
+fn refuses_fn(f: (int) -> int): void {
+    return
+}
+
+fn refuses_dyn_trait(s: dyn ToolSource): void {
+    return
+}
+
+fn refuses_f32(x: f32): void {
+    return
+}
+
+fn refuses_fixed_width(xs: List<i32>): void {
+    return
+}
+
+fn refuses_map_key(m: Map<int, string>): void {
+    return
+}
+
+fn refuses_struct(s: ToolSpec): void {
+    return
+}
+
+fn refuses_enum(p: Part): void {
+    return
+}
+
+fn refuses_nested(xs: List<bytes>): void {
+    return
+}
+
+
+// One parameter of each supported declared type, so a coercion test can take its `Type` from a real
+// signature. The same reason the refusals above are real declarations: a `Type` value cannot be
+// written in expression position today, and reading one off `params_of` is the stricter test anyway.
+fn types_probe(
+    i: int,
+    f: float,
+    b: bool,
+    s: string,
+    d: dyn,
+    li: List<int>,
+    si: Set<int>,
+    mi: Map<string, int>,
+    os: ?string,
+    uis: int|string,
+    uib: int|bool,
+): void {
+    return
+}
+
+@test {
+    // --- Discovery and the trust-boundary role ---------------------------------------------------
+
+    fn the_tool_attribute_finds_the_functions_it_annotates(): void {
+        seen = specs_or_fail().map(fn(s) => s.name)
+        assert(seen.contains("shout"), "${seen}")
+        // `#[Tool(name: "add")]` overrides the function's own name.
+        assert(seen.contains("add"), "${seen}")
+        assert(!seen.contains("add_ints"), "the override replaces the function name: ${seen}")
+    }
+
+    // The line that makes "what can a model reach in this program?" a query rather than a code
+    // review. Asserted rather than merely written: an annotation that confers no role is a comment.
+    //
+    // The role is matched, not compared with `==`: the prelude `Semantic` enum has no expression
+    // form today (`Semantic.TrustBoundary` type-checks and aborts at runtime), so a pattern is the
+    // only spelling that works. See AGENTS.md.
+    fn every_tool_is_tagged_a_trust_boundary(): void {
+        mut tagged: List<string> = []
+        for r in roles_of::<Semantic>() {
+            match r.role {
+                Semantic.TrustBoundary => {
+                    tagged = tagged ~ [r.target]
+                },
+                _ => {},
+            }
+        }
+        // Targets are the **qualified** reflection keys, which is also what `params_of`/`invoke`
+        // take — a namespaced module's own free function is `para.ai.tools.shout`.
+        assert(tagged.contains(local_target("shout")), "roles_of::<Semantic>() sees the tools: ${tagged}")
+        assert(tagged.contains(local_target("add_ints")), "the role rides the target, not the model-facing name: ${tagged}")
+        assert(tagged.contains(local_target("shapes")), "${tagged}")
+        // And nothing else in this module is a trust boundary.
+        assert(!tagged.contains(local_target("refuses_bytes")), "${tagged}")
+    }
+
+    // --- Schema derivation -----------------------------------------------------------------------
+
+    // The exact bytes a known signature produces. `json.stringify` sorts keys, so this is stable —
+    // and an exact-string assertion is the only kind that catches a schema silently changing shape.
+    fn a_signature_derives_exactly_this_json_schema(): void {
+        derived = schema_or_fail(local_target("add_ints"))
+        assert(derived
+            == "{\"additionalProperties\":false,\"properties\":{\"a\":{\"description\":\"The left operand\",\"type\":\"integer\"},\"b\":{\"description\":\"The right operand\",\"type\":\"integer\"}},\"required\":[\"a\"],\"type\":\"object\"}",
+            derived)
+    }
+
+    // `#[Arg(help)]` is the parameter's `description`, which is where a model learns what a bare
+    // `string` is for.
+    fn arg_help_becomes_the_parameters_description(): void {
+        s = schema_or_fail(local_target("shout"))
+        assert(s.contains("\"description\":\"The text to shout\""), s)
+    }
+
+    // A defaulted parameter is absent from `required`; a mandatory one is in it.
+    fn a_default_makes_a_parameter_optional(): void {
+        s = schema_or_fail(local_target("add_ints"))
+        assert(s.contains("\"required\":[\"a\"]"), s)
+    }
+
+    fn every_supported_type_derives_its_schema(): void {
+        s = schema_or_fail(local_target("shapes"))
+        assert(s.contains("\"flag\":{\"type\":\"boolean\"}"), s)
+        assert(s.contains("\"ratio\":{\"type\":\"number\"}"), s)
+        assert(s.contains("\"tags\":{\"items\":{\"type\":\"string\"},\"type\":\"array\"}"), s)
+        assert(s.contains("\"uniq\":{\"items\":{\"type\":\"integer\"},\"type\":\"array\",\"uniqueItems\":true}"), s)
+        assert(s.contains("\"lookup\":{\"additionalProperties\":{\"type\":\"integer\"},\"type\":\"object\"}"), s)
+        // An `?T` is its inner schema, and is absent from `required`.
+        assert(s.contains("\"maybe\":{\"type\":\"string\"}"), s)
+        // `dyn` is declared to accept anything, so the empty schema is the honest reading.
+        assert(s.contains("\"anything\":{}"), s)
+        assert(s.contains("\"either\":{\"anyOf\":[{\"type\":\"integer\"},{\"type\":\"string\"}]}"), s)
+        assert(s.contains("\"required\":[\"flag\",\"ratio\",\"tags\",\"uniq\",\"lookup\",\"anything\",\"either\"]"),
+            "an `?T` parameter is never required: ${s}")
+    }
+
+    // Total means total: every underivable declared type is a message naming the parameter, the
+    // type, and what to write instead — never an empty schema discovered at the first model call.
+    fn an_underivable_type_is_a_loud_message_not_an_empty_schema(): void {
+        assert(refusal("refuses_bytes").contains("`bytes` has no tool-argument encoding"))
+        assert(refusal("refuses_result").contains("`Result` parameter"))
+        assert(refusal("refuses_fn").contains("function-typed"))
+        assert(refusal("refuses_dyn_trait").contains("has no JSON representation"))
+        assert(refusal("refuses_f32").contains("f32"))
+        assert(refusal("refuses_fixed_width").contains("fixed-width"))
+        // A map has to be keyed by string, because a JSON object's keys are.
+        assert(refusal("refuses_map_key").contains("keyed by `string`"))
+        // Every message names the parameter it is about, not just the type.
+        assert(refusal("refuses_bytes").contains("parameter `blob`"), refusal("refuses_bytes"))
+        // A failure nested in a container is reported, not swallowed by the container's own schema.
+        assert(refusal("refuses_nested").contains("`bytes`"), refusal("refuses_nested"))
+    }
+
+    // The two nominal refusals are different gaps with different fixes, so they are different
+    // messages. `field_specs_of` is what tells them apart.
+    fn a_struct_and_an_enum_parameter_get_different_refusals(): void {
+        struct_message = refusal("refuses_struct")
+        assert(struct_message.contains("struct or class"), struct_message)
+        assert(struct_message.contains("@schema"), "it points at the slice that closes it: ${struct_message}")
+        enum_message = refusal("refuses_enum")
+        assert(enum_message.contains("variants are not reflectable"), enum_message)
+        assert(enum_message.contains("variants_of"), "it names the primitive that is missing: ${enum_message}")
+    }
+
+    // --- Coercion ----------------------------------------------------------------------------------
+
+    fn scalars_coerce_from_the_neighboring_json_type(): void {
+        // A model that sends `"5"` for an integer meant 5, and refusing costs a round trip.
+        assert(coerced("i", "5") == "5")
+        assert(coerced("i", "2.0") == "2", "a whole JSON number is an integer")
+        assert(coerced("f", "3") == "3.0")
+        assert(coerced("b", "\"true\"") == "true")
+        assert(coerced("s", "5") == "5")
+        assert(coerced("d", "{\"anything\": 1}") == "{\"anything\": 1}")
+    }
+
+    // Lenient in one direction only: a conversion that loses information is refused.
+    fn a_lossy_coercion_is_refused(): void {
+        assert(coercion_error("i", "2.5").contains("fractional"))
+        assert(coercion_error("i", "\"seven\"").contains("expected an integer"))
+        assert(coercion_error("b", "\"yes\"").contains("expected a boolean"))
+        // An object is not prose, so it does not become a string parameter's value.
+        assert(coercion_error("s", "{\"a\":1}").contains("expected a string"))
+    }
+
+    fn containers_coerce_element_wise(): void {
+        assert(coerced("li", "[1, \"2\", 3.0]") == "[1, 2, 3]")
+        assert(coerced("mi", "{\"a\": 1}") == "{\"a\": 1}")
+        assert(coerced("si", "[1, 1, 2]") == "{1, 2}", coerced("si", "[1, 1, 2]"))
+        // The path names the offending element rather than the whole array.
+        assert(coercion_error("li", "[1, \"x\"]").contains("[1]"))
+        assert(coercion_error("li", "5").contains("expected an array"))
+        assert(coercion_error("mi", "5").contains("expected an object"))
+        assert(coercion_error("mi", "{\"a\": \"x\"}").contains(".a"))
+    }
+
+    fn an_option_takes_null_as_none(): void {
+        assert(coerced("os", "null") == "none")
+        assert(coerced("os", "\"hi\"") == "some(hi)")
+        // `null` for a non-optional parameter is a missing argument wearing a value's clothes.
+        assert(coercion_error("i", "null").contains("got null"))
+    }
+
+    fn a_union_takes_the_first_member_that_accepts(): void {
+        assert(coerced("uis", "7") == "7")
+        assert(coerced("uis", "\"seven\"") == "seven")
+        assert(coercion_error("uib", "{}").contains("matches no member"))
+    }
+
+    // --- Dispatch ----------------------------------------------------------------------------------
+
+    // The whole point, in one assertion: a JSON argument blob reaches the real Noeta function and
+    // its return value comes back.
+    fn a_tool_call_reaches_the_function_and_returns_its_value(): void {
+        assert(called("shout", "{\"text\": \"hej\"}") == Ok("HEJ"))
+        assert(called("add", "{\"a\": 2, \"b\": 3}") == Ok("5"))
+        // A defaulted parameter left off is filled by the callee, not by this package.
+        assert(called("add", "{\"a\": 2}") == Ok("3"))
+        // A tool that takes nothing can be called with an empty blob — some vendors send `""`.
+        assert(called("shout", "{\"text\": \"x\"}") == Ok("X"))
+    }
+
+    // A tool declared `Result<T, E>` is unwrapped: an `Err` is a failed turn carrying its message.
+    fn a_tool_returning_err_is_a_failed_turn(): void {
+        match called("add", "{\"a\": 9999999}") {
+            Ok(v) => {
+                assert(false, "an Err return is not an answer, got ${v}")
+            },
+            Err(e) => {
+                assert("${e}".contains("unreasonably large"), "${e}")
+            },
+        }
+    }
+
+    // Every one of these is a recoverable turn rather than an abort — which is the property that
+    // lets an agent survive a model that guessed.
+    fn a_bad_call_is_an_error_not_an_abort(): void {
+        assert(call_error("nope", "{}").contains("no such tool"))
+        assert(call_error("shout", "{}").contains("missing required argument `text`"))
+        assert(call_error("shout", "{\"text\": \"a\", \"volume\": 11}").contains("unknown argument `volume`"))
+        assert(call_error("shout", "{oops").contains("invalid JSON"))
+        // A wrong-typed argument is caught here and never reaches the function body — `invoke`
+        // checks a callable's name and arity, not its argument types, so a string handed to an
+        // `int` parameter would abort *inside* the callee and take the process with it.
+        assert(call_error("add", "{\"a\": \"two\"}").contains("expected an integer"))
+    }
+
+    // `invoke` takes a positional list and nothing else, so a skipped middle parameter is not
+    // expressible. Named rather than guessed: reflection does not expose a parameter's default.
+    fn a_missing_required_argument_is_named(): void {
+        e = call_error("shapes", "{\"flag\": true}")
+        assert(e.contains("missing required argument `ratio`"), e)
+    }
+
+    // --- The toolbox -------------------------------------------------------------------------------
+
+    fn a_toolbox_offers_every_tool_of_every_source(): void {
+        box = toolbox_or_fail()
+        assert(box.len() >= 3, "${box.names()}")
+        assert(box.has("shout"))
+        assert(box.has("add"))
+        assert(!box.has("add_ints"))
+        assert(box.tool_type("shout") == "function")
+        assert(Toolbox.new().is_empty())
+        assert(box.specs().len() == box.len())
+    }
+
+    // Not last-one-wins. The message names both sources, because those are what a reader needs.
+    fn a_name_collision_names_both_sources(): void {
+        match Toolbox.of(Local.new())?.with(Local.new()) {
+            Ok(_) => {
+                assert(false, "the same source twice is a collision")
+            },
+            Err(e) => {
+                assert("${e}".contains("declared by both `local` and `local`"), "${e}")
+            },
+        }
+    }
+
+    fn an_unknown_tool_lists_what_the_agent_does_have(): void {
+        box = toolbox_or_fail()
+        match box.call("teleport", "{}") {
+            Ok(_) => {
+                assert(false, "there is no teleport tool")
+            },
+            Err(e) => {
+                assert("${e}".contains("no such tool"), "${e}")
+                assert("${e}".contains("shout"), "the message lists the real ones: ${e}")
+            },
+        }
+    }
+
+    // --- Bounded concurrent dispatch ------------------------------------------------------------
+
+    fn dispatch_answers_every_call_in_order(): void {
+        box = toolbox_or_fail()
+        results = dispatch(box, [
+            Part.ToolCall(id: "c1", name: "shout", args: "{\"text\": \"one\"}"),
+            Part.ToolCall(id: "c2", name: "add", args: "{\"a\": 1, \"b\": 2}"),
+            Part.ToolCall(id: "c3", name: "shout", args: "{\"text\": \"three\"}"),
+        ], 2)
+        assert(results == [
+            Part.ToolResult(id: "c1", content: "ONE", is_error: false),
+            Part.ToolResult(id: "c2", content: "3", is_error: false),
+            Part.ToolResult(id: "c3", content: "THREE", is_error: false),
+        ], "${results}")
+    }
+
+    // A failing call is one failed result among successful ones — it does not take the batch down.
+    fn one_failing_call_does_not_fail_the_batch(): void {
+        box = toolbox_or_fail()
+        results = dispatch(box, [
+            Part.ToolCall(id: "a", name: "shout", args: "{\"text\": \"ok\"}"),
+            Part.ToolCall(id: "b", name: "missing", args: "{}"),
+        ], 4)
+        assert(results.len() == 2)
+        assert(results[0] == Part.ToolResult(id: "a", content: "OK", is_error: false))
+        assert(match results[1] {
+            Part.ToolResult(id, content, is_error) => is_error && content.contains("no such tool"),
+            _ => false,
+        }, "${results[1]}")
+    }
+
+    // Every call produces exactly one result, so the conversation this feeds can never separate a
+    // `ToolCall` from its `ToolResult` — the single most common bug in hand-rolled tool loops.
+    fn dispatch_pairs_every_call_with_exactly_one_result(): void {
+        box = toolbox_or_fail()
+        calls = [
+            Part.ToolCall(id: "x", name: "shout", args: "{\"text\": \"a\"}"),
+            Part.Text(text: "not a call"),
+            Part.ToolCall(id: "y", name: "shout", args: "{\"text\": \"b\"}"),
+        ]
+        // A cap of zero is a caller's mistake, not a deadlock: it is clamped to one.
+        results = dispatch(box, calls, 0)
+        assert(results.len() == 2, "a non-call part contributes nothing: ${results}")
+    }
+}
+
+// --- Test helpers ---------------------------------------------------------------------------------
+//
+// Unwrap-or-fail, kept out of the `@test` block because a `match` arm cannot both fail an assertion
+// and produce a value — so the unwrapping lives here instead of being repeated per test.
+
+// A reflection key for a function declared in this module. Reflection keys are **qualified**, so a
+// namespaced module's own `shout` is keyed `para.ai.tools.shout` and nothing finds a bare `shout`.
+fn local_target(name: string): string {
+    return "para.ai.tools." ~ name
+}
+
+fn specs_or_fail(): List<ToolSpec> {
+    match Local.new().specs() {
+        Ok(s) => {
+            return s
+        },
+        Err(e) => {
+            assert(false, "specs failed: ${e}")
+        },
+    }
+    return []
+}
+
+fn toolbox_or_fail(): Toolbox {
+    match Toolbox.of(Local.new()) {
+        Ok(b) => {
+            return b
+        },
+        Err(e) => {
+            assert(false, "toolbox failed: ${e}")
+        },
+    }
+    return Toolbox.new()
+}
+
+fn schema_or_fail(target: string): string {
+    match schema_of(target) {
+        Ok(s) => {
+            return s
+        },
+        Err(e) => {
+            assert(false, "schema failed: ${e}")
+        },
+    }
+    return ""
+}
+
+// The refusal a declared signature produces, or a loud failure if it produced a schema instead.
+fn refusal(name: string): string {
+    target = local_target(name)
+    match schema_of(target) {
+        Ok(s) => {
+            assert(false, "`${target}` must not derive a schema, got ${s}")
+        },
+        Err(e) => {
+            return e
+        },
+    }
+    return ""
+}
+
+// One `types_probe` parameter's **declared** type, read back off `params_of` — the same value the
+// schema and coercion paths see in production.
+fn probe_type(param: string): Type {
+    params = params_of(local_target("types_probe"))
+    for p in params {
+        if p.name == param {
+            return p.type
+        }
+    }
+    assert(false, "no parameter `${param}` on `types_probe`")
+    return params[0].type
+}
+
+// Coerce a JSON fragment to a `types_probe` parameter's declared type, rendered for assertion.
+fn coerced(param: string, fragment: string): string {
+    match coerce(probe_type(param), parsed(fragment)) {
+        Ok(c) => {
+            return "${c}"
+        },
+        Err(e) => {
+            assert(false, "coercion failed: ${e}")
+        },
+    }
+    return ""
+}
+
+fn coercion_error(param: string, fragment: string): string {
+    match coerce(probe_type(param), parsed(fragment)) {
+        Ok(c) => {
+            assert(false, "`${fragment}` must not coerce to `${param}`'s type, got ${c}")
+        },
+        Err(e) => {
+            return e
+        },
+    }
+    return ""
+}
+
+fn parsed(fragment: string): dyn {
+    return match provider.parse_value(fragment, "test fragment") {
+        Ok(x) => x,
+        Err(e) => "PARSE FAILED: ${e}",
+    }
+}
+
+fn called(name: string, args: string): Result<string, AiError> {
+    return toolbox_or_fail().call(name, args)
+}
+
+fn call_error(name: string, args: string): string {
+    match called(name, args) {
+        Ok(v) => {
+            assert(false, "`${name}(${args})` must not succeed, got ${v}")
+        },
+        Err(e) => {
+            return "${e}"
+        },
+    }
+    return ""
+}

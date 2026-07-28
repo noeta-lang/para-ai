@@ -4,7 +4,7 @@ An agent harness for Noeta: a **provider codec seam**, one run loop over `para/a
 
 The split that decides everything else: **a provider is a codec, not a client.** The thing that varies between model vendors is the wire format; auth headers, retries, timeouts, mocking, recording, and tracing are identical across all of them. So a `Provider` turns a neutral `ModelRequest` into a request description and a response body back into a neutral `ModelReply` — and never performs I/O. The transport is written once, over a `para.api.Api`, which means a 429 backoff is not para/ai code.
 
-> **Status: phase 1.** Core data model, the `Provider` seam, the Anthropic codec, the `Mock` provider, the non-streaming run loop, errors, and telemetry. Streaming, tools, MCP, guardrails, context strategies, structured output, AG-UI, and the OpenAI/Google/OpenRouter/Ollama codecs are later phases; [DESIGN.md](DESIGN.md) is the whole plan and §18 is the order. What is *not* here is not stubbed — it is absent, and the seams it will attach to are marked in the source.
+> **Status: phase 2.** Core data model, the `Provider` seam, the Anthropic codec, the `Mock` provider, the run loop, errors, telemetry — and **tool calling**: `#[Tool]`/`#[Arg]`, `Type` → JSON Schema, argument coercion, `invoke` dispatch, the trust-boundary role, and bounded concurrent dispatch inside a multi-turn loop. Streaming, MCP, guardrails, context strategies, structured output, AG-UI, and the OpenAI/Google/OpenRouter/Ollama codecs are later phases; [DESIGN.md](DESIGN.md) is the whole plan and §18 is the order. What is *not* here is not stubbed — it is absent, and the seams it will attach to are marked in the source.
 
 ## What it provides
 
@@ -12,8 +12,9 @@ The split that decides everything else: **a provider is a codec, not a client.**
 | --- | --- |
 | `para.ai` | `Agent`, `AgentConfig`, `Conversation`, `Run`, `Message`, `Part`, `Role`, `AiError` — the data model, the run loop, and the errors |
 | `para.ai.provider` | `Provider`, `ModelRequest`, `ModelReply`, `Delta`, `Usage`, `StopReason`, `Wire`, `Framing` — the codec seam and the delta accumulator |
+| `para.ai.tools` | `Tool`, `Arg`, `ToolSpec`, `ToolSource`, `Local`, `Toolbox`, `dispatch` — the signature-is-the-spec pipeline |
 | `para.ai.providers.anthropic` | `Anthropic` — the Anthropic Messages API codec |
-| `para.ai.mock` | `Mock`, `Scripted` — the hermetic test double, codec *and* transport |
+| `para.ai.mock` | `Mock`, `Scripted`, `ScriptedCall` — the hermetic test double, codec *and* transport |
 
 ## Installation
 
@@ -97,6 +98,150 @@ A completed run gives back more than the answer:
 pub struct Run { messages: List<Message>  usage: Usage  turns: int  stop: StopReason }
 ```
 
+## Tools: the function signature is the spec
+
+There is no tool-definition DSL, because the language already answers every question one would ask. Annotate an ordinary function:
+
+```noeta
+use para.ai.tools.{Tool, Arg, Local}
+
+#[Tool(about: "Current weather for a city")]
+fn weather(
+    #[Arg(help: "City name, e.g. 'Malmö'")] city: string,
+    #[Arg(help: "`metric` for °C or `imperial` for °F")] units: string = "metric",
+): Result<string, string> {
+    return Ok("18°C, clear in ${city}")
+}
+
+agent = Agent.from(cfg, provider).tools(Local.new())?
+echo agent.run_sync("What's the weather in Malmö?")?
+```
+
+The whole pipeline is four reflection primitives and no codegen:
+
+1. `attributes_of::<Tool>()` finds every `#[Tool]` in the program and its target name. Reflection is closed-world, so this crosses the package boundary: the query runs in para/ai, your tools live in your program, and it still sees them.
+
+   **One constraint worth knowing before you split your tools across files:** the program the query sees is the *linked* one, and linking is import-driven — a declaration in a sibling module that the entry file neither imports nor reaches is not merged in, so its `#[Tool]` is invisible. Keep your tools in the entry module, or `pub` them and `use` them by name from it:
+
+   ```noeta
+   use app.tools.{weather, distance_km}    // enough to link them; the query does the rest
+   ```
+
+2. `params_of(target)` gives each parameter's name, declared `Type`, whether it is `optional` (it declared a default), and its own `#[Arg]` metadata. That is the JSON Schema.
+3. The model's argument blob is decoded and each value coerced to the declared parameter type.
+4. `invoke(target, args)` calls it. It returns `Result<dyn, dyn>` and never aborts on a resolution failure.
+
+`weather`'s schema is derived, not written twice:
+
+```json
+{"additionalProperties":false,
+ "properties":{"city":{"description":"City name, e.g. 'Malmö'","type":"string"},
+               "units":{"description":"`metric` for °C or `imperial` for °F","type":"string"}},
+ "required":["city"],"type":"object"}
+```
+
+`#[Arg(help)]` becomes the parameter's `description`, which is the only place a model learns what a bare `string` is *for*. A parameter with a default is absent from `required`; so is an `?T`, because an omitted optional argument means `none`.
+
+### Tools are a trust boundary, and the package says so
+
+```noeta
+@attribute(Function, Method)
+@role(Semantic.TrustBoundary)
+pub struct Tool { about: string = ""  name: string = "" }
+```
+
+That one line turns "which functions in this program can a language model reach?" into a query rather than a code review:
+
+```noeta
+for r in roles_of::<Semantic>() {
+    match r.role {
+        Semantic.TrustBoundary => { echo r.target },   // noeta.tools.weather, …
+        _ => {},
+    }
+}
+```
+
+For a program where a model can call code, that is not a nicety; it is the review surface, and no other language's agent SDK can answer it without a bespoke linter. (Match the role rather than comparing it with `==`: the prelude `Semantic` enum has no expression form today — see [AGENTS.md](AGENTS.md).)
+
+### A failing tool is a turn, not an outage
+
+An unknown tool name, a missing argument, an argument that will not coerce, an unknown argument, and a tool that returns `Err` all become `Part.ToolResult(is_error: true)` fed back to the model, which then gets to try something else. That is the behavior that makes agents recover instead of stopping. A panic *inside* a tool body is still a panic, and that is correct: `invoke` catches by-name resolution, not the callee.
+
+The coercion layer is load-bearing here rather than a convenience. `invoke` validates a callable's **name and arity and nothing else**, so a string handed to an `int` parameter reaches the function body and aborts *there* — a crashed process, not a turn. Nothing reaches `invoke` that did not come through coercion first. Coercion is lenient in one direction only: `"5"` for an `int`, `5` for a `string`, and a whole `2.0` for an `int` are accepted, because models do that constantly; a fractional `2.5` for an `int` is refused, because that conversion loses information.
+
+### Schema derivation is total over the `Type` ADT
+
+| declared type | schema |
+| --- | --- |
+| `int` | `{"type":"integer"}` |
+| `float` | `{"type":"number"}` |
+| `bool` | `{"type":"boolean"}` |
+| `string` | `{"type":"string"}` |
+| `dyn` | `{}` — declared to accept anything, so the empty schema is the honest reading |
+| `List<T>` | `{"type":"array","items":…}` |
+| `Set<T>` | the same, plus `"uniqueItems":true` |
+| `Map<string, T>` | `{"type":"object","additionalProperties":…}` |
+| `?T` | `T`'s schema, and absent from `required` |
+| `A\|B` | `{"anyOf":[…]}` |
+
+Every remaining variant is a **loud, actionable message** naming the parameter, the type, and what to write instead — never an empty schema. `bytes`, `void`, `Result`, a function type, a `dyn Trait`, a `Map` not keyed by `string`, and the fixed-width numerics (`i32`, `f32`, `f64` in container position — their packed storage cannot be built from JSON) are all refused, and the refusal reaches you at `Toolbox` construction rather than at the first model call.
+
+Two nominal shapes get their own messages, because they are different gaps with different fixes:
+
+- **A struct or class parameter** — a nested-object schema is [DESIGN.md](DESIGN.md) §8.5's slice, closed by `@schema`. Declare its fields as separate parameters in the meantime.
+- **An enum parameter** — an enum's variants are not reflectable at runtime (there is no `variants_of` to mirror `field_specs_of`), so the `{"enum": […]}` §6 sketches cannot be derived today. Declare the parameter `string` and name the accepted values in `#[Arg(help: …)]` — which is what §6's own example does.
+
+### `ToolSource` and `Toolbox`
+
+Local `#[Tool]` functions and (from phase 6) an MCP server are the same thing to the agent:
+
+```noeta
+pub trait ToolSource {
+    fn source_name(): string                                        // "local" | "mcp:memory"
+    fn tool_type(): string                                          // gen_ai.tool.type
+    fn specs(): Result<List<ToolSpec>, AiError>
+    fn call(name: string, args: string): Result<string, AiError>
+}
+```
+
+`specs` returns a `Result` where [DESIGN.md](DESIGN.md) §6's sketch does not, and for the same reason `Provider.encode` does: a source has to be able to refuse what it cannot express, loudly, naming the offending part. An underivable schema is a bug in the tool, and reporting it as an empty schema would send a model arguments the function cannot accept.
+
+A `Toolbox` is every tool across every source. **A name collision is a construction-time error naming both sources**, never a last-one-wins — a silently shadowed tool is the kind of bug that shows up as a wrong answer three weeks later:
+
+```noeta
+box = Toolbox.of(Local.new())?.with(mcp)?     // Err naming both if a name repeats
+agent = Agent.from(cfg, provider).with_toolbox(box)
+```
+
+`agent.tools(src)` is the one-source shorthand and returns the same `Result`. A `Toolbox` holds `List<dyn ToolSource>`, so an agent with tools is `!Send` — the same trade `api`'s middleware stack already makes. Ship the `AgentConfig`, build the `Agent` per worker.
+
+Two smaller rules, both loud:
+
+- **A model-facing tool name defaults to the function's last name segment**, not its qualified reflection key: `#[Tool] fn weather` inside `namespace app.tools` is keyed `app.tools.weather` but offered as `weather`, because every vendor constrains a tool name to `[A-Za-z0-9_-]`. Two tools that shorten to the same name are refused at construction; `#[Tool(name: "…")]` breaks the tie.
+- **`#[Tool]` on a method is refused**, naming it. `invoke(name, args)` resolves top-level functions only and `Local` has no receiver to supply. `Method` stays in the attribute's target list because `invoke(recv, name, args)` can dispatch one and a future source over an object is a real shape — but an advertised tool that can never run would be worse than a refusal.
+
+### The loop
+
+When the model answers `ToolUse`, the run loop dispatches the requested calls, appends the results, and goes round again:
+
+```
+loop:
+  encode → send → decode
+  a refusal is AiError.Refused, immediately
+  append the assistant turn
+  if the model asked for no tools (or there is no toolbox): finish
+  dispatch the calls concurrently and bounded; append ONE tool turn with every result
+  bounded by AgentConfig.max_turns
+```
+
+Three properties are decisions:
+
+- **All the results ride one tool turn.** A message per result would produce consecutive same-role turns, which several vendors reject outright — and it would make it possible for a context strategy to split a `ToolCall` from its `ToolResult`, the single most common bug in hand-rolled trimming. One message makes that unrepresentable.
+- **Dispatch is concurrent and bounded**, over `std.task.map_bounded`, which gives per-item order and a concurrency cap for free. `AgentConfig.tool_concurrency` defaults to 4. Unbounded parallel dispatch is a good way to get rate-limited by your own agent: a model that asks for twelve web fetches should not open twelve sockets.
+- **`AgentConfig.max_turns` (default 8) is a hard rail, and exceeding it is `AiError.MaxTurns`** rather than a truncated `Ok`. A run that stops mid-loop has an assistant turn whose last word was a tool call nobody answered; handing that back as an answer is the silent-truncation failure §10 refuses for context strategies, for the same reason. (The `MaxTurns` *guard* of phase 5 is a different thing at a different layer — a policy a caller opts into, reported as `Guard(...)`. This is the loop's own rail, always on.)
+
+An agent with **no** toolbox that receives a tool-use stop finishes the run and hands the requested calls back in `Run.messages`, exactly as phase 1 did. That is the only behavior that cannot spin.
+
 ## Writing a provider
 
 A codec implements five functions and performs no I/O:
@@ -164,7 +309,20 @@ use para.ai.mock.Mock
 }
 ```
 
-`m.agent(cfg)` wires both halves in one call. `Scripted` covers the four things a turn can be — `reply_text`, `reply_tool`, `refuse`, `fail(status, code, message)` — and the script is consumed in order, one entry per model call. A run that outlasts its script gets a loud `mock_script_exhausted` error rather than a plausible-looking answer.
+`m.agent(cfg)` wires both halves in one call; `m.tool_agent(cfg, src)` does the same with a source of tools attached. `Scripted` covers the four things a turn can be — `reply_text`, `reply_tool` / `reply_tools`, `refuse`, `fail(status, code, message)` — and the script is consumed in order, one entry per model call. A run that outlasts its script gets a loud `mock_script_exhausted` error rather than a plausible-looking answer.
+
+`reply_tools` scripts **several calls in one turn**, which is what every current vendor actually emits and the only shape that exercises the concurrency bound:
+
+```noeta
+m = Mock.new()
+    .reply_tools([
+        ScriptedCall { id: "a", name: "weather", args: "{\"city\": \"Malmö\"}" },
+        ScriptedCall { id: "b", name: "distance_km", args: "{\"from\": \"Malmö\", \"to\": \"Lund\"}" },
+    ])
+    .reply_text("18°C in Malmö, and Lund is 18 km away.")
+```
+
+Nothing in the script says what the tools *return* — that comes from running the real functions, which is what makes a scripted tool test worth writing.
 
 Because `Mock` is the codec as well as the transport, **`calls()` records the bytes the codec actually produced** rather than a re-derivation of them — which is what makes "assert on what was sent" mean something:
 
@@ -186,7 +344,8 @@ pub enum AiError {
     Encode(provider: string, message: string)         // a codec cannot express part of the request
     Decode(path: string, message: string)             // a response body did not decode
     Refused(reason: string)                           // the model declined
-    Tool(name: string, message: string)               // phase 2
+    Tool(name: string, message: string)               // a tool could not be listed, or its schema not derived
+    MaxTurns(turns: int)                              // the run exceeded AgentConfig.max_turns
     ContextOverflow(needed: int, budget: int)         // phase 5
     Cancelled
 }
@@ -194,7 +353,7 @@ pub enum AiError {
 
 A language constraint shapes this: **a type carries at most one `From` impl** (a second is a coherence conflict). So `AiError` declares `impl From<HttpError>` — the conversion that appears at the most `?` sites — and `JsonError` is mapped explicitly at its handful of decode points into `Decode(path, message)`, preserving the path. That is a decision, not an omission.
 
-The `para/api` line holds: `Err` means the call failed, while an HTTP error *status* from a vendor is an answer.
+The `para/api` line holds: `Err` means the call failed, while an HTTP error *status* from a vendor is an answer. The same line runs through `Tool`: a tool that merely *fails* is not an `AiError` at all — it is a `ToolResult(is_error: true)` turn the model can recover from. `AiError.Tool` is for what the model cannot be asked to fix: an underivable schema, a name collision across sources, a source that could not be listed.
 
 `Guard(stage, guard, reason)` and `Mcp(server, code, message)` join the enum in phases 5 and 6, with the types they name.
 
@@ -208,13 +367,17 @@ Following the OpenTelemetry **GenAI semantic conventions, v1.37.0**:
 | --- | --- |
 | `invoke_agent {agent}` | `gen_ai.operation.name`, `gen_ai.agent.name`, `gen_ai.provider.name`, `gen_ai.request.model`, aggregate `gen_ai.usage.*`, `gen_ai.response.finish_reasons`, `para.ai.run.turns` |
 | `chat {model}` | `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.request.max_tokens`, `gen_ai.request.temperature`, `gen_ai.response.model`, `gen_ai.response.finish_reasons`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens` |
+| `execute_tool {name}` | `gen_ai.operation.name`, `gen_ai.tool.name`, `gen_ai.tool.call.id`, `gen_ai.tool.type` (`function` / `mcp`) |
 
 | metric | kind | attributes |
 | --- | --- | --- |
 | `gen_ai.client.token.usage` | histogram | `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.token.type` |
 | `gen_ai.client.operation.duration` | histogram (seconds) | the same, plus `error.type` on a failure |
+| `para.ai.tool.calls` | counter | `gen_ai.tool.name`, `para.ai.tool.outcome` (`ok` / `error`) |
 
-`execute_tool {name}`, `para.ai.tool.calls`, and `para.ai.guard.denials` arrive with phases 2 and 5.
+`para.ai.guard.denials` arrives with phase 5.
+
+**Tool dispatch is instrumented in the run loop, not at the tool.** A `#[Tool]` function contains zero telemetry code and still shows up as a span of the model call that requested it, with its outcome on the counter. That is the whole reason dispatch is the instrumentation point.
 
 Three commitments:
 
@@ -224,13 +387,14 @@ Three commitments:
 
 ## What the run loop does today
 
-`run(conv)` performs **exactly one model call**. The only thing that continues a loop is a tool-use stop, and phase 1 sends no tools. When the model *does* answer `ToolUse` — a scripted `Mock`, or a vendor that volunteers one — the run finishes and hands the requested calls back in `Run.messages` rather than spinning against a dispatcher that does not exist yet. Phase 2 replaces that arm with dispatch-and-continue, and that is also where the guard stages and the context strategy attach.
+`run(conv)` calls the model, and keeps calling while the model asks for tools — see [The loop](#the-loop) above for the shape and the three decisions in it. The guard stages and the context strategy attach to the same loop in phase 5; phase 3 replaces the single `call` with a fold over `stream`.
 
 `run` is `async` and `run_sync` is not. That is deliberate in both directions: phase 3's streaming makes `run` genuinely async — its body becomes a fold over `stream` — and a caller written today should not have to change then; while `run_sync(text) -> Result<string, AiError>` stays synchronous because a plain string-in/string-out entry point is what makes a framework testable from an ordinary `fn`. In phase 1 the work inside is synchronous, because `para/api`'s transport is.
 
 ## Examples
 
 - [`examples/ask/`](examples/ask) — one question, one answer: the runtime-provider `match`, the config/agent split, and a hermetic `@test` block over `Mock`.
+- [`examples/tools/`](examples/tools) — a full multi-turn tool loop: two `#[Tool]` functions, a scripted parallel tool turn, the exact derived JSON Schema, a failing tool that becomes a recoverable turn, and the `roles_of::<Semantic>()` query. Hermetic, no key.
 
 The design's other examples (`chat-cli`, `agui-server`, `mcp-memory`, `structured`, `local-ollama`) arrive with the phases they exercise.
 
@@ -240,7 +404,7 @@ The `noeta` toolchain, and `para/api` (declared as a path dependency during pre-
 
 ## Development
 
-`examples/ask` is its own small package depending on this repo by path; run `noeta check` / `noeta test` there and at the repo root. See [AGENTS.md](AGENTS.md) for the repo layout and the toolchain-composition note.
+Each directory under `examples/` is its own small package depending on this repo by path; run `noeta check` / `noeta test` there and at the repo root. See [AGENTS.md](AGENTS.md) for the repo layout and the toolchain-composition note.
 
 ## License
 
