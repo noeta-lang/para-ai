@@ -277,8 +277,7 @@ pub struct Run {
 // from a vendor is an answer — decoded into `Provider(status, code, message)` with the vendor's own
 // typed error body, so `code == "rate_limit_error"` is matchable and nobody has to regex a message.
 //
-// `Guard(stage, guard, reason)` and `Mcp(server, code, message)` join this enum in phases 5 and 6,
-// with the types they name.
+// `Guard(stage, guard, reason)` joins this enum in phase 5, with the type it names.
 @derive(Error)
 pub enum AiError {
     // The request never produced a response — the network broke.
@@ -297,6 +296,17 @@ pub enum AiError {
     // name collision across sources, a source that could not be listed. A tool that merely *fails*
     // is not this — it is a `ToolResult(is_error: true)` turn, and the model gets to try again.
     Tool(name: string, message: string)
+    // An MCP **server** failed as a server: it would not start, it exited, it broke the protocol, it
+    // was asked for a capability it never advertised, or its session ended. `server` is the source
+    // name a `Toolbox` collision message would print (`mcp:memory`), and `code` is one of a fixed,
+    // low-cardinality set (`spawn`, `server_exited`, `eof`, `timeout`, `protocol`, `capability`,
+    // `http_status`, `session_expired`, `read_budget`, `closed`, `sampling`) so it is matchable and
+    // safe as a metric attribute.
+    //
+    // A *tool* that fails on an MCP server is `Tool(name, message)`, exactly as a local one is —
+    // the model gets a `ToolResult(is_error: true)` turn either way. This variant is the layer
+    // underneath that: the thing the model cannot be asked to work around.
+    Mcp(server: string, code: string, message: string)
     // The run asked for more model calls than `AgentConfig.max_turns` allows.
     //
     // An error rather than a truncated `Ok`: a run that stops mid-tool-loop has an assistant turn
@@ -320,6 +330,7 @@ pub enum AiError {
                 AiError.Decode(path, message) => if path == "" then "decode failed: ${message}" else "decode failed at ${path}: ${message}",
                 AiError.Refused(reason) => "the model refused: ${reason}",
                 AiError.Tool(name, message) => if name == "" then "tool call failed: ${message}" else "tool `${name}` failed: ${message}",
+                AiError.Mcp(server, code, message) => "mcp server `${server}` failed (${code}): ${message}",
                 AiError.MaxTurns(turns) => "the run reached its ${turns}-turn limit with the model still asking for tools — raise `AgentConfig.max_turns` if the task genuinely needs more",
                 AiError.ContextOverflow(needed, budget) => "context overflow: ${needed} tokens needed, budget is ${budget} — configure a context strategy",
                 AiError.Cancelled => "cancelled",
@@ -1259,6 +1270,9 @@ fn error_type(e: AiError): string {
         AiError.Decode(path, m) => "decode",
         AiError.Refused(reason) => "refusal",
         AiError.Tool(name, m) => "tool",
+        // The code is one of a fixed set, so it stays low-cardinality — and "the server exited"
+        // and "the server broke the protocol" are different operational problems.
+        AiError.Mcp(server, code, m) => if code == "" then "mcp" else "mcp_${code}",
         AiError.MaxTurns(turns) => "max_turns",
         AiError.ContextOverflow(needed, budget) => "context_overflow",
         AiError.Cancelled => "cancelled",
@@ -1536,6 +1550,16 @@ fn refusal_text(reply: ModelReply): string {
         assert(error_type(AiError.Provider(status: 503, code: "", message: "upstream said no")) == "503")
         assert(error_type(AiError.Decode(path: "a.b", message: "nope")) == "decode")
         assert(error_type(AiError.Refused(reason: "policy")) == "refusal")
+    }
+
+    // The phase-6 variant. A *server* failure, not a tool failure — and it names which server, so a
+    // run with two MCP sources attached says which of them stopped answering. The class rides in
+    // `code`, drawn from a fixed set, which is what keeps it usable as a metric attribute.
+    fn an_mcp_failure_names_the_server_and_its_class(): void {
+        assert("${AiError.Mcp(server: "mcp:memory", code: "server_exited", message: "exit status 1")}"
+            == "mcp server `mcp:memory` failed (server_exited): exit status 1")
+        assert(error_type(AiError.Mcp(server: "mcp:memory", code: "timeout", message: "no reply")) == "mcp_timeout")
+        assert(error_type(AiError.Mcp(server: "mcp:memory", code: "", message: "no reply")) == "mcp")
     }
 
     fn message_capture_is_off_unless_the_standard_env_var_says_otherwise(): void {

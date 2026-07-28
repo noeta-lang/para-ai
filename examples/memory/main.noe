@@ -1,0 +1,218 @@
+// Memory, as an MCP server — the whole of DESIGN §1's last row in one file.
+//
+// **para/ai ships no memory.** No store, no embedder, no recall heuristic, no `para.ai.memory`
+// module. What it ships is an MCP client, and memory is a server you point it at — swappable,
+// inspectable, and shared with every other agent you run. `memory-server.sh` next to this file is
+// one such server in sixty lines of shell; a vector database or your team's wiki would plug in at
+// exactly the same seam, and this file would not change.
+//
+// Three things worth watching:
+//
+//   * **The agent's whole tool vocabulary came from a subprocess.** There is not one `#[Tool]` in
+//     this program — the last test asserts that from the trust-boundary index — and yet the model
+//     has two tools it can call. `McpClient` is a `ToolSource`, so a server's tools and local
+//     `#[Tool]` functions are the same thing to an `Agent`: same toolbox, same collision check,
+//     same dispatch, same `ToolResult` turns, and the same guard stage when phase 5 lands.
+//   * **This is the zero-configuration path.** The agent is simply *told* the memory tools exist
+//     and calls them itself. That needs no `Recall` guard and no framework support at all: it is a
+//     system prompt and a `ToolSource`. Phase 5's `Recall` guard automates the recall half for
+//     callers who would rather not rely on the model remembering to look; both paths use this same
+//     client, and neither is memory living inside para/ai.
+//   * **Nothing is auto-injected.** The client can list and read a server's *resources*, and this
+//     example deliberately does not put any of them in the context. Auto-injection is how context
+//     windows quietly fill up, so it stays the caller's decision.
+//
+//     ANTHROPIC_API_KEY=sk-... noeta run  main.noe    # a real two-turn memory loop
+//     noeta run  main.noe                             # no key: the model turns come from the mock,
+//                                                     # and the memory server is real either way
+//     noeta test main.noe                             # the assertions
+namespace noeta.memory
+
+use std.{env, io, os}
+use std.id.{uuid}
+use para.ai.{Agent, AgentConfig, AiError, Conversation}
+use para.ai.mcp.{McpClient, Stdio}
+use para.ai.mock.{Mock, ScriptedCall}
+use para.ai.providers.anthropic.Anthropic
+use para.ai.tools.{Toolbox}
+
+// --- The memory server ------------------------------------------------------------------------------
+
+// Where the facts live. A path per process, so running the example twice does not accumulate one
+// long-lived pile — a real deployment points this at something durable, which is the point.
+fn store_path(): string {
+    return "${env.get("TMPDIR") ?? "/tmp"}/para-ai-memory-${uuid()}.db"
+}
+
+// Start the memory server and complete the MCP handshake.
+//
+// `connect` spawns it, sends `initialize`, negotiates capabilities, tells it the handshake is done,
+// and lists its tools — so a client that comes back is one an agent can use, and a server that is
+// broken says so here rather than at the first model call.
+fn memory(store: string): Result<McpClient, AiError> {
+    return McpClient.connect(Stdio.new("sh", ["${os.cwd()}/memory-server.sh", store]))
+}
+
+// --- The agent ---------------------------------------------------------------------------------------
+
+// The system prompt *is* the memory policy on this path. Nothing in the framework decides when to
+// remember or recall; the model does, from this instruction and the tool descriptions the server
+// wrote.
+fn config(): AgentConfig {
+    return AgentConfig.new("claude-opus-5")
+        .with_system("You have a memory server. Call `recall` before answering anything about the user, and `remember` whenever they tell you something worth keeping. Answer in one sentence.")
+        .with_max_tokens(512)
+        .with_max_turns(6)
+        .named("memory")
+}
+
+// Two scripted turns: the model stores what it was told, then confirms.
+fn offline_remember(fact: string): Mock {
+    return Mock.new()
+        .reply_tool("call_1", "remember", "{\"fact\": \"${fact}\"}")
+        .reply_text("Noted.")
+}
+
+// And two more: the model looks the subject up, then answers from what came back.
+fn offline_recall(about: string): Mock {
+    return Mock.new()
+        .reply_tool("call_2", "recall", "{\"about\": \"${about}\"}")
+        .reply_text("You take your coffee black.")
+}
+
+// The runtime-selection `match`, pushed to the outermost point where the arms still agree —
+// `Agent<Anthropic>` and `Agent<Mock>` are different types, and `run_sync` is not.
+//
+// The memory client is the same object in both arms: the *model* is mocked when there is no API
+// key, and the memory server is a real subprocess regardless.
+fn ask(mem: McpClient, m: Mock, text: string): Result<string, AiError> {
+    live = env.get("AI_PROVIDER") == some("anthropic") || env.get("ANTHROPIC_API_KEY") != none
+    return match live {
+        true => Agent.from(config(), Anthropic.from_env() ?? Anthropic.new("")).tools(mem)?.run_sync(text),
+        false => m.agent(config()).tools(mem)?.run_sync(text),
+    }
+}
+
+// The demo: one session, two turns, one server. The fact crosses between them through the *server*,
+// not through the conversation — the second run is a fresh `Conversation` with no memory of the
+// first in it at all.
+fn demo(): Result<string, AiError> {
+    mem = memory(store_path())?
+    stored = ask(mem, offline_remember("Niklas takes his coffee black"), "Remember that I take my coffee black.")?
+    recalled = ask(mem, offline_recall("coffee"), "How do I take my coffee?")?
+    mem.close()
+    return Ok("${stored}\n${recalled}")
+}
+
+// `noeta test` never runs top-level statements, so this is the entry point only.
+io.outln(match demo() {
+    Ok(both) => both,
+    Err(e) => "error: ${e}",
+})
+
+@test {
+    // The agent's whole vocabulary came from a subprocess, and it is an ordinary toolbox: the same
+    // names, the same specs, the same `call`. The only difference a consumer can see is
+    // `tool_type`, which is what the GenAI telemetry reports.
+    fn the_agents_vocabulary_is_the_memory_servers_tools(): void {
+        mem = memory_or_fail()
+        box = toolbox_or_fail(mem)
+        assert(box.names() == ["remember", "recall"], "${box.names()}")
+        assert(box.tool_type("remember") == "mcp", box.tool_type("remember"))
+        assert(mem.server_name() == "mcp:memory", mem.server_name())
+        // The schema the model is shown is the *server's* own, passed through rather than derived —
+        // this process cannot see the function behind it.
+        assert(box.specs()[0].parameters.contains("\"required\":[\"fact\"]"), box.specs()[0].parameters)
+        mem.close()
+    }
+
+    // The point of the example: a fact learned in one run is available in the next, because it left
+    // the process. The second conversation contains no mention of coffee — only the recall result
+    // the server produced does.
+    fn a_fact_survives_between_runs_because_it_left_the_process(): void {
+        mem = memory_or_fail()
+        first = offline_remember("Niklas takes his coffee black")
+        assert(ask(mem, first, "Remember that I take my coffee black.") == Ok("Noted."))
+
+        second = offline_recall("coffee")
+        assert(ask(mem, second, "How do I take my coffee?") == Ok("You take your coffee black."))
+        // The tool result in the second run's second model call is what the *server* answered, so
+        // this asserts the round trip and not the script.
+        answered = second.calls()[1]
+        assert(answered.contains("Niklas takes his coffee black"), answered)
+        assert(answered.contains("\"role\":\"tool\""), answered)
+        mem.close()
+    }
+
+    // A tool the server does not have is a failed turn carrying the server's own words, exactly as
+    // a local tool's `Err` is. Nothing about MCP makes a failure special.
+    fn a_memory_tool_that_fails_is_a_turn_not_an_outage(): void {
+        mem = memory_or_fail()
+        box = toolbox_or_fail(mem)
+        match box.call("forget_everything", "{}") {
+            Ok(text) => {
+                assert(false, "there is no such tool: ${text}")
+            },
+            Err(e) => {
+                assert("${e}".contains("no such tool"), "${e}")
+            },
+        }
+        mem.close()
+    }
+
+    // **This program declares no tools at all.** The trust-boundary index — the same query a
+    // reviewer runs to ask "what can a model reach here?" — is empty, and the model still has two
+    // tools. That is what "memory is a server, not a subsystem" buys, and it is also why the index
+    // matters: the answer to "what can the model reach?" is now "whatever `mcp:memory` offers",
+    // which is a question you ask the *server*.
+    fn this_program_declares_no_tools_of_its_own(): void {
+        mut reachable: List<string> = []
+        for r in roles_of::<Semantic>() {
+            if r.role == Semantic.TrustBoundary {
+                reachable = reachable ~ [r.target]
+            }
+        }
+        assert(reachable == [], "a consumer of para/ai inherits no tools from it: ${reachable}")
+    }
+
+    // Closing is deterministic and the session stays closed — a later call answers rather than
+    // blocking on a server that is gone.
+    fn closing_the_server_is_deterministic(): void {
+        mem = memory_or_fail()
+        mem.close()
+        assert(mem.is_closed())
+        match mem.call("recall", "{\"about\": \"coffee\"}") {
+            Ok(text) => {
+                assert(false, "a closed session has nowhere to send this: ${text}")
+            },
+            Err(e) => {
+                assert("${e}".contains("closed"), "${e}")
+            },
+        }
+    }
+}
+
+// Unwrap-or-fail, out here because a `match` arm cannot both fail an assertion and produce a value.
+fn memory_or_fail(): McpClient {
+    match memory(store_path()) {
+        Ok(mem) => {
+            return mem
+        },
+        Err(e) => {
+            assert(false, "the memory server did not start: ${e}")
+        },
+    }
+    return McpClient.unstarted()
+}
+
+fn toolbox_or_fail(mem: McpClient): Toolbox {
+    match Toolbox.of(mem) {
+        Ok(box) => {
+            return box
+        },
+        Err(e) => {
+            assert(false, "building the toolbox failed: ${e}")
+        },
+    }
+    return Toolbox.new()
+}
