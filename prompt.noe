@@ -1,0 +1,308 @@
+// `para.ai.prompt` — the `@prompt` expression tier, and the split that makes prompt caching free.
+//
+// Noeta's **expression tiers** turn a `@name { … }` block into a typed value: the body is verbatim
+// foreign text, the `${…}` holes are parsed by the full grammar, close over the enclosing scope,
+// and type-check, and the block desugars to an ordinary call to this module's `render` with the
+// body's pieces. Three things fall out, and only the first two are about ergonomics:
+//
+//   1. **A malformed prompt variable is a compile error pointing inside the prompt.** `${acount}`
+//      for `${account}` is E0007 at that column, not a `${undefined}` that reaches a model.
+//   2. **Holes are thunks.** `render` receives `List<() -> string>`, so *whether and when* a hole
+//      evaluates is this module's choice — and `Prompt` chooses not to, until asked. Reading a
+//      prompt's cache prefix (`stable()`) evaluates **no** holes at all, so the expensive recall in
+//      `${memory.recall(q)}` does not run to answer "what can be cached?".
+//   3. **Statics always number holes + 1.** The prompt therefore arrives *pre-split into its stable
+//      and its volatile part*: everything before the first hole is fixed text the author wrote, and
+//      everything from the first hole on varies per call. That is exactly the input a prompt cache
+//      wants, and it is why `Prompt` keeps the pieces rather than concatenating them — the moment a
+//      prompt becomes one string the split is gone and this whole module is sugar over `"…${x}…"`.
+//
+// The third is the one that cannot be ported. In every other language a prompt is an opaque string
+// by the time an SDK sees it, so a framework that wants to place a cache breakpoint has to guess at
+// one, ask the user to mark one, or skip caching. Here the boundary is a fact the compiler already
+// computed, so `para.ai` can place it automatically: Anthropic gets an explicit `cache_control`
+// marker on the last stable content block, and OpenAI and Google — which cache implicitly on an
+// exact prefix match — get the stable text first and byte-identical across calls.
+//
+// **This module deliberately imports nothing from the rest of the package.** A `Prompt` knows about
+// text and thunks and nothing about messages, roles, or providers; `para.ai` owns the conversion
+// (`prompt_turns`) and `para.ai.providers.*` owns the vendor spelling. That keeps the dependency
+// one-way — `ai.noe` imports this, never the reverse.
+//
+//     use para.ai.prompt.render                 // one import brings the tier into existence
+//
+//     sys = @prompt {
+//         You are a support agent for ${company.name}.
+//         The customer's plan is ${account.plan}.
+//     }
+namespace para.ai.prompt
+
+// --- The tier -------------------------------------------------------------------------------------
+
+// A `@prompt { … }` block, as a value: the literal text the author wrote, split at every `${…}`,
+// with the holes still **unevaluated**.
+//
+// `statics.len() == holes.len() + 1` always — the compiler guarantees it, including the empty
+// statics where two holes touch — so the two lists interleave deterministically: `statics[0]`,
+// `holes[0]`, `statics[1]`, `holes[1]`, … , `statics[n]`.
+//
+// There is no `@derive` here and there cannot be: a field of function type is neither `Equatable`
+// nor `Display`. That is the trade for laziness, and it is why `resolve()` exists — a `Resolved` is
+// a plain value struct that derives both, and it is what the rest of the package stores.
+pub struct Prompt {
+    pub statics: List<string>
+    pub holes: List<() -> string>
+
+    // A prompt with no holes, from ordinary text — the door a plain `string` comes through, so that
+    // `AgentConfig.with_system("…")` and `.with_system_prompt(@prompt { … })` end up in exactly one
+    // representation instead of two code paths.
+    fn of(text: string): Prompt {
+        return Prompt { statics: [text], holes: [] }
+    }
+
+    // Whether this prompt interpolates nothing. Such a prompt is stable in its entirety, which is
+    // the *maximal* cache prefix — the best case, not a degenerate one.
+    fn is_static(): bool {
+        return self.holes.len() == 0
+    }
+
+    // The longest prefix of this prompt that cannot vary between calls: the text before the first
+    // hole, or the whole body when there is no hole.
+    //
+    // **This evaluates no holes.** It is a read of `statics[0]`, which is why a cache decision
+    // costs nothing even when the prompt interpolates a database read.
+    fn stable(): string {
+        return self.statics.first() ?? ""
+    }
+
+    // Evaluate every hole, **once each, in order**, and keep the result split.
+    //
+    // Once rather than once-per-use is the contract callers depend on: a hole that reads a clock or
+    // a counter must contribute the same text to every turn of a run, or the stable prefix stops
+    // being byte-identical and implicit prefix caching silently stops matching. `AgentConfig`
+    // resolves at configuration time for exactly that reason.
+    fn resolve(): Resolved {
+        mut values: List<string> = []
+        for h in self.holes {
+            values = values ~ [h()]
+        }
+        return Resolved { statics: self.statics, holes: values }
+    }
+
+    // The whole prompt as text, holes evaluated. The escape hatch for a caller who wants a plain
+    // string and is giving up the cache split to get it.
+    fn text(): string {
+        return self.resolve().text()
+    }
+
+    // The same prompt with the whitespace around the block's braces removed — `\n` and indentation
+    // that came from writing
+    //
+    //     @prompt {
+    //         You are …
+    //     }
+    //
+    // rather than from the author's intent. Only the outer edges go: interior layout is content.
+    //
+    // A combinator rather than something `render` does, because the tier's contract is that the
+    // body is *verbatim* and a handler that quietly rewrote it would be lying about the bytes a
+    // vendor's cache is keyed on. Trimming stays lazy — it rewrites statics and never calls a hole.
+    fn trimmed(): Prompt {
+        n = self.statics.len()
+        if n == 0 {
+            return self
+        }
+        if n == 1 {
+            return Prompt { ...self, statics: [self.statics[0].trim()] }
+        }
+        edged = self.statics.set(0, self.statics[0].trim_start())
+        return Prompt { ...self, statics: edged.set(n - 1, edged[n - 1].trim_end()) }
+    }
+}
+
+// A `Prompt` whose holes have been evaluated, with the split intact: `holes[i]` is the text
+// `statics[i]` is followed by.
+//
+// Keeping the two lists rather than one string is the entire point of the tier. A `Resolved` is a
+// plain value struct — `Send`, `Equatable`, `Display` — so it is what `AgentConfig` stores and what
+// crosses a channel to a worker, and it still knows where the cache breakpoint goes.
+@derive(Equatable, Display)
+pub struct Resolved {
+    pub statics: List<string>
+    pub holes: List<string>
+
+    fn of(text: string): Resolved {
+        return Resolved { statics: [text], holes: [] }
+    }
+
+    fn is_static(): bool {
+        return self.holes.len() == 0
+    }
+
+    // Everything before the first hole — the text a prompt cache may keep.
+    fn stable(): string {
+        return self.statics.first() ?? ""
+    }
+
+    // Everything from the first hole on, interleaved back together. Stable *text* appears in here
+    // too (`statics[1]` and after), and that is correct rather than sloppy: a cache prefix has to
+    // be contiguous, so a static that sits behind a hole cannot be part of it.
+    fn volatile(): string {
+        mut out = ""
+        mut i = 0
+        for h in self.holes {
+            out = out ~ h
+            i = i + 1
+            if i < self.statics.len() {
+                out = out ~ self.statics[i]
+            }
+        }
+        return out
+    }
+
+    fn text(): string {
+        return self.stable() ~ self.volatile()
+    }
+}
+
+// The tier's handler, and the reason `@prompt { … }` is an expression at all.
+//
+// `@tier(prompt, …)` names the block syntax, `text: "markdown"` is the body's language — it drives
+// editor highlighting and the LSP's hover (`expression tier @prompt — markdown body, evaluates to
+// Prompt`) for every consumer, from one declaration — and `expr: Prompt` is the block's type.
+//
+// The handler does not touch a hole. That is deliberate and load-bearing: `render` is the last
+// place laziness could be thrown away, and a handler that concatenated here would evaluate a
+// memory recall to build a value nobody may end up sending.
+@tier(prompt, text: "markdown", expr: Prompt)
+pub fn render(statics: List<string>, holes: List<() -> string>): Prompt {
+    return Prompt { statics: statics, holes: holes }
+}
+
+@test {
+    // The decomposition itself, asserted exactly. If this drifts, everything downstream — the cache
+    // breakpoint, the byte-identical prefix — drifts with it silently.
+    fn a_prompt_arrives_split_at_its_holes(): void {
+        company = "Acme"
+        plan = "pro"
+        p = @prompt { You work for ${company}. The plan is ${plan}. }
+
+        assert(p.statics == [" You work for ", ". The plan is ", ". "], "${p.statics}")
+        assert(p.holes.len() == 2, "two holes, one per `\${…}`")
+        assert(p.statics.len() == p.holes.len() + 1, "statics always number holes + 1")
+
+        r = p.resolve()
+        assert(r.holes == ["Acme", "pro"], "${r.holes}")
+        assert(r.stable() == " You work for ", "[${r.stable()}]")
+        assert(r.volatile() == "Acme. The plan is pro. ", "[${r.volatile()}]")
+        assert(r.text() == " You work for Acme. The plan is pro. ", "[${r.text()}]")
+    }
+
+    // A hole records that it ran, and the assertions say when it did not. This is the whole of
+    // point 2: reading the cache prefix off a prompt does not pay for the interpolation.
+    fn a_hole_evaluates_only_when_something_asks_for_it(): void {
+        spy = Spy.new()
+        p = @prompt { A long stable preamble. Recalled: ${spy.read()} }
+
+        assert(spy.reads == 0, "building the prompt evaluated a hole (${spy.reads})")
+        assert(p.stable() == " A long stable preamble. Recalled: ", "[${p.stable()}]")
+        assert(spy.reads == 0, "stable() evaluated a hole (${spy.reads})")
+        assert(p.is_static() == false, "one hole is not static")
+        assert(p.trimmed().stable() == "A long stable preamble. Recalled: ", "[${p.trimmed().stable()}]")
+        assert(spy.reads == 0, "trimmed() evaluated a hole (${spy.reads})")
+
+        r = p.resolve()
+        assert(spy.reads == 1, "resolve() calls each hole exactly once (${spy.reads})")
+        assert(r.holes == ["<recalled>"], "${r.holes}")
+        // And the resolved value is a value: reading it again costs nothing.
+        assert(r.text() == " A long stable preamble. Recalled: <recalled> ", "[${r.text()}]")
+        assert(r.volatile() == "<recalled> ", "[${r.volatile()}]")
+        assert(spy.reads == 1, "reading a `Resolved` re-evaluated a hole (${spy.reads})")
+    }
+
+    // A prompt that interpolates nothing is the best case for a cache, not a special case: the
+    // whole body is the prefix.
+    fn a_static_prompt_is_entirely_stable(): void {
+        p = @prompt { Answer in one sentence. }
+        assert(p.is_static())
+        assert(p.holes.len() == 0)
+        assert(p.statics == [" Answer in one sentence. "], "${p.statics}")
+        assert(p.stable() == " Answer in one sentence. ")
+
+        r = p.resolve()
+        assert(r.is_static())
+        assert(r.volatile() == "", "a static prompt has no volatile tail")
+        assert(r.text() == r.stable(), "the maximal prefix is the whole prompt")
+    }
+
+    // A plain string enters through the same door, so there is one representation rather than two.
+    fn a_plain_string_is_a_static_prompt(): void {
+        p = Prompt.of("You are terse.")
+        assert(p.is_static())
+        assert(p.stable() == "You are terse.")
+        assert(p.resolve() == Resolved.of("You are terse."), "${p.resolve()}")
+    }
+
+    // A hole at the very start leaves nothing in front of it. The prompt still works; it just has
+    // no cache prefix to offer, which is a thing `para.ai` has to notice rather than mark an empty
+    // block.
+    fn a_leading_hole_leaves_no_stable_prefix(): void {
+        who = "Ada"
+        p = @prompt {${who} is asking.}
+        assert(p.statics == ["", " is asking."], "${p.statics}")
+        assert(p.stable() == "", "a leading hole leaves no prefix")
+        assert(p.resolve().text() == "Ada is asking.")
+    }
+
+    // Adjacent holes produce an empty static between them — the guarantee is `holes + 1` statics,
+    // not `holes + 1` *non-empty* statics.
+    fn touching_holes_leave_an_empty_static_between_them(): void {
+        a = "one"
+        b = "two"
+        p = @prompt { ${a}${b} }
+        assert(p.statics == [" ", "", " "], "${p.statics}")
+        assert(p.resolve().text() == " onetwo ")
+    }
+
+    // Trimming is an edge operation: it removes what the braces added and leaves the body's own
+    // layout alone.
+    fn trimming_removes_the_block_edges_and_nothing_else(): void {
+        x = "X"
+        p = @prompt {
+            first
+            ${x}
+            last
+        }
+        t = p.trimmed()
+        assert(t.stable() == "first\n            ", "[${t.stable()}]")
+        assert(t.resolve().text() == "first\n            X\n            last", "[${t.resolve().text()}]")
+
+        s = @prompt {   only static   }.trimmed()
+        assert(s.stable() == "only static", "a one-static prompt trims both ends: [${s.stable()}]")
+    }
+
+    // A hand-built `Resolved` interleaves the same way a rendered one does — the shape is the
+    // contract, not an artifact of how the tier happened to fill it.
+    fn a_resolved_prompt_interleaves_by_position(): void {
+        r = Resolved { statics: ["a", "b", "c"], holes: ["1", "2"] }
+        assert(r.stable() == "a")
+        assert(r.volatile() == "1b2c")
+        assert(r.text() == "a1b2c")
+    }
+
+    // A counter with identity, so a thunk can record that it ran. A `class` rather than a struct
+    // because a hole closes over the *binding*, and only a reference type lets the assertion
+    // afterwards see what the closure did.
+    class Spy {
+        mut reads: int
+
+        fn new(): Spy {
+            return Spy { reads: 0 }
+        }
+
+        fn read(): string {
+            self.reads = self.reads + 1
+            return "<recalled>"
+        }
+    }
+}

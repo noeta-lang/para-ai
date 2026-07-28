@@ -30,6 +30,12 @@ use std.{env, metrics, time, tracing}
 use para.api.Api
 use para.api.middleware.Retry
 use para.ai.provider.{Delta, ModelRequest, ModelReply, Provider, StopReason, StreamDecoder, Usage, Wire, fold}
+// The `@prompt` tier's value types by name, for the same reason `uuid` is: a whole-module
+// `use para.ai.prompt` would bind `prompt` as a local, and this file is full of bindings that want
+// that word. Importing the types does **not** bring the tier into a consumer's file — a consumer
+// writing `@prompt { … }` imports `para.ai.prompt.render` itself, which is the one line that
+// declares the block syntax exists.
+use para.ai.prompt.{Prompt, Resolved}
 use para.ai.tools
 use para.ai.tools.{Toolbox, ToolSource}
 
@@ -78,6 +84,18 @@ pub struct Message {
     pub role: Role
     pub parts: List<Part>
     pub name: ?string = none
+    // "Everything up to and including this turn may be served from the vendor's prompt cache."
+    //
+    // A **hint**, exactly like `name`: a codec whose vendor has no explicit breakpoint (OpenAI and
+    // Google cache implicitly, on an exact prefix match) ignores it and still produces a correct
+    // request, while Anthropic's codec turns it into `cache_control` on this turn's last content
+    // block. It sits on the message rather than on a `Part` because that is the granularity a
+    // breakpoint is *placed* at — and `prompt_turns` gives a `@prompt`'s stable prefix a turn of
+    // its own precisely so message granularity is enough.
+    //
+    // Defaulted to `false`, so nothing that builds a `Message` today changes, and meaningless on a
+    // message that came *back* from a model — a reply is not a request.
+    pub cache_breakpoint: bool = false
 
     fn system(text: string): Message {
         return Message { role: Role.System, parts: [Part.Text(text: text)] }
@@ -114,6 +132,13 @@ pub struct Message {
         return out
     }
 
+    // The same turn, marked as the end of a cacheable prefix. The hand door: `AgentConfig` marks
+    // the system prompt's stable part for you, and this is how a caller marks a long stable context
+    // turn of their own — a retrieved corpus, a code base, a transcript.
+    fn cached(): Message {
+        return Message { ...self, cache_breakpoint: true }
+    }
+
     // Every tool call this message requests, in order. Empty unless the model asked for one.
     fn tool_calls(): List<Part> {
         mut out: List<Part> = []
@@ -127,6 +152,34 @@ pub struct Message {
         }
         return out
     }
+}
+
+// The turns a resolved `@prompt` becomes — **the one place the language's split turns into wire
+// shape**, and the reason this package can place a cache breakpoint that other frameworks cannot.
+//
+// A prompt with holes becomes *two* turns of the same role: its stable prefix, then its volatile
+// tail. Two turns rather than one turn with two parts because a vendor's breakpoint attaches to a
+// content block and the cached prefix ends where that block ends — so the stable text has to be a
+// block of its own or the boundary lands in the wrong place. Codecs already merge adjacent turns of
+// one wire role, so the split costs nothing on the wire: Anthropic sees two `system` blocks, an
+// OpenAI-shaped codec sees one merged turn whose text is byte-identical to the unsplit version.
+//
+// `mark` places the breakpoint on the stable turn. It is skipped when there is nothing worth
+// marking: a prompt whose first hole is at the start (or after nothing but whitespace) has no
+// prefix to cache, and marking an empty content block is a vendor error rather than a free win.
+//
+// A prompt with **no** holes is one marked turn — the maximal prefix, which is the best case.
+pub fn prompt_turns(role: Role, r: Resolved, mark: bool): List<Message> {
+    stable = r.stable()
+    volatile = r.volatile()
+    if stable.trim() == "" {
+        return [Message { role: role, parts: [Part.Text(text: stable ~ volatile)] }]
+    }
+    head = Message { role: role, parts: [Part.Text(text: stable)], cache_breakpoint: mark }
+    if volatile == "" {
+        return [head]
+    }
+    return [head, Message { role: role, parts: [Part.Text(text: volatile)] }]
 }
 
 // A conversation, as a value. Immutable: every builder returns a new `Conversation`, so a prefix
@@ -158,6 +211,29 @@ pub struct Conversation {
 
     fn system(text: string): Conversation {
         return self.with(Message.system(text))
+    }
+
+    // Append a `@prompt { … }` block as a turn — the same door `with` is, for a value that arrived
+    // with its stable/volatile boundary attached.
+    //
+    // The prompt is resolved **here**, once, so the turns are ordinary `Message` values from this
+    // point on: a `Conversation` is `Send` and `Equatable`, and a list of thunks is neither.
+    //
+    // `cache` defaults to `false`, unlike `AgentConfig`'s system prompt. A conversation turn is not
+    // reliably a prefix — the next `with` puts something after it — and every vendor caps how many
+    // breakpoints one request may carry (Anthropic: four), so spending one on each interpolated
+    // turn is the wrong default. Pass `true`, or `Message.cached()`, when the turn really is a long
+    // stable prefix worth caching.
+    fn with_prompt(role: Role, p: Prompt, cache: bool = false): Conversation {
+        return Conversation { messages: self.messages ~ prompt_turns(role, p.resolve(), cache) }
+    }
+
+    fn system_prompt(p: Prompt, cache: bool = false): Conversation {
+        return self.with_prompt(Role.System, p, cache)
+    }
+
+    fn user_prompt(p: Prompt, cache: bool = false): Conversation {
+        return self.with_prompt(Role.User, p, cache)
     }
 
     fn last(): ?Message {
@@ -280,7 +356,19 @@ pub enum AiError {
 @derive(Equatable, Display)
 pub struct AgentConfig {
     pub model: string
-    pub system: ?string = none
+    // The system prompt, **kept split** rather than flattened to a string.
+    //
+    // A `Resolved` from `.with_system("…")` is one static and no holes; one from
+    // `.with_system_prompt(@prompt { … })` remembers where the author's fixed text ends and the
+    // interpolated part begins. That boundary is what `prompt_turns` turns into a cache breakpoint,
+    // and it is the reason this field is not a `?string`: flatten it here and the information the
+    // language handed us is gone before any codec can use it.
+    //
+    // Resolving at configuration time rather than per turn is deliberate. A run makes one model
+    // call per turn and re-sends the system prompt on each; a hole re-evaluated per call could
+    // produce different text each time, and the stable prefix would stop being byte-identical —
+    // which is the *only* thing OpenAI's and Google's implicit prefix caching keys on.
+    pub system: ?Resolved = none
     pub max_tokens: ?int = none
     pub temperature: ?float = none
     pub stop: List<string> = []
@@ -318,13 +406,47 @@ pub struct AgentConfig {
     // Documented as unchecked: this is the escape hatch for a knob the neutral model has not
     // grown yet, and a malformed fragment surfaces at `encode`.
     pub extra: Map<string, string> = {}
+    // Whether the run loop marks the system prompt's stable prefix as a prompt-cache breakpoint.
+    //
+    // **True by default**, which is the whole claim of DESIGN §14: caching is correct by default
+    // because the language handed us the split, and a default that has to be switched on is a
+    // default nobody switches on. A system prompt is re-sent on every turn of a run, so the tool
+    // loop repays the cache write on its second call; below a vendor's minimum cacheable length the
+    // marker is simply ignored rather than charged for.
+    //
+    // Turn it off for a single-call workload with a large system prompt that is never repeated
+    // inside the cache's TTL — that is the one shape where a cache *write* (Anthropic prices it at
+    // 1.25× input) is a real cost with no return.
+    pub cache: bool = true
 
     fn new(model: string): AgentConfig {
         return AgentConfig { model: model }
     }
 
+    // The system prompt as ordinary text. Unchanged for every existing caller: a plain string is a
+    // prompt with no holes, so it is entirely stable and gets the maximal cache prefix.
     fn with_system(text: string): AgentConfig {
-        return AgentConfig { ...self, system: some(text) }
+        return AgentConfig { ...self, system: some(Resolved.of(text)) }
+    }
+
+    // The system prompt as a `@prompt { … }` block — the door that carries the split.
+    //
+    // A separate method rather than an overload of `with_system`, and not for want of trying: a
+    // `trait IntoPrompt` with an `impl … for string` is **E0013** (`cannot implement a trait for
+    // `string`: it is not a record, class, or enum declared in this module`), so no bound can span
+    // the two. Two named doors that agree on one representation beat a `dyn` parameter that agrees
+    // on nothing the checker can see.
+    fn with_system_prompt(p: Prompt): AgentConfig {
+        return AgentConfig { ...self, system: some(p.resolve()) }
+    }
+
+    // The system prompt flattened back to text, for a caller that only wants to read it. The split
+    // is on `system` itself when the boundary matters.
+    fn system_text(): ?string {
+        return match self.system {
+            some(r) => some(r.text()),
+            none => none,
+        }
     }
 
     fn with_max_tokens(n: int): AgentConfig {
@@ -372,6 +494,18 @@ pub struct AgentConfig {
 
     fn with_stream_backoff(ms: int): AgentConfig {
         return AgentConfig { ...self, stream_backoff_ms: ms }
+    }
+
+    // Mark the system prompt's stable prefix for the vendor's prompt cache — the default, spelled
+    // out for a caller switching back.
+    fn cached(): AgentConfig {
+        return AgentConfig { ...self, cache: true }
+    }
+
+    // Send no cache breakpoint at all. The stable text is still first and still byte-identical, so
+    // a vendor that caches implicitly keeps doing so; only the explicit marker goes away.
+    fn uncached(): AgentConfig {
+        return AgentConfig { ...self, cache: false }
     }
 }
 
@@ -673,16 +807,22 @@ pub struct Agent<P: Provider> {
         return Agent { ...self, toolbox: box }
     }
 
-    // The neutral request for a conversation, with the config's system prompt prepended when the
-    // conversation does not open with one of its own.
+    // The neutral request for a conversation, with the config's system prompt prepended.
+    //
+    // **This is where the cache breakpoint is placed.** The system prompt arrives already split at
+    // its first hole, so the longest provably stable prefix of the request is its stable part, and
+    // `prompt_turns` gives that part a turn of its own and marks it. Nothing further along is
+    // marked: a conversation's later turns *happen* to repeat inside one run, but the loop cannot
+    // promise that of the next run, and a breakpoint spent on a guess is one of four Anthropic
+    // allows. A caller who knows better says so with `Message.cached()`.
     //
     // `streamed` is an argument rather than a config read because the two doors disagree on
     // purpose: `stream(conv, out)` streams whatever the config says, and `run_sync` never does.
     fn request(conv: Conversation, streamed: bool = false): ModelRequest {
         mut msgs = conv.messages
         match self.config.system {
-            some(text) => {
-                msgs = [Message.system(text)] ~ msgs
+            some(sys) => {
+                msgs = prompt_turns(Role.System, sys, self.config.cache) ~ msgs
             },
             none => {},
         }
@@ -740,6 +880,15 @@ pub struct Agent<P: Provider> {
                 span.set_attribute("gen_ai.response.finish_reasons", reply.stop.semconv())
                 span.set_attribute("gen_ai.usage.input_tokens", reply.usage.input_tokens)
                 span.set_attribute("gen_ai.usage.output_tokens", reply.usage.output_tokens)
+                // The prompt cache's answer, and the only way to find out whether a breakpoint did
+                // anything. Set **only when a vendor reported a read**: `Usage.cached_input_tokens`
+                // is `0` both for "the cache missed" and for "this vendor does not report it", so
+                // an unconditional `0` would claim a miss we cannot distinguish from silence. The
+                // attribute's presence therefore means "the vendor served this many input tokens
+                // from its cache".
+                if reply.usage.cached_input_tokens > 0 {
+                    span.set_attribute("gen_ai.usage.cached_input_tokens", reply.usage.cached_input_tokens)
+                }
                 if capture_messages() {
                     span.set_attribute("gen_ai.output.messages", "${reply.parts}")
                 }
@@ -944,6 +1093,10 @@ pub struct Agent<P: Provider> {
             Ok(run) => {
                 root.set_attribute("gen_ai.usage.input_tokens", run.usage.input_tokens)
                 root.set_attribute("gen_ai.usage.output_tokens", run.usage.output_tokens)
+                // Aggregated over the run's calls — see `call` for why it is conditional.
+                if run.usage.cached_input_tokens > 0 {
+                    root.set_attribute("gen_ai.usage.cached_input_tokens", run.usage.cached_input_tokens)
+                }
                 root.set_attribute("gen_ai.response.finish_reasons", run.stop.semconv())
                 root.set_attribute("para.ai.run.turns", run.turns)
                 root.end()
@@ -1174,6 +1327,78 @@ fn refusal_text(reply: ModelReply): string {
         assert(grown.messages[1].text() == "two")
     }
 
+    // The split becomes two turns of one role, with the breakpoint on the stable one. Everything
+    // downstream — the `cache_control` marker, the byte-identical prefix — reads off this shape.
+    fn a_split_prompt_becomes_a_marked_stable_turn_and_a_volatile_one(): void {
+        r = Resolved { statics: ["You work for ", ". Be brief."], holes: ["Acme"] }
+        turns = prompt_turns(Role.System, r, true)
+        assert(turns.len() == 2, "${turns}")
+        assert(turns[0] == Message {
+            role: Role.System,
+            parts: [Part.Text(text: "You work for ")],
+            cache_breakpoint: true,
+        }, "${turns[0]}")
+        assert(turns[1] == Message {
+            role: Role.System,
+            parts: [Part.Text(text: "Acme. Be brief.")],
+        }, "${turns[1]}")
+        // The two turns still say exactly what the prompt said, in order.
+        assert(turns[0].text() ~ turns[1].text() == r.text())
+    }
+
+    // No holes is the best case, not the empty one: the whole prompt is the prefix, in one turn.
+    fn a_static_prompt_becomes_one_marked_turn(): void {
+        turns = prompt_turns(Role.System, Resolved.of("Answer in one sentence."), true)
+        assert(turns.len() == 1, "${turns}")
+        assert(turns[0].cache_breakpoint, "a static prompt is stable in its entirety")
+        assert(turns[0].text() == "Answer in one sentence.")
+    }
+
+    // Nothing in front of the first hole means nothing to cache — and marking an empty content
+    // block is a vendor error, not a free win. One unmarked turn.
+    fn a_prompt_with_no_stable_prefix_is_one_unmarked_turn(): void {
+        r = Resolved { statics: [" ", " is asking."], holes: ["Ada"] }
+        turns = prompt_turns(Role.User, r, true)
+        assert(turns.len() == 1, "${turns}")
+        assert(turns[0].cache_breakpoint == false, "whitespace is not a cache prefix")
+        assert(turns[0].text() == " Ada is asking.", "[${turns[0].text()}]")
+    }
+
+    // `mark: false` changes the marker and nothing else — the stable text is still first and still
+    // byte-identical, which is all an implicitly-caching vendor needs.
+    fn declining_to_mark_leaves_the_split_alone(): void {
+        r = Resolved { statics: ["stable ", " tail"], holes: ["x"] }
+        marked = prompt_turns(Role.System, r, true)
+        plain = prompt_turns(Role.System, r, false)
+        assert(marked.len() == plain.len())
+        assert(marked[0].parts == plain[0].parts, "the same bytes either way")
+        assert(marked[0].cache_breakpoint && plain[0].cache_breakpoint == false)
+    }
+
+    // A `Prompt` enters a conversation as naturally as a string does, and resolves once on the way
+    // in — a `Conversation` is a value, and a list of thunks is not one.
+    fn a_conversation_accepts_a_prompt_like_a_string(): void {
+        p = Prompt { statics: ["Context: ", "\nAnswer briefly."], holes: [fn() => "the manual"] }
+        conv = Conversation.new().system_prompt(p).user("what is it?")
+        assert(conv.messages.len() == 3, "${conv.messages}")
+        assert(conv.messages[0].role == Role.System)
+        assert(conv.messages[0].text() == "Context: ")
+        assert(conv.messages[1].text() == "the manual\nAnswer briefly.")
+        assert(conv.messages[2].text() == "what is it?")
+        // A conversation turn is not reliably a prefix, so it is unmarked unless asked.
+        assert(conv.messages[0].cache_breakpoint == false, "a conversation turn is unmarked by default")
+        assert(Conversation.new().system_prompt(p, true).messages[0].cache_breakpoint)
+        assert(Conversation.new().user_prompt(p).messages[0].role == Role.User)
+    }
+
+    // The hand door, for a long stable turn the caller knows repeats and the loop cannot.
+    fn a_message_can_be_marked_by_hand(): void {
+        m = Message.user("a very long retrieved corpus").cached()
+        assert(m.cache_breakpoint)
+        assert(Message.user("a very long retrieved corpus").cache_breakpoint == false)
+        assert(m.parts == Message.user("a very long retrieved corpus").parts, "only the marker differs")
+    }
+
     fn a_tool_message_addresses_the_call_it_answers(): void {
         m = Message.tool("call_7", "18°C", true)
         assert(m.role == Role.Tool)
@@ -1186,7 +1411,10 @@ fn refusal_text(reply: ModelReply): string {
         base = AgentConfig.new("m")
         tuned = base.with_system("be brief").with_max_tokens(64).with_temperature(0.0).named("brief")
         assert(base.system == none, "the original is untouched")
-        assert(tuned.system == some("be brief"))
+        // A plain string is a prompt with no holes, so it arrives as one static and is stable in
+        // its entirety — the maximal cache prefix.
+        assert(tuned.system == some(Resolved.of("be brief")), "${tuned.system}")
+        assert(tuned.system_text() == some("be brief"))
         assert(tuned.max_tokens == some(64))
         assert(tuned.temperature == some(0.0))
         assert(tuned.name == "brief")
