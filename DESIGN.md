@@ -2,7 +2,7 @@
 
 An agent harness for Noeta: model calls, tool calling, MCP, structured responses, guardrails, rolling context, streaming (AG-UI over SSE), and OpenTelemetry — in the shape the rest of the `para` suite already has.
 
-Status: **design only.** Nothing here is implemented. Open questions are collected at the end; two of them need a toolchain answer before the corresponding slice can be built.
+Status: **phases 1 and 2 are built and merged** — the codec seam, Anthropic, Mock, the run loop with tool calling, and GenAI telemetry. Phases 3–8 remain design. Every toolchain prerequisite this document named has landed (§17); the questions are settled or corrected in place.
 
 ---
 
@@ -84,7 +84,9 @@ para/cli established that the function signature is the CLI spec. para/aether es
 
 `params_of(name)` already returns each parameter's *declared* `Type` at full fidelity (generic arguments intact), whether it is optional, and its own `#[…]` attributes. `attributes_of::<Tool>()` finds the functions. `invoke(name, args)` calls one by name. That is the entire tool-calling machinery, in the language, with no codegen — see §6.
 
-The one thing reflection cannot do today is answer *"what fields does the type `T` have?"* without an instance of `T`. That gap is §8.5, and it is the design's single real dependency on the toolchain.
+Both halves of that are already reachable: `field_specs_of::<T>()` answers *"what fields does the type `T` have?"* from a type, with no instance, which is what an output schema needs. This design originally claimed otherwise and was wrong — see §8.5, kept as written because the way it went wrong is instructive.
+
+What reflection genuinely cannot do today is enumerate an **enum's variants** at runtime. There is no `variants_of` mirroring `field_specs_of`, and `params_of` reports a declared enum as `Type.Named`, never `Type.Enum` — so an enum-typed tool parameter is refused rather than half-derived (§6).
 
 ### 2.3 The wire is value types, so parallelism works
 
@@ -393,33 +395,25 @@ On a decode or validation failure, para/ai feeds `e.message()` back as a tool/us
 
 A model that refuses returns `StopReason.Refusal`, which surfaces as `AiError.Refused(reason)` — never as a JSON error. Conflating the two makes "the model declined" look like "your schema is wrong", which sends people debugging the wrong thing.
 
-### 8.5 The one gap: a schema for `T` without a value of `T` — and how it closes
+### 8.5 The gap that was not there
 
-Everything above needs *the JSON Schema of `T`*, and this is the single place the design cannot be built from today's language surface.
+**This section was wrong, and the error is worth keeping visible.** It claimed a schema for `T` could not be derived without an instance of `T`, called that the design's single real toolchain dependency, and used it to justify a `@schema` directive.
 
-- `params_of` gives full declared types — enough for **tool schemas**, including scalars, lists, options, and unions. Tools are covered.
-- `fields_of(value)` needs an **instance**, which is exactly what you do not have when asking a model to produce one.
-- `Type.Struct(name, args)` carries the name but not the fields, so recursion stops one level in.
+`field_specs_of::<T>()` — and its runtime-string twin `field_specs_of(name)` — already existed when this was written. It returns each declared field's name, declared type, and whether it is optional, from a *type*, with no instance anywhere. `construct(name, fields)` is its inverse. Both landed on `main` four days before this design; `para/cli` already ships nested-struct expansion on exactly that pair (`build_struct_arg`).
 
-**Resolved: a `@schema` directive, once `DirectiveCtx` carries the decorated declaration's fields (U-1).**
+The mistake was reading `content/docs/` in the docs-site repo — a **synced mirror** — instead of `docs/` in the language repo. The mirror was stale and had no mention of the primitive. A generated copy is not a source of truth, and this design knew that about that directory and read it anyway.
+
+**So structured output needs no new toolchain surface.** The schema walk is ordinary Noeta, recursive through nested structs, sharing one `Type` → JSON Schema function with §6's tool schemas:
 
 ```noeta
-@schema
-struct Extraction {
-    company: string
-    confidence: float
-    // `json_schema()` is generated as a member, from the declared field types
+for spec in field_specs_of::<Extraction>() {
+    // spec.name, spec.type (the full declared Type), spec.optional
 }
 ```
 
-This is the `@openapi` shape exactly: an `expand` hook contributing members of the declaration it decorates, output as real source with true spans, inspectable with `noeta expand`, so a schema change is a reviewable diff rather than an opaque blob. It is compile-time, costs nothing at runtime, and rejects an unsupported field shape at the declaration instead of at the first model call.
+`@schema` is not needed and phase 5 is not gated. U-1 (`DirectiveCtx.fields`) still landed and is still worth having — compile-time codegen from a declaration's shape is a genuinely different capability from runtime reflection, and it arrived with a shared derivation and an E0013 fix — but it was **not** the blocker this section made it.
 
-The two alternatives were weighed and dropped:
-
-- **`fields_of_type(name)` at runtime** — the type-level twin of `fields_of`. Strictly worse for this use (runtime cost, errors land far from the declaration) and a larger surface. If a runtime type-reflection surface is wanted for its own sake, that is a separate conversation and not a para/ai dependency.
-- **A prototype instance** — a `Schema` trait whose default `json_schema()` walks `fields_of(self)`, plus a required `fn prototype(): T`. It needs no toolchain change at all, which is why it was the fallback, but it puts boilerplate in every output type and a defaulted field silently skews the inferred schema. Not worth shipping as an interim when U-1 is a `Vec<(String, String)>` on one struct.
-
-Tool schemas do **not** wait on any of this: `params_of` already gives declared parameter types at full fidelity, so §6 is buildable today. Only §8 is gated, and only on U-1.
+What remains genuinely missing is smaller and is in §6: there is no runtime reflection over an **enum's variants** (no `variants_of` mirroring `field_specs_of`), and `params_of` reports a declared enum as `Type.Named`, never `Type.Enum`. So an enum-typed tool parameter or output field is refused with a message naming the missing primitive rather than half-derived. That is the real ask, and it is one primitive, not a directive.
 
 ---
 
@@ -774,7 +768,9 @@ pub struct DirectiveCtx {
 }
 ```
 
-The compiler already computes exactly this shape and hands it to a native hook at check time: `ExtDerive::validate` is `fn(&str, &[(String, String)]) -> Option<String>`, documented as "the deriving type's name and its `(field name, field type spelling)` pairs". U-1 is that same data, delivered to the other extension hook. It joins the memoization key like any other input. Unlocks `@schema` (§8.5) and therefore phase 5.
+The compiler already computes exactly this shape and hands it to a native hook at check time: `ExtDerive::validate` is `fn(&str, &[(String, String)]) -> Option<String>`, documented as "the deriving type's name and its `(field name, field type spelling)` pairs". U-1 is that same data, delivered to the other extension hook. It joins the memoization key like any other input.
+
+> **Corrected in hindsight:** this said U-1 "unlocks `@schema` and therefore phase 5". It does not — `field_specs_of` already covered that and phase 5 was never gated (§8.5). U-1 remains worth having on its own terms: compile-time generation from a declaration's shape is a different capability from runtime reflection, and it landed with a shared derivation both extension seams now read plus a fix for unvalidated positional enum-payload types. It just was not a prerequisite for anything here.
 
 A runtime `fields_of_type(name)` was the alternative ask; U-1 is strictly better for this use — compile-time, zero runtime cost, and errors land at the declaration. If a runtime type-level reflection surface is wanted for its own sake, that is a separate conversation, not a para/ai dependency.
 
