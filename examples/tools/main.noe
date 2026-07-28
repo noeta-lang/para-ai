@@ -1,0 +1,261 @@
+// Tool calling with `para.ai` — the whole of phase 2 in one file.
+//
+// Three things this example exists to show:
+//
+//   * **The function signature is the tool spec.** Annotate an ordinary Noeta function with
+//     `#[Tool]` and the package does the rest: it finds the function by whole-program reflection,
+//     derives its JSON Schema from the declared parameter types, coerces the model's arguments, and
+//     calls it by name. There is no tool-definition DSL, and there is nothing to keep in sync.
+//   * **Tools are a trust boundary, and the program can be asked about it.** `#[Tool]` carries
+//     `@role(Semantic.TrustBoundary)`, so "which functions here can a language model reach?" is
+//     `roles_of::<Semantic>()` — a query, not a code review. The last test asserts exactly that.
+//   * **The `@test` block is the point of the file as much as the code above it.** A full
+//     call → tool → answer cycle runs against a scripted `Mock`, so the suite needs no API key, no
+//     network, and no patience.
+//
+//     ANTHROPIC_API_KEY=sk-... noeta run  main.noe    # a real multi-turn tool loop
+//     noeta run  main.noe                             # no key: answers from the mock
+//     noeta test main.noe                             # the assertions
+namespace noeta.tools
+
+use std.{env, io}
+use para.ai.{Agent, AgentConfig, AiError, Conversation, Part, Role}
+use para.ai.mock.{Mock, ScriptedCall}
+use para.ai.provider.StopReason
+use para.ai.providers.anthropic.Anthropic
+use para.ai.tools
+use para.ai.tools.{Arg, Local, Tool, Toolbox}
+
+// --- The tools ------------------------------------------------------------------------------------
+//
+// Ordinary functions. No registration, no schema, no wrapper — `#[Tool]` and a `#[Arg(help)]` on
+// each parameter is the whole of it. The `help` text matters more than it looks: it becomes the
+// parameter's `description` in the derived schema, and it is the only place a model learns what a
+// bare `string` is actually for.
+
+#[Tool(about: "Current weather for a city")]
+fn weather(
+    #[Arg(help: "City name, e.g. 'Malmö'")] city: string,
+    #[Arg(help: "`metric` for °C or `imperial` for °F")] units: string = "metric",
+): Result<string, string> {
+    if city == "" {
+        return Err("a city name is required")
+    }
+    return Ok(if units == "imperial" then "64°F and clear in ${city}" else "18°C and clear in ${city}")
+}
+
+// A tool that can fail, so the run loop's recovery path is a real one. `Err` is not an outage: it
+// comes back to the model as a failed tool result carrying this message, and the model gets to try
+// something else — which is the behavior that makes agents recover instead of stopping.
+#[Tool(about: "Road distance in kilometers between two Swedish cities")]
+fn distance_km(
+    #[Arg(help: "The city to start from")] from: string,
+    #[Arg(help: "The city to travel to")] to: string,
+): Result<int, string> {
+    roads = {"Malmö|Lund": 18, "Lund|Malmö": 18, "Malmö|Göteborg": 273, "Göteborg|Malmö": 273}
+    return match roads.get("${from}|${to}") {
+        some(km) => Ok(km),
+        none => Err("no road distance on file for ${from} to ${to}"),
+    }
+}
+
+// --- The agent ------------------------------------------------------------------------------------
+
+fn config(): AgentConfig {
+    return AgentConfig.new("claude-opus-5")
+        .with_system("You are a Swedish travel assistant. Use the tools; answer in one sentence.")
+        .with_max_tokens(512)
+        // A tool loop needs a bound, and both have workable defaults (8 and 4). They are set here
+        // only to make them visible: an unbounded loop spends money, and unbounded parallel
+        // dispatch is a good way to get rate-limited by your own agent.
+        .with_max_turns(6)
+        .with_tool_concurrency(4)
+        .named("travel")
+}
+
+// The scripted stand-in used when no API key is set — and by every test below. Two turns: the model
+// asks for both tools at once, then answers from what came back. Nothing here says what the tools
+// *return*; that comes from running the real functions above.
+fn offline(): Mock {
+    return Mock.new()
+        .reply_tools([
+            ScriptedCall { id: "call_1", name: "weather", args: "{\"city\": \"Malmö\"}" },
+            ScriptedCall { id: "call_2", name: "distance_km", args: "{\"from\": \"Malmö\", \"to\": \"Lund\"}" },
+        ])
+        .reply_text("It is 18°C and clear in Malmö, and Lund is 18 km up the road.")
+}
+
+// The runtime-selection `match`, pushed to the outermost point where the arms still agree.
+// `Agent<Anthropic>` and `Agent<Mock>` are different types, but `run_sync` is not — so the arms
+// diverge at construction and re-converge at the result.
+//
+// `.tools(...)` returns a `Result`: attaching a source derives every schema and checks every name
+// against what is already there, and a collision across sources is a construction-time error naming
+// both. `?` is how that reaches the caller.
+fn ask(text: string): Result<string, AiError> {
+    which = env.get("AI_PROVIDER") ?? (if env.get("ANTHROPIC_API_KEY") == none then "mock" else "anthropic")
+    return match which {
+        "mock" => offline().agent(config()).tools(Local.new())?.run_sync(text),
+        _ => Agent.from(config(), Anthropic.from_env() ?? Anthropic.new("")).tools(Local.new())?.run_sync(text),
+    }
+}
+
+// What the model is actually told about a tool. Worth printing once: it is the contract, and it was
+// derived from the signature rather than written twice.
+fn schema_of_the_weather_tool(): string {
+    return match Local.new().specs() {
+        Ok(specs) => spec_named(specs, "weather"),
+        Err(e) => "error: ${e}",
+    }
+}
+
+fn spec_named(specs: List<tools.ToolSpec>, name: string): string {
+    for s in specs {
+        if s.name == name {
+            return s.parameters
+        }
+    }
+    return "no tool named ${name}"
+}
+
+// `noeta test` never runs top-level statements, so these are the entry point only.
+io.outln(match ask("What is the weather in Malmö, and how far is Lund?") {
+    Ok(answer) => answer,
+    Err(e) => "error: ${e}",
+})
+io.outln(schema_of_the_weather_tool())
+
+@test {
+    // The full cycle, hermetic: the model asks for two tools at once, the dispatcher calls the real
+    // Noeta functions, both results go back as one turn, and the model answers. Two model calls,
+    // no socket, no key.
+    fn a_tool_loop_runs_end_to_end(): void {
+        m = offline()
+        agent = agent_or_fail(m)
+        assert(agent.run_sync("weather and distance?")
+            == Ok("It is 18°C and clear in Malmö, and Lund is 18 km up the road."))
+        assert(m.call_count() == 2, "the ask, then the answer")
+        assert(m.remaining() == 0, "and the script is spent")
+    }
+
+    // The results the model saw came from running `weather` and `distance_km`, not from the script.
+    // `18 km` is `distance_km`'s return value, rendered from an `int`.
+    fn the_real_functions_ran_and_their_values_went_back(): void {
+        m = offline()
+        one = agent_or_fail(m).run_sync("weather and distance?")
+        second = m.calls()[1]
+        assert(second.contains("18°C and clear in Malmö"), second)
+        assert(second.contains("\"content\":\"18\""), "an int return, rendered: ${second}")
+        // Both results ride one tool turn, in call order. Splitting a `ToolCall` from its
+        // `ToolResult` is the single most common bug in hand-rolled tool loops, and several vendors
+        // reject the conversation it produces.
+        assert(second.contains("\"id\":\"call_1\""), second)
+        assert(second.contains("\"id\":\"call_2\""), second)
+        assert(second.contains("\"role\":\"tool\""), second)
+    }
+
+    // The exact JSON Schema `weather`'s signature produces. An exact-string assertion is the only
+    // kind that catches a schema silently changing shape — and this one is derived from the
+    // declaration a few lines up, so it cannot drift from it.
+    fn the_signature_is_the_schema(): void {
+        derived = schema_of_the_weather_tool()
+        assert(derived == "{\"additionalProperties\":false,\"properties\":{\"city\":{\"description\":\"City name, e.g. 'Malmö'\",\"type\":\"string\"},\"units\":{\"description\":\"`metric` for °C or `imperial` for °F\",\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"}",
+            derived)
+    }
+
+    // **A failing tool is a turn, not an outage.** `distance_km` returns `Err` for a road it does
+    // not know; the model sees the message and answers anyway.
+    fn a_failing_tool_comes_back_as_a_recoverable_turn(): void {
+        m = Mock.new()
+            .reply_tool("call_1", "distance_km", "{\"from\": \"Malmö\", \"to\": \"Kiruna\"}")
+            .reply_text("I don't have that road distance, sorry.")
+        assert(agent_or_fail(m).run_sync("how far is Kiruna?")
+            == Ok("I don't have that road distance, sorry."))
+        second = m.calls()[1]
+        assert(second.contains("no road distance on file"), second)
+        assert(second.contains("\"is_error\":true"), second)
+    }
+
+    // A model that invents an argument, or sends the wrong type, gets told — as a turn it can act
+    // on rather than as a crashed process.
+    fn a_malformed_call_is_told_off_rather_than_crashing(): void {
+        m = Mock.new()
+            .reply_tools([
+                ScriptedCall { id: "a", name: "weather", args: "{\"city\": \"Lund\", \"mood\": \"sunny\"}" },
+                ScriptedCall { id: "b", name: "teleport", args: "{}" },
+            ])
+            .reply_text("Let me try that differently.")
+        one = agent_or_fail(m).run_sync("go")
+        second = m.calls()[1]
+        assert(second.contains("unknown argument `mood`"), second)
+        assert(second.contains("no such tool"), second)
+    }
+
+    // The line that makes tool calling reviewable. `#[Tool]` carries
+    // `@role(Semantic.TrustBoundary)`, so the set of model-reachable functions is a query — the
+    // same index `noeta mcp` serves to an editor or an agent.
+    //
+    // The role is matched rather than compared with `==`, because the prelude `Semantic` enum has
+    // no expression form today: `Semantic.TrustBoundary` type-checks and then aborts at runtime.
+    fn every_tool_is_a_declared_trust_boundary(): void {
+        mut reachable: List<string> = []
+        for r in roles_of::<Semantic>() {
+            match r.role {
+                Semantic.TrustBoundary => {
+                    reachable = reachable ~ [r.target]
+                },
+                _ => {},
+            }
+        }
+        assert(reachable.contains("noeta.tools.weather"), "${reachable}")
+        assert(reachable.contains("noeta.tools.distance_km"), "${reachable}")
+        // And nothing else in this program is one — `config`, `ask`, and `offline` are not
+        // reachable by a model, and the index says so.
+        assert(!reachable.contains("noeta.tools.ask"), "${reachable}")
+    }
+
+    // The toolbox is the whole vocabulary, and it is `AgentConfig`-independent — build it once, hand
+    // it to as many agents as you like.
+    fn the_toolbox_lists_what_the_model_may_call(): void {
+        match Toolbox.of(Local.new()) {
+            Ok(box) => {
+                assert(box.names() == ["weather", "distance_km"], "${box.names()}")
+                assert(box.tool_type("weather") == "function", "MCP tools report `mcp`")
+                // And it can be called directly, with no model in the loop at all.
+                assert(box.call("weather", "{\"city\": \"Lund\", \"units\": \"imperial\"}")
+                    == Ok("64°F and clear in Lund"))
+            },
+            Err(e) => {
+                assert(false, "${e}")
+            },
+        }
+    }
+
+    // A name collision across sources is a construction-time error naming both, never a
+    // last-one-wins: a silently shadowed tool is the kind of bug that shows up as a wrong answer
+    // three weeks later.
+    fn a_shadowed_tool_is_refused_at_construction(): void {
+        match Toolbox.of(Local.new())?.with(Local.new()) {
+            Ok(_) => {
+                assert(false, "the same source twice is a collision")
+            },
+            Err(e) => {
+                assert("${e}".contains("declared by both"), "${e}")
+                assert("${e}".contains("weather"), "and it names the tool: ${e}")
+            },
+        }
+    }
+}
+
+// Unwrap-or-fail, out here because a `match` arm cannot both fail an assertion and produce a value.
+fn agent_or_fail(m: Mock): Agent<Mock> {
+    match m.agent(config()).tools(Local.new()) {
+        Ok(a) => {
+            return a
+        },
+        Err(e) => {
+            assert(false, "attaching tools failed: ${e}")
+        },
+    }
+    return m.agent(config())
+}
