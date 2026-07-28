@@ -256,7 +256,7 @@ impl ToolSource for Local {
         // Every resolution failure is an `Err` here, never an abort — an arity mismatch, a name
         // that vanished between `specs()` and now. It becomes a tool-result turn like any other.
         return match invoke(target, bound) {
-            Ok(v) => outcome(v),
+            Ok(v) => outcome(name, v),
             Err(e) => Err(AiError.Tool(name: name, message: "${e}")),
         }
     }
@@ -283,11 +283,11 @@ fn parse_arguments(name: string, args: string): Result<Map<string, dyn>, AiError
 // A tool declared `Result<T, E>` is unwrapped: `Ok(v)` is the answer, `Err(e)` is a failed turn.
 // That is the whole of "a failing tool is a turn, not an outage" — the model sees the error text
 // and gets to try something else.
-fn outcome(v: dyn): Result<string, AiError> {
+fn outcome(tool: string, v: dyn): Result<string, AiError> {
     return match v.as<Result<dyn, dyn>>() {
         some(r) => match r {
             Ok(x) => Ok(render(x)),
-            Err(e) => Err(AiError.Tool(name: "", message: render(e))),
+            Err(e) => Err(AiError.Tool(name: tool, message: render(e))),
         },
         none => Ok(render(v)),
     }

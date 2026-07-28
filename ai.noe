@@ -716,8 +716,7 @@ fn refusal_text(reply: ModelReply): string {
         assert(error_type(e) == "max_turns")
     }
 
-    // An `AiError.Tool` with no tool name is a failure of the call itself rather than of a named
-    // tool — the `Err` a tool's own `Result` came back as, before the toolbox re-labels it.
+    // The unnamed form is the fallback for a failure that belongs to no particular tool.
     fn a_tool_error_reads_correctly_with_and_without_a_name(): void {
         assert("${AiError.Tool(name: "weather", message: "no such city")}"
             == "tool `weather` failed: no such city")
