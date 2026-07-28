@@ -711,7 +711,8 @@ API keys come from `std.env`; para/ai never reads a config file and never writes
 | U-1 | `DirectiveCtx.fields` — an expand hook sees the decorated declaration's shape | **merged** (`21ca0362`), unblocks `@schema` and phase 5 |
 | U-2 | `async` through `dyn` typed correctly, plus the impl↔declaration parity rule | **merged** (`95ad4ab8`) |
 | U-3 | streaming HTTP bodies + `server.sse` | **merged** (`f90f9053`) — `client.stream(req, framing)`, `Framing { Sse; Ndjson; Lines }`, `FrameStream`, `server.sse`; unblocks phases 3 and 7 |
-| U-4 | a cross-module type cannot be a positional enum payload | in flight |
+| U-4 | a cross-module type cannot be a positional enum payload | **merged** (`79de7d35`) — fixed at the representation: a payload's type lives in the type slot, so `Leaf(App.Models.User)`, `Many(List<int>)`, `Maybe(?int)` and `Pair(string, int)` all parse now |
+| — | method-receiver parity: a self-less trait method answers to both call forms | **merged** (`79de7d35`) |
 | — | three checker fixes found building phase 1 (see §2.3, §13) | **merged** |
 
 ### O-1, O-2, O-4 — answered by inspection, and all three become build items
