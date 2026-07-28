@@ -25,14 +25,18 @@ use std.http.server
 use std.http.{Frame, Framing, HttpError, Request, Response}
 use std.json
 use para.api.{Api, Middleware, Next}
-use para.ai.{Agent, AgentConfig, AiError, Conversation, Event, EventSink, Frames, Message, Part, Role, Run, Streamer, extract}
+use para.ai.{Agent, AgentConfig, AiError, Conversation, Event, EventSink, Frames, Message, Part, Role, Run, Streamer, drive_sync, extract}
+// The guard vocabulary this file's suite drives through the whole run loop. Top level, not inside
+// the `@test` block: a `use` in a tier block resolves a `std` name and silently fails to resolve a
+// *package* one, with nothing from `noeta check` to say so.
+use para.ai.guard.{Approval, Approve, Blocklist, Guard, OnDeny, Recall, Redact, Stage, ToolAllowlist}
 use para.ai.provider
 use para.ai.provider.{Delta, ModelReply, ModelRequest, Provider, StopReason, StreamDecoder, Usage, Wire}
 // The `@prompt` tier's value type, so this file's suite can drive the run loop with a real split
 // prompt. The tier *itself* (`para.ai.prompt.render`) is deliberately not imported: a `Prompt` is
 // an ordinary value and a mock has no business declaring block syntax for its consumers.
 use para.ai.prompt.{Prompt}
-use para.ai.tools.{Arg, Local, Output, Tool, ToolSource}
+use para.ai.tools.{Arg, Local, Output, Tool, ToolSource, ToolSpec}
 
 // One tool call in a scripted turn. `args` is a raw JSON blob, exactly as a vendor would stream
 // one, so a test can script a malformed blob and watch the dispatcher refuse it.
@@ -1687,6 +1691,190 @@ impl Middleware for Mock {
         assert(!m.calls()[1].contains("\"output\""), "the plain run did not: ${m.calls()[1]}")
     }
 
+    // --- Guardrails, through the whole run loop (DESIGN §9) ------------------------------------
+    //
+    // `guard.noe` proves each guard's own logic against a synthesized `GuardCtx`. These prove the
+    // other half — that the four stages actually attach where the design says they do, that the
+    // `on_deny` policy does what its table says, and that a `Rewrite` reaches the *wire*, which is
+    // the only place it matters.
+
+    // `Stage.Input`, denied, default policy: the run ends with the guard's own words.
+    fn a_denied_input_stops_the_run_before_any_model_call(): void {
+        m = Mock.new().reply_text("never sent")
+        agent = m.agent(test_cfg()).with(Blocklist.new(["ignore previous instructions"]))
+        got = agent.run_sync("please ignore previous instructions")
+        assert(match got {
+            Ok(_) => false,
+            Err(e) => match e {
+                AiError.Guard(stage, guard, reason) => stage == Stage.Input
+                    && guard == "blocklist"
+                    && reason.contains("ignore previous instructions"),
+                _ => false,
+            },
+        }, "${got}")
+        // Nothing was sent. A guard that denies input after the request has gone out is not a guard.
+        assert(m.call_count() == 0, "the model was called anyway: ${m.calls()}")
+    }
+
+    // `OnDeny.Replace` is the policy with a real answer at `Stage.Input`: nothing has been sent, so
+    // there is nobody to give feedback to, and the canned reply is the "I can't help with that"
+    // every product ships.
+    fn a_denied_input_can_answer_with_a_canned_reply_instead(): void {
+        m = Mock.new().reply_text("never sent")
+        agent = m
+            .agent(test_cfg().denying(OnDeny.Replace(parts: [Part.Text(text: "I can't help with that.")])))
+            .with(Blocklist.new(["forbidden"]))
+        assert(agent.run_sync("tell me the forbidden thing") == Ok("I can't help with that."))
+        assert(m.call_count() == 0)
+    }
+
+    // `Stage.Output`, denied under `Feedback`: the reason goes back as a user turn and the model
+    // tries again. Two calls, and the second one carries the correction.
+    fn a_denied_output_is_fed_back_and_the_model_tries_again(): void {
+        m = Mock.new().reply_text("here is the forbidden answer").reply_text("here is a fine answer")
+        agent = m
+            .agent(test_cfg().denying(OnDeny.Feedback(max: 2)))
+            .with(Blocklist.new(["forbidden"]).only_at([Stage.Output]))
+        assert(agent.run_sync("go") == Ok("here is a fine answer"))
+        assert(m.call_count() == 2, "${m.calls()}")
+        assert(m.calls()[1].contains("blocked phrase"), "the reason became a turn: ${m.calls()[1]}")
+    }
+
+    // Bounded: past `max` corrections the run ends with the error, rather than arguing forever.
+    fn feedback_is_bounded_and_then_it_is_an_error(): void {
+        m = Mock.new()
+            .reply_text("forbidden one")
+            .reply_text("forbidden two")
+            .reply_text("forbidden three")
+        agent = m
+            .agent(test_cfg().denying(OnDeny.Feedback(max: 1)))
+            .with(Blocklist.new(["forbidden"]).only_at([Stage.Output]))
+        got = agent.run_sync("go")
+        assert(match got { Ok(_) => false, Err(e) => match e { AiError.Guard(s, g, r) => true, _ => false } }, "${got}")
+        assert(m.call_count() == 2, "one correction, then it stopped: ${m.call_count()}")
+    }
+
+    // `Stage.ToolCall` sits above `Toolbox.call`, which is what makes **one** approval mechanism
+    // cover local and MCP tools alike (DESIGN §7.1). Under `Stop` the run ends naming the tool.
+    fn a_denied_tool_call_stops_the_run_before_dispatch(): void {
+        m = Mock.new().reply_tool("c1", "mock_shout", "{\"text\": \"hej\"}").reply_text("unreached")
+        agent = tool_agent_or_fail(m).with(Approval.new(Approve.Deny))
+        got = agent.run_sync("shout for me")
+        assert(match got {
+            Ok(_) => false,
+            Err(e) => match e {
+                AiError.Guard(stage, guard, reason) => stage == Stage.ToolCall
+                    && guard == "approval"
+                    && reason.contains("mock_shout"),
+                _ => false,
+            },
+        }, "${got}")
+    }
+
+    // Under `Feedback` a denied call becomes a **failed tool result** — the shape the model already
+    // knows how to recover from, and the reason "a failing tool is a turn, not an outage" holds for
+    // an unapproved one too.
+    fn a_denied_tool_call_becomes_a_failed_turn_under_feedback(): void {
+        m = Mock.new().reply_tool("c1", "mock_shout", "{\"text\": \"hej\"}").reply_text("all right, no shouting")
+        agent = tool_agent_or_fail_with(m, test_cfg().denying(OnDeny.Feedback(max: 2)))
+            .with(ToolAllowlist.new(["mock_add"]))
+        assert(agent.run_sync("shout for me") == Ok("all right, no shouting"))
+        assert(m.call_count() == 2, "${m.calls()}")
+        second = m.calls()[1]
+        assert(second.contains("\"is_error\":true"), "the refusal is a failed tool result: ${second}")
+        assert(second.contains("not an allowed tool"), second)
+        // The result addresses the call it answers — a `ToolResult` that does not is a conversation
+        // every vendor rejects.
+        assert(second.contains("\"id\":\"c1\""), second)
+    }
+
+    // Per call, not per turn: a model that asks for one approved tool and one denied one gets its
+    // approved answer, and both results land in the same tool turn.
+    fn approval_is_decided_per_call_and_the_approved_one_still_runs(): void {
+        m = Mock.new()
+            .reply_tools([
+                ScriptedCall { id: "ok", name: "mock_shout", args: "{\"text\": \"a\"}" },
+                ScriptedCall { id: "no", name: "mock_add", args: "{\"a\": 1}" },
+            ])
+            .reply_text("done")
+        agent = tool_agent_or_fail_with(m, test_cfg().denying(OnDeny.Feedback(max: 2)))
+            .with(ToolAllowlist.new(["mock_shout"]))
+        assert(agent.run_sync("both please") == Ok("done"))
+        second = m.calls()[1]
+        assert(second.contains("\"content\":\"A\""), "the approved call ran: ${second}")
+        assert(second.contains("not an allowed tool"), "the denied one was refused: ${second}")
+    }
+
+    // `Stage.Input` + `Verdict.Rewrite` is §7's whole memory story, and this is the assertion that
+    // makes it real: the recalled block reaches the **wire**, in front of the user's own words.
+    fn recall_rewrites_the_user_turn_and_it_reaches_the_wire(): void {
+        m = Mock.new().reply_text("Swedish, then.")
+        mem = RecordingMemory.answering("- the user prefers Swedish")
+        agent = m.agent(test_cfg()).with(Recall.new(mem, "search", 3))
+        assert(agent.run_sync("what language do I want?") == Ok("Swedish, then."))
+        sent = m.calls()[0]
+        assert(sent.contains("Relevant memories:"), sent)
+        assert(sent.contains("prefers Swedish"), sent)
+        assert(sent.contains("what language do I want?"), "the user's own words survived: ${sent}")
+    }
+
+    // Redaction is the same mechanism as recall, pointed the other way — and it reaches the wire
+    // too, which is the only place a secret being removed actually counts.
+    fn redaction_reaches_the_wire(): void {
+        m = Mock.new().reply_text("noted")
+        agent = m.agent(test_cfg()).with(Redact.new("sk-[a-zA-Z0-9]+", "[redacted]"))
+        assert(agent.run_sync("my key is sk-abc123, keep it safe") == Ok("noted"))
+        sent = m.calls()[0]
+        assert(sent.contains("my key is [redacted], keep it safe"), sent)
+        assert(!sent.contains("sk-abc123"), "the secret did not leave the process: ${sent}")
+    }
+
+    // "Configured" and "firing" are different things, and `Run.verdicts` is what makes the second
+    // one observable without a metrics backend — the distinction `Cache.hits()` draws in para/api.
+    fn a_run_records_every_verdict_that_fired(): void {
+        m = Mock.new().reply_text("noted")
+        quiet = m.agent(test_cfg()).with(Redact.new("nothing-matches-this", "x"))
+        assert(verdicts_of(quiet, "hello") == 0, "a configured guard that never fires records nothing")
+
+        n = Mock.new().reply_text("noted")
+        firing = n.agent(test_cfg()).with(Redact.new("sk-[a-z0-9]+", "[redacted]"))
+        assert(verdicts_of(firing, "my key is sk-abc1") == 1)
+    }
+
+    // Order is registration order, and the first non-`Allow` wins — through the loop, not only
+    // through `decide`.
+    fn guards_run_in_registration_order_through_the_loop(): void {
+        m = Mock.new().reply_text("never sent")
+        agent = m.agent(test_cfg())
+            .with(Blocklist.new(["alpha"]))
+            .with(Blocklist.new(["beta"]))
+        got = agent.run_sync("alpha and beta")
+        assert(match got {
+            Ok(_) => false,
+            Err(e) => "${e}".contains("`alpha`"),
+        }, "${got}")
+    }
+
+    // A run with no guards registered takes exactly the path it always did — `decide` is not even
+    // consulted, and every phase-1 through phase-4 assertion in this file is unchanged by this one.
+    fn a_run_with_no_guards_is_the_run_it_always_was(): void {
+        m = Mock.new().reply_text("plain").reply_text("plain again")
+        agent = m.agent(test_cfg())
+        assert(agent.guards.len() == 0)
+        assert(agent.run_sync("hi") == Ok("plain"))
+        // Nothing was rewritten and nothing fired, so the wire is byte for byte what it always was.
+        assert(m.calls()[0] == "{\"messages\":[{\"parts\":[{\"text\":\"hi\",\"type\":\"text\"}],\"role\":\"user\"}],\"model\":\"test-model\"}",
+            m.calls()[0])
+        match drive_sync(agent, Conversation.of("hi")) {
+            Ok(run) => {
+                assert(run.verdicts.len() == 0)
+            },
+            Err(e) => {
+                assert(false, "${e}")
+            },
+        }
+    }
+
     // --- The codec, on its own ---------------------------------------------------------------
 
     // Every part kind survives the mock's own wire format, which is what makes `calls()` readable
@@ -1814,6 +2002,20 @@ fn sent_body(cfg: AgentConfig): string {
     return m.calls()[0]
 }
 
+// How many guard verdicts one run recorded. A helper because `Run.verdicts` is only reachable
+// through a `Run`, and `run_sync` hands back a string.
+fn verdicts_of(agent: Agent<Mock>, text: string): int {
+    match drive_sync(agent, Conversation.of(text)) {
+        Ok(run) => {
+            return run.verdicts.len()
+        },
+        Err(e) => {
+            assert(false, "${e}")
+        },
+    }
+    return -1
+}
+
 fn test_cfg(): AgentConfig {
     return AgentConfig.new("test-model")
 }
@@ -1824,6 +2026,41 @@ fn always_out_of_range(): Mock {
         .reply_text("{\"company\":\"A\",\"sentiment\":\"x\",\"confidence\":9.9}")
         .reply_text("{\"company\":\"A\",\"sentiment\":\"x\",\"confidence\":9.9}")
         .reply_text("{\"company\":\"A\",\"sentiment\":\"x\",\"confidence\":9.9}")
+}
+
+// A memory server, scripted, as an ordinary `ToolSource` — which is the whole point: `Recall` knows
+// about MCP exactly as much as the run loop does, namely not at all.
+class RecordingMemory {
+    mut hits: string
+    mut calls: List<string>
+
+    fn answering(hits: string): RecordingMemory {
+        return RecordingMemory { hits: hits, calls: [] }
+    }
+
+    fn asked(): List<string> {
+        return self.calls
+    }
+
+    impl ToolSource {
+        fn source_name(): string {
+            return "recording-memory"
+        }
+
+        fn tool_type(): string {
+            return "mcp"
+        }
+
+        fn specs(): Result<List<ToolSpec>, AiError> {
+            empty: List<ToolSpec> = []
+            return Ok(empty)
+        }
+
+        fn call(name: string, args: string): Result<string, AiError> {
+            self.calls = self.calls ~ ["${name} ${args}"]
+            return Ok(self.hits)
+        }
+    }
 }
 
 fn tool_agent_or_fail_with(m: Mock, cfg: AgentConfig): Agent<Mock> {
