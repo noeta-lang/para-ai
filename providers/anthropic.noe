@@ -23,14 +23,12 @@
 // the package that knows how Anthropic spells it — OpenAI and Google cache the same prefix
 // implicitly, on an exact match, and need no marker at all. That is exactly why the neutral model
 // carries a *hint* and not a vendor field.
-namespace para.ai.providers.anthropic
-
 use std.http.{Frame}
 use std.{env, json}
-use para.ai.{AiError, Message, Part, Role}
-use para.ai.provider
-use para.ai.provider.{Delta, ModelReply, ModelRequest, Provider, StopReason, StreamDecoder, Usage, Wire}
-use para.ai.tools.{Output, ToolSpec}
+use ai.{AiError, Message, Part, Role}
+use ai.provider
+use ai.provider.{Delta, ModelReply, ModelRequest, Provider, StopReason, StreamDecoder, Usage, Wire}
+use ai.tools.{Output, ToolSpec}
 
 // The Anthropic Messages API, as a codec.
 //

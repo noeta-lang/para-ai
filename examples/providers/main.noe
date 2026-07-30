@@ -23,8 +23,6 @@
 //     AI_PROVIDER=google noeta run main.noe        # a real Gemini call
 //     ollama serve & noeta test main.noe           # the live checks stop skipping
 //     noeta test main.noe                          # the assertions
-namespace noeta.providers
-
 use std.http.{Frame}
 use std.http.client
 use std.{env, io}

@@ -18,25 +18,23 @@
 // calls, so it needs reference identity and mutable state — exactly the reason `para/api`'s
 // `Record` is one. That makes a `Mock`-backed agent `!Send`, which is fine: a test is not an
 // isolate.
-namespace para.ai.mock
-
 use std.http.client
 use std.http.server
 use std.http.{Frame, Framing, HttpError, Request, Response}
 use std.json
 use para.api.{Api, Middleware, Next}
-use para.ai.{Agent, AgentConfig, AiError, Conversation, Event, EventSink, Frames, Message, Part, Role, Run, Streamer, drive_sync, extract}
+use ai.{Agent, AgentConfig, AiError, Conversation, Event, EventSink, Frames, Message, Part, Role, Run, Streamer, drive_sync, extract}
 // The guard vocabulary this file's suite drives through the whole run loop. Top level, not inside
 // the `@test` block: a `use` in a tier block resolves a `std` name and silently fails to resolve a
 // *package* one, with nothing from `noeta check` to say so.
-use para.ai.guard.{Approval, Approve, Blocklist, Guard, OnDeny, Recall, Redact, Stage, ToolAllowlist}
-use para.ai.provider
-use para.ai.provider.{Delta, ModelReply, ModelRequest, Provider, StopReason, StreamDecoder, Usage, Wire}
+use ai.guard.{Approval, Approve, Blocklist, Guard, OnDeny, Recall, Redact, Stage, ToolAllowlist}
+use ai.provider
+use ai.provider.{Delta, ModelReply, ModelRequest, Provider, StopReason, StreamDecoder, Usage, Wire}
 // The `@prompt` tier's value type, so this file's suite can drive the run loop with a real split
 // prompt. The tier *itself* (`para.ai.prompt.render`) is deliberately not imported: a `Prompt` is
 // an ordinary value and a mock has no business declaring block syntax for its consumers.
-use para.ai.prompt.{Prompt}
-use para.ai.tools.{Arg, Local, Output, Tool, ToolSource, ToolSpec}
+use ai.prompt.{Prompt}
+use ai.tools.{Arg, Local, Output, Tool, ToolSource, ToolSpec}
 
 // One tool call in a scripted turn. `args` is a raw JSON blob, exactly as a vendor would stream
 // one, so a test can script a malformed blob and watch the dispatcher refuse it.

@@ -26,14 +26,12 @@
 //   * **`system` is a message role here**, not a hoisted top-level field.
 //   * **`data: [DONE]` is not JSON.** It terminates the event stream and has to be recognized
 //     before the body is handed to a parser.
-namespace para.ai.providers.openai
-
 use std.http.{Frame}
 use std.{env, json}
-use para.ai.{AiError, Message, Part, Role}
-use para.ai.provider
-use para.ai.provider.{Delta, ModelReply, ModelRequest, Provider, StopReason, StreamDecoder, Usage, Wire}
-use para.ai.tools.{Output, ToolSpec}
+use ai.{AiError, Message, Part, Role}
+use ai.provider
+use ai.provider.{Delta, ModelReply, ModelRequest, Provider, StopReason, StreamDecoder, Usage, Wire}
+use ai.tools.{Output, ToolSpec}
 
 // How a request proves who is asking.
 //

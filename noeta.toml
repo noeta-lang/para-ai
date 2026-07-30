@@ -10,7 +10,7 @@ keywords = ["ai", "llm", "agent", "anthropic", "openai"]
 # The transport para/ai composes over (DESIGN O-6). Retry-with-`Retry-After`, `Mock`, `Record`,
 # `Cache`, and `Logging` are already written and already the idiom this suite documents; the run
 # loop bottoms out in an `Api`, so none of them is para/ai code.
-para = { path = "../para-api" }
+para = [{ path = "../para-api" }]
 
 # `para/api` ships a native extension crate — the `@openapi` directive's compile-time expansion hook
 # and the `para.api.url` percent-encoder its generated query strings are built with. para/ai

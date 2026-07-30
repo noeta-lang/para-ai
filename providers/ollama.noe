@@ -25,14 +25,12 @@
 //   * **`done_reason` is `"stop"` for a tool call**, so `StopReason.ToolUse` is derived from the
 //     parts rather than read off the vendor's word for it.
 //   * **Images are a per-message array of bare base64**, not content parts and not data URIs.
-namespace para.ai.providers.ollama
-
 use std.http.{Frame}
 use std.{env, json}
-use para.ai.{AiError, Message, Part, Role}
-use para.ai.provider
-use para.ai.provider.{Delta, ModelReply, ModelRequest, Provider, StopReason, StreamDecoder, Usage, Wire}
-use para.ai.tools.{Output, ToolSpec}
+use ai.{AiError, Message, Part, Role}
+use ai.provider
+use ai.provider.{Delta, ModelReply, ModelRequest, Provider, StopReason, StreamDecoder, Usage, Wire}
+use ai.tools.{Output, ToolSpec}
 
 // Ollama's native chat API, as a codec.
 //

@@ -24,12 +24,10 @@
 // site exists. It also happens to be the spelling that works: `async` trait methods are correct
 // under a bound and unsound through `dyn` today. Runtime provider selection is therefore the
 // *caller's* `match`; see the README.
-namespace para.ai.provider
-
 use std.json
 use std.http.{Frame}
-use para.ai.{Message, Part, AiError}
-use para.ai.tools.{Output, ToolSpec}
+use ai.{Message, Part, AiError}
+use ai.tools.{Output, ToolSpec}
 
 // --- The wire ------------------------------------------------------------------------------------
 

@@ -32,8 +32,6 @@
 //
 //     noeta run  main.noe        # the split, the markers, and what a run costs
 //     noeta test main.noe        # the assertions — hermetic, no key, no socket
-namespace noeta.prompt_cache
-
 use std.{io, json}
 use para.ai.{Agent, AgentConfig, Conversation, Message, Run}
 use para.ai.mock.Mock

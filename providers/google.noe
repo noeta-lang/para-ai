@@ -23,14 +23,12 @@
 //     Anthropic's signature is.
 //   * **Inline media is anything**, not just images. Gemini takes audio, video, and PDFs in the same
 //     `inlineData` envelope, so this codec accepts a `Part.File` that Anthropic's refuses.
-namespace para.ai.providers.google
-
 use std.http.{Frame}
 use std.{env, json}
-use para.ai.{AiError, Message, Part, Role}
-use para.ai.provider
-use para.ai.provider.{Delta, ModelReply, ModelRequest, Provider, StopReason, StreamDecoder, Usage, Wire}
-use para.ai.tools.{Output, ToolSpec}
+use ai.{AiError, Message, Part, Role}
+use ai.provider
+use ai.provider.{Delta, ModelReply, ModelRequest, Provider, StopReason, StreamDecoder, Usage, Wire}
+use ai.tools.{Output, ToolSpec}
 
 // The Gemini Generative Language API, as a codec.
 //

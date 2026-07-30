@@ -18,8 +18,6 @@
 //     ANTHROPIC_API_KEY=sk-... noeta run  main.noe    # a real extraction
 //     noeta run  main.noe                             # no key: answers from the mock
 //     noeta test main.noe                             # the assertions
-namespace noeta.structured
-
 use std.{env, io}
 use para.ai.{Agent, AgentConfig, AiError, Conversation, drive_sync, extract}
 use para.ai.guard.{Approval, Approve, Blocklist, Stage}

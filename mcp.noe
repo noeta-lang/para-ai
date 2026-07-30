@@ -50,8 +50,6 @@
 //     way it is and what it costs.
 //   * **A chatty server** cannot spin forever either way: a reply is awaited for at most
 //     `read_budget` intervening documents (default 64), after which the exchange fails.
-namespace para.ai.mcp
-
 use std.{env, fs, json, os}
 use std.http.client
 use std.http.server
@@ -59,10 +57,10 @@ use std.http.{Framing, FrameStream, HttpError, Request, Response}
 use std.id.{uuid}
 use std.task.{map_bounded, sleep}
 use para.api.{Api, Middleware, Next}
-use para.ai.{AiError, Message, Part, Role}
-use para.ai.provider
-use para.ai.tools
-use para.ai.tools.{Arg, Local, Tool, Toolbox, ToolSource, ToolSpec}
+use ai.{AiError, Message, Part, Role}
+use ai.provider
+use ai.tools
+use ai.tools.{Arg, Local, Tool, Toolbox, ToolSource, ToolSpec}
 
 // --- The protocol ---------------------------------------------------------------------------------
 

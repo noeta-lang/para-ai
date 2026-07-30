@@ -47,13 +47,11 @@
 //
 // `McpClient` joins `ToolSource` in phase 6 and is otherwise indistinguishable to the agent; the
 // tool-call and tool-result guard stages attach around `dispatch` in phase 5.
-namespace para.ai.tools
-
 use std.json
 use std.{metrics, tracing}
 use std.task.{map_bounded}
-use para.ai.{AiError, Part}
-use para.ai.provider
+use ai.{AiError, Part}
+use ai.provider
 
 // --- The attributes ---------------------------------------------------------------------------
 
@@ -483,6 +481,10 @@ fn schema_at(t: Type, seen: List<string>): Result<Map<string, dyn>, string> {
         Type.F64 => Err("`f64` is not a tool-argument shape in container position — declare `float`"),
         Type.Bytes => Err("`bytes` has no tool-argument encoding yet: para/ai can base64-*encode* an image onto a request but ships no decoder, so a `bytes` parameter cannot be built from a model's JSON — take a `string` and decode it in the tool"),
         Type.Unit => Err("`void` is not a value a model can send"),
+        // `never` is the type of an expression that does not return. No value inhabits it,
+        // so there is nothing for a model to send — the same reading as `void`, one step
+        // stronger.
+        Type.Never => Err("`never` is not a value a model can send — no value inhabits it"),
         Type.Result(ok, err) => Err("a `Result` parameter cannot be sent by a model — a tool *returns* a `Result`, it does not take one"),
         Type.Fn(params, ret) => Err("a function-typed parameter has no JSON representation"),
         Type.DynTrait(name) => Err("a `dyn ${name}` parameter has no JSON representation — a model can only send data"),

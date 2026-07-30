@@ -14,8 +14,6 @@
 //     ANTHROPIC_API_KEY=sk-... noeta run  examples/ask/main.noe    # a real call
 //     noeta run  main.noe                                          # no key: answers from the mock
 //     noeta test main.noe                                          # the assertions
-namespace noeta.ask
-
 use std.{env, io}
 use para.ai.{Agent, AgentConfig, AiError, Conversation, Message, Part, Role, Run}
 use para.ai.mock.Mock

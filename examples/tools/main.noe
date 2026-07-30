@@ -16,8 +16,6 @@
 //     ANTHROPIC_API_KEY=sk-... noeta run  main.noe    # a real multi-turn tool loop
 //     noeta run  main.noe                             # no key: answers from the mock
 //     noeta test main.noe                             # the assertions
-namespace noeta.tools
-
 use std.{env, io}
 use para.ai.{Agent, AgentConfig, AiError, Conversation, Part, Role}
 use para.ai.mock.{Mock, ScriptedCall}

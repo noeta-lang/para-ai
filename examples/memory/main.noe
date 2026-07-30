@@ -26,8 +26,6 @@
 //     noeta run  main.noe                             # no key: the model turns come from the mock,
 //                                                     # and the memory server is real either way
 //     noeta test main.noe                             # the assertions
-namespace noeta.memory
-
 use std.{env, io, os}
 use std.id.{uuid}
 use para.ai.{Agent, AgentConfig, AiError, Conversation}

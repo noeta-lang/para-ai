@@ -35,8 +35,6 @@
 //         You are a support agent for ${company.name}.
 //         The customer's plan is ${account.plan}.
 //     }
-namespace para.ai.prompt
-
 // --- The tier -------------------------------------------------------------------------------------
 
 // A `@prompt { … }` block, as a value: the literal text the author wrote, split at every `${…}`,

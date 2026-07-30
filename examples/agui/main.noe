@@ -28,8 +28,6 @@
 //     curl -N -X POST localhost:8080/agent -H 'content-type: application/json' \
 //       -d '{"threadId":"t1","runId":"r1","state":{},"context":[],"tools":[],
 //            "forwardedProps":{},"messages":[{"id":"m1","role":"user","content":"weather in Malmö?"}]}'
-namespace noeta.agui
-
 use std.http.client
 use std.http.server
 use std.http.{Request, Response}

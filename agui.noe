@@ -34,16 +34,14 @@
 // `THINKING_*` is deprecated in favor of `REASONING_*`, so a thinking delta is encoded as the
 // latter; and `TOOL_CALL_RESULT` has no error field at all, so a failing tool's flag rides in
 // `rawEvent`, the protocol's own escape hatch. Both are in the table at `encode`.
-namespace para.ai.agui
-
 use std.http.client
 use std.http.server
 use std.http.{Frame, Request, Response, SseSink}
 use std.json
 use std.task.{map_bounded}
-use para.ai.{Agent, AgentConfig, AiError, Conversation, Event, Message, Part, Role}
-use para.ai.provider
-use para.ai.provider.{Provider, Usage}
+use ai.{Agent, AgentConfig, AiError, Conversation, Event, Message, Part, Role}
+use ai.provider
+use ai.provider.{Provider, Usage}
 // The last four are the `@test` block's, and they are up here rather than in it because **a `use`
 // inside a tier block does not work for a package name**. Measured, both shapes: with
 // `use para.ai.mock.Mock` inside the block, `noeta check` is clean and `noeta test` reports
@@ -53,8 +51,8 @@ use para.ai.provider.{Provider, Usage}
 // becomes top-level after tier activation, and by then the module graph has been resolved. A
 // whole-module `use std.http.client` inside the block *does* work, which is what makes this look
 // like it should.
-use para.ai.mock.Mock
-use para.ai.tools.{Arg, Local, Tool}
+use ai.mock.Mock
+use ai.tools.{Arg, Local, Tool}
 
 // --- The input document ---------------------------------------------------------------------------
 

@@ -27,19 +27,17 @@
 // `para.ai.guard.rewrites`, both keyed by stage and guard name) and is recorded on `Run.verdicts`.
 // "The guardrails are configured" and "the guardrails are firing" have to be distinguishable
 // without reading logs — the same distinction `Cache.hits()` draws in para/api.
-namespace para.ai.guard
-
 use std.json
 use std.regex
 // The compiled pattern type, by its own name — `std.regex` binds only the module.
 use std.regex.Pattern
 use std.{metrics, tracing}
-use para.ai.{AiError, Conversation, Message, Part, Role}
+use ai.{AiError, Conversation, Message, Part, Role}
 // `ToolSpec` is named only by this module's suite, in the scripted `ToolSource` it drives `Recall`
 // with — but the import has to be **top level** regardless: a `use` inside a tier block resolves a
 // `std` name and silently fails to resolve a *package* one, and `noeta check` says nothing about it.
 // The failure surfaces only under `noeta test`, as "cannot find type … in this scope".
-use para.ai.tools.{ToolSource, ToolSpec}
+use ai.tools.{ToolSource, ToolSpec}
 
 // --- The vocabulary -------------------------------------------------------------------------------
 

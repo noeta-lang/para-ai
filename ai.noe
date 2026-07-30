@@ -17,8 +17,6 @@
 // **Telemetry is not a module.** The run loop emits OpenTelemetry GenAI spans and metrics directly
 // onto `std.tracing`/`std.metrics`, so it cannot be forgotten: nothing when no endpoint is set,
 // everything when one is, and no configuration API of our own.
-namespace para.ai
-
 use std.http.client
 use std.http.{Frame, Framing, FrameStream, HttpError, Request}
 use std.task.{map_bounded, sleep}
@@ -29,19 +27,19 @@ use std.id.{uuid}
 use std.{env, metrics, time, tracing}
 use para.api.Api
 use para.api.middleware.Retry
-use para.ai.provider.{Delta, ModelRequest, ModelReply, Provider, StopReason, StreamDecoder, Usage, Wire, fold}
+use ai.provider.{Delta, ModelRequest, ModelReply, Provider, StopReason, StreamDecoder, Usage, Wire, fold}
 // The `@prompt` tier's value types by name, for the same reason `uuid` is: a whole-module
 // `use para.ai.prompt` would bind `prompt` as a local, and this file is full of bindings that want
 // that word. Importing the types does **not** bring the tier into a consumer's file — a consumer
 // writing `@prompt { … }` imports `para.ai.prompt.render` itself, which is the one line that
 // declares the block syntax exists.
-use para.ai.prompt.{Prompt, Resolved}
-use para.ai.tools
-use para.ai.tools.{Output, Toolbox, ToolSource}
+use ai.prompt.{Prompt, Resolved}
+use ai.tools
+use ai.tools.{Output, Toolbox, ToolSource}
 // The guard vocabulary. `decide` comes in **by name** rather than through a whole-module
 // `use para.ai.guard`: a whole-module import binds its last segment as a local, and `guard` is the
 // field `Fired` and `Denial` both want (E0020, the same collision `provider` has in this file).
-use para.ai.guard.{Fired, Guard, GuardCtx, OnDeny, Stage, Verdict, decide}
+use ai.guard.{Fired, Guard, GuardCtx, OnDeny, Stage, Verdict, decide}
 // The typed decode `extract` bottoms out in. `json.try_parse::<T>` is the recoverable door **and**
 // the one that runs `Validate` — see `extract` for why that matters more than it looks.
 use std.json
