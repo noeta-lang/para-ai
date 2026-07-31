@@ -50,7 +50,7 @@
 //     way it is and what it costs.
 //   * **A chatty server** cannot spin forever either way: a reply is awaited for at most
 //     `read_budget` intervening documents (default 64), after which the exchange fails.
-use std.{env, fs, json, os, time}
+use std.{env, fs, json, os}
 use std.http.client
 use std.http.server
 use std.http.{Framing, FrameStream, HttpError, Request, Response}
@@ -298,8 +298,6 @@ pub class Stdio {
     mut running: bool
     mut exit_status: int
     mut exited: bool
-    mut beacon: string
-    mut seq: int
     mut last_error: string
 
     fn new(command: string, args: List<string> = []): Stdio {
@@ -311,8 +309,6 @@ pub class Stdio {
             running: false,
             exit_status: 0,
             exited: false,
-            beacon: "",
-            seq: 0,
             last_error: "",
         }
     }
@@ -325,17 +321,24 @@ pub class Stdio {
     //
     //   * A blocked `read_line` parks the scheduler, so the only thing that can run beside it is a
     //     separate **isolate** (measured: an isolate watchdog killed a silent child at 300 ms while
-    //     a `spawn`ed task in the same isolate could not). An isolate needs a `concurrent` block,
-    //     which is E0040 in a synchronous `fn` — and `ToolSource.call` is synchronous and must stay
-    //     so, since it is held as `dyn` and `async` through `dyn` is unsound (DESIGN O-2). So the
-    //     read is driven through `map_bounded`, exactly as `run_sync` drives the run loop.
-    //   * A parked isolate **cannot be cancelled**: `h.cancel()` reports `Err(Cancelled)` to the
-    //     joiner and the isolate still runs to completion in its own thread (measured — the kill
-    //     still landed). So the watchdog is disarmed by a **beacon file** it polls, and the join
-    //     costs at most one poll slice.
+    //     a `spawn`ed task in the same isolate could not — re-measured, and still true). An isolate
+    //     needs a `concurrent` block, which is E0040 in a synchronous `fn` — and `ToolSource.call`
+    //     is synchronous and must stay so, since it is held as `dyn` and `async` through `dyn` is
+    //     unsound (DESIGN O-2). So the read is driven through `map_bounded`, exactly as `run_sync`
+    //     drives the run loop.
     //   * The kill goes through `kill(1)`, since the `Process` handle is not `Send` and cannot cross
-    //     into the isolate. That makes the deadline POSIX-only, which is the second reason it is not
-    //     the default.
+    //     into the isolate (measured: E0042 `an isolate argument of type Process is not Send`). That
+    //     makes the deadline POSIX-only, which is the second reason it is not the default.
+    //
+    // What it costs while running is an isolate per bounded read, and nothing else: the watchdog is
+    // disarmed by `h.cancel()` the moment the reply arrives, so a server that answers in time pays
+    // one cancelled sleep slice. See `deadline_watch` for why that sleep is sliced.
+    //
+    // **This shape is retirable, and nothing here depends on it.** `Process.read_line_async` has
+    // since landed, which makes a bounded read an ordinary `race` — no isolate, no pid, no
+    // `kill(1)`, and the kill goes through the handle this class already holds. Measured; see
+    // AGENTS.md. It is a rewrite of the deadline rather than a tidy-up of it, so it is written down
+    // here rather than half-done.
     //
     // What you get for that: a hung server ends the *call* rather than the process, as
     // `AiError.Mcp(server, "timeout", …)` — a failed turn like any other.
@@ -407,12 +410,18 @@ pub class Stdio {
     // shrug. So poll for a bounded moment instead. A server that exited becomes reapable almost at
     // once; one that is still running never will, and pays this wait exactly once, at the end of a
     // session that is already over. `eof` then means what it says: still up, no longer talking.
+    //
+    // **The pause between polls is `nap`, not `time.sleep`.** `time.sleep` advances a *logical*
+    // clock and returns at once, so the first version of this loop was twenty `try_wait`s back to
+    // back with no wall clock between them — which spends its whole budget in microseconds and
+    // reports `eof` for an exiting server exactly as a single poll would. It flaked at about one run
+    // in eight until this became a real pause.
     fn ended(): Result<?string, AiError> {
         mut tries = 0
         while !self.exited && tries < exit_settle_tries() {
             self.reap()
             if !self.exited {
-                time.sleep(exit_settle_ms())
+                nap(exit_settle_ms())
             }
             tries = tries + 1
         }
@@ -434,15 +443,7 @@ pub class Stdio {
         if self.deadline_ms <= 0 {
             return Ok(p.read_line())
         }
-        self.seq = self.seq + 1
-        token = "${self.seq}"
-        fs.write(self.beacon, token)
-        out = read_guarded(ReadJob {
-            child: p,
-            deadline_ms: self.deadline_ms,
-            beacon: self.beacon,
-            token: token,
-        })
+        out = read_guarded(ReadJob { child: p, deadline_ms: self.deadline_ms })
         if out.timed_out {
             self.running = false
             self.exited = true
@@ -480,10 +481,6 @@ pub class Stdio {
             self.child = some(os.spawn(resolved, self.args))
             self.running = true
             self.exited = false
-            if self.deadline_ms > 0 {
-                self.beacon = "${temp_dir()}/para-ai-mcp-${uuid()}.beacon"
-                fs.write(self.beacon, "idle")
-            }
             return Ok()
         }
 
@@ -547,10 +544,6 @@ pub class Stdio {
                 },
                 none => {},
             }
-            if self.beacon != "" {
-                fs.remove(self.beacon)
-                self.beacon = ""
-            }
             self.child = none
             return
         }
@@ -579,7 +572,8 @@ fn temp_dir(): string {
 
 // How long `Stdio.ended` lets a just-closed stdout become an observable exit status, and in how many
 // steps. Module-level `fn`s rather than methods: one that never mentions `self` is an associated
-// function (E0047) and cannot be called on a value. 100ms in total, paid only on the `eof` path.
+// function (E0047) and cannot be called on a value. 100 ms of real wall clock in total (through
+// `nap`, not `time.sleep` — see `ended`), paid only on the `eof` path.
 fn exit_settle_ms(): int {
     return 5
 }
@@ -595,8 +589,6 @@ fn exit_settle_tries(): int {
 struct ReadJob {
     child: os.Process
     deadline_ms: int
-    beacon: string
-    token: string
 }
 
 struct ReadOut {
@@ -607,44 +599,36 @@ struct ReadOut {
 // The watchdog, which runs in **its own isolate** because that is the only thing that runs beside a
 // blocked `read_line` (measured — see `Stdio.with_deadline`).
 //
-// It polls the beacon rather than sleeping the whole deadline for two reasons: a parked isolate
-// cannot be cancelled, so the beacon is the only disarm available; and polling means the join at the
-// end of the `concurrent` block costs one slice rather than the whole deadline.
+// It sleeps its deadline in 5 ms **slices**, and that is the load-bearing detail: a worker parked in
+// one long `sleep` observes a cancel only when that sleep ends, while a slice returns to the
+// scheduler and the scheduler checks. A whole-deadline sleep would make `h.cancel()` below cost the
+// full deadline on every reply that arrived in time; slices make the disarm immediate. Measured, not
+// assumed: a slice-sleeping isolate cancelled 60 ms into a 3 s deadline joined `Err(Cancelled)` at
+// once and never reached the code past its loop.
 //
-// Only `Send` values cross the boundary — the `Process` handle cannot, which is why the kill goes
-// through `kill(1)` by pid.
-async fn deadline_watch(pid: int, ms: int, beacon: string, token: string): int {
+// Only `Send` values cross the boundary — the `Process` handle cannot (E0042), which is why the kill
+// goes through `kill(1)` by pid.
+async fn deadline_watch(pid: int, ms: int): int {
     slice = 5
     mut waited = 0
-    mut fired = 0
-    mut watching = true
-    while watching {
+    while waited < ms {
         sleep(slice).await
         waited = waited + slice
-        if !armed(beacon, token) {
-            watching = false
-        } else if waited >= ms {
-            os.exec("kill", ["-KILL", "${pid}"])
-            fired = 1
-            watching = false
-        }
     }
-    return fired
-}
-
-fn armed(beacon: string, token: string): bool {
-    return fs.exists(beacon) && fs.read(beacon) == token
+    os.exec("kill", ["-KILL", "${pid}"])
+    return 1
 }
 
 async fn guarded(j: ReadJob): ReadOut {
     mut line: ?string = none
     mut fired = 0
     concurrent {
-        h = isolate deadline_watch(j.child.pid(), j.deadline_ms, j.beacon, j.token)
+        h = isolate deadline_watch(j.child.pid(), j.deadline_ms)
         line = j.child.read_line()
-        // Disarm before joining: the watchdog sees this on its next poll and returns without
-        // killing a server that answered in time.
-        fs.write(j.beacon, "done")
+        // Disarm: a server that answered in time cancels its watchdog, which stops at its next
+        // slice without killing anything. `join` is the report — `Ok(1)` only if the kill had
+        // already gone out, which is the honest reading of a reply that raced the deadline.
+        h.cancel()
         fired = match h.join() {
             Ok(v) => v,
             Err(_) => 0,
@@ -2530,6 +2514,19 @@ fn connect_error(t: dyn Transport): string {
         assert(message.contains("timeout"), message)
         assert(message.contains("400ms"), message)
         assert(message.contains("terminated"), "the deadline is terminal, and says so: ${message}")
+        c.close()
+    }
+
+    // The other half of the deadline, and the one a broken disarm would break: a server that
+    // answers gets its watchdog cancelled and keeps living. Several calls, each well inside a
+    // deadline short enough that a watchdog left armed would kill the server before the last one —
+    // so a failure here reads "the disarm stopped working" rather than "something is slow".
+    fn a_server_that_answers_in_time_is_untouched_by_the_deadline(): void {
+        c = probe_deadline("", 400)
+        for word in ["one", "two", "three", "four"] {
+            answer = call_or_fail(c, "echo", "{\"text\": \"${word}\"}")
+            assert(answer.contains(word), answer)
+        }
         c.close()
     }
 
