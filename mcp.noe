@@ -334,6 +334,12 @@ pub class Stdio {
     // disarmed by `h.cancel()` the moment the reply arrives, so a server that answers in time pays
     // one cancelled sleep slice. See `deadline_watch` for why that sleep is sliced.
     //
+    // **This shape is retirable, and nothing here depends on it.** `Process.read_line_async` has
+    // since landed, which makes a bounded read an ordinary `race` — no isolate, no pid, no
+    // `kill(1)`, and the kill goes through the handle this class already holds. Measured; see
+    // AGENTS.md. It is a rewrite of the deadline rather than a tidy-up of it, so it is written down
+    // here rather than half-done.
+    //
     // What you get for that: a hung server ends the *call* rather than the process, as
     // `AiError.Mcp(server, "timeout", …)` — a failed turn like any other.
     fn with_deadline(ms: int): Stdio {
