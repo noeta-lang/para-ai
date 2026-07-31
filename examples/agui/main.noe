@@ -125,7 +125,10 @@ fn port(): int {
     return (env.get("PORT") ?? "8080").to_int() ?? 8080
 }
 
-// `noeta test` never runs top-level statements, so these two lines are the entry point only.
+// **`server.serve` is declared `never`, so this entry point is dropped under `noeta test`.** A
+// file's top-level statements are otherwise the shared setup every `@test` in it runs on — once per
+// test — and the runner drops only what cannot finish. That is what makes a file with a server in it
+// runnable as a suite at all; an entry point that *does* return belongs behind `os.exit(…)`.
 io.outln("AG-UI agent on http://localhost:${port()}/agent")
 server.serve(port(), fetch)
 

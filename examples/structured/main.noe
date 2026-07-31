@@ -18,7 +18,7 @@
 //     ANTHROPIC_API_KEY=sk-... noeta run  main.noe    # a real extraction
 //     noeta run  main.noe                             # no key: answers from the mock
 //     noeta test main.noe                             # the assertions
-use std.{env, io}
+use std.{env, io, os}
 use para.ai.{Agent, AgentConfig, AiError, Conversation, drive_sync, extract}
 use para.ai.guard.{Approval, Approve, Blocklist, Stage}
 use para.ai.mock.Mock
@@ -91,7 +91,7 @@ fn shape(): Result<Output, AiError> {
 // a scripted `Mock` whose first answer is deliberately out of range, so the repair round happens in
 // front of you.
 
-fn main(): void {
+fn main_status(): int {
     // A block-bodied `match` arm produces no value, so the failing arm cannot both print and return
     // from inside an expression — the whole `match` is a statement instead.
     match shape() {
@@ -100,8 +100,10 @@ fn main(): void {
         },
         Err(e) => {
             io.outln("the schema would not derive: ${e}")
+            return 1
         },
     }
+    return 0
 }
 
 fn run_with(out: Output): void {
@@ -170,7 +172,13 @@ fn repairing_mock(): Mock {
         .reply_text("{\"company\":\"Acme Industries\",\"sentiment\":\"positive\",\"confidence\":0.85,\"lead\":{\"who\":\"Dana Reyes\",\"weight\":2.0},\"note\":null}")
 }
 
-main()
+// **`os.exit(...)` rather than a bare call.** A file's top-level statements are the *shared setup*
+// every `@test` in it runs on — once per test, in a fresh isolate — so a bare entry point would make
+// every assertion below pay for a full run first, and with a key in the environment pay a vendor for
+// it. `os.exit` is declared `never`, and the runner drops a statement that cannot finish, argument
+// and all. (The claim that used to stand here — that `noeta test` never runs top-level statements —
+// is not what the runner does; see the Testing guide's "What runs, and what does not".)
+os.exit(main_status())
 
 @test {
     // The whole claim of DESIGN §8.5, as exact bytes: the schema is **derived** from the five field

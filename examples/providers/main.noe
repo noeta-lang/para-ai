@@ -25,7 +25,7 @@
 //     noeta test main.noe                          # the assertions
 use std.http.{Frame}
 use std.http.client
-use std.{env, io}
+use std.{env, io, os}
 use para.api.Api
 use para.api.middleware
 use para.ai.{Agent, AgentConfig, AiError, Message}
@@ -219,15 +219,25 @@ fn canned(path: string, body: string): Api {
     return Api.new(client.new().retry(0)).with(middleware.Mock.new().route("post", path, 200, body))
 }
 
-// `noeta test` never runs top-level statements, so these lines are the entry point only.
-io.outln("provider: ${chosen()} (model ${model_for(chosen())})")
-io.outln(if ollama_reachable()
-    then "a local Ollama is answering at ${ollama_host()} — `noeta test main.noe` will talk to it for real"
-    else "no local Ollama at ${ollama_host()} — the live checks in `noeta test main.noe` will skip")
-io.outln(match ask("Say hello in Swedish.") {
-    Ok(answer) => answer,
-    Err(e) => "error: ${e}",
-})
+fn demo(): int {
+    io.outln("provider: ${chosen()} (model ${model_for(chosen())})")
+    io.outln(if ollama_reachable()
+        then "a local Ollama is answering at ${ollama_host()} — `noeta test main.noe` will talk to it for real"
+        else "no local Ollama at ${ollama_host()} — the live checks in `noeta test main.noe` will skip")
+    io.outln(match ask("Say hello in Swedish.") {
+        Ok(answer) => answer,
+        Err(e) => "error: ${e}",
+    })
+    return 0
+}
+
+// **`os.exit(...)` rather than a bare call.** A file's top-level statements are the *shared setup*
+// every `@test` in it runs on — once per test, in a fresh isolate — so a bare entry point would make
+// every assertion below pay for a full run first, and with a key in the environment pay a vendor for
+// it. `os.exit` is declared `never`, and the runner drops a statement that cannot finish, argument
+// and all. (The claim that used to stand here — that `noeta test` never runs top-level statements —
+// is not what the runner does; see the Testing guide's "What runs, and what does not".)
+os.exit(demo())
 
 @test {
     // The selection falls back to the scripted mock when there is no credential and no local model,

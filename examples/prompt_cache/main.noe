@@ -104,7 +104,11 @@ fn offline(): Mock {
     return Mock.new().with_cache_reads(1580).reply_text("Jag eskalerar ärendet till fakturateamet.")
 }
 
-// `noeta test` never runs top-level statements, so everything below here is the entry point only.
+// **These bindings are deliberately shared setup.** A file's top-level statements are the fixture
+// every `@test` in it runs on — once per test, in a fresh isolate — and the tests below capture
+// `encoded`, `stable_turn` and friends with `use (…)`. That is the right shape *here* because none
+// of this work touches a network: an entry point that made a live model call would make every
+// assertion pay for one, and belongs behind `os.exit(demo())` instead (see `examples/ask`).
 recall = CountingRecall.new()
 prompt = system_prompt(acme(), recall)
 

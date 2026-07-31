@@ -102,11 +102,21 @@ fn demo(): Result<string, AiError> {
     return Ok("${stored}\n${recalled}")
 }
 
-// `noeta test` never runs top-level statements, so this is the entry point only.
-io.outln(match demo() {
-    Ok(both) => both,
-    Err(e) => "error: ${e}",
-})
+fn report(): int {
+    io.outln(match demo() {
+        Ok(both) => both,
+        Err(e) => "error: ${e}",
+    })
+    return 0
+}
+
+// **`os.exit(...)` rather than a bare call.** A file's top-level statements are the *shared setup*
+// every `@test` in it runs on — once per test, in a fresh isolate — so a bare entry point would make
+// every assertion below pay for a full run first, and with a key in the environment pay a vendor for
+// it. `os.exit` is declared `never`, and the runner drops a statement that cannot finish, argument
+// and all. (The claim that used to stand here — that `noeta test` never runs top-level statements —
+// is not what the runner does; see the Testing guide's "What runs, and what does not".)
+os.exit(report())
 
 @test {
     // The agent's whole vocabulary came from a subprocess, and it is an ordinary toolbox: the same
