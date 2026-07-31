@@ -49,7 +49,7 @@
 // tool-call and tool-result guard stages attach around `dispatch` in phase 5.
 use std.json
 use std.{metrics, tracing}
-use std.task.{map_bounded}
+use std.task.map_bounded
 use ai.{AiError, Part}
 use ai.provider
 
@@ -73,10 +73,15 @@ pub struct Tool {
     pub name: string = ""
 }
 
-// Per-parameter metadata. `help` becomes the parameter's `description` in the derived JSON Schema,
-// which is the only place a model learns what a bare `string` is *for* — an enum-valued parameter
-// spelled as a string names its accepted values here.
-@attribute(Param)
+// Per-parameter and per-**field** metadata. `help` becomes the `description` in the derived JSON
+// Schema, which is the only place a model learns what a bare `string` is *for* — an enum-valued
+// parameter or field spelled as a string names its accepted values here.
+//
+// `Field` is in the target list because the type door (`Output.of` → `schema_for`) walks a declared
+// type's fields through exactly the walk the parameter door walks a signature's parameters, and a
+// description is not a property of which door you came through. See `field_help` for why a field's
+// is read by a different query than a parameter's.
+@attribute(Param, Field)
 pub struct Arg {
     pub help: string = ""
 }
@@ -150,20 +155,20 @@ pub struct Output {
 // refuse what it cannot express, loudly, naming the offending part. It also happens to be what
 // phase 6 needs — an MCP `tools/list` is a network call.
 pub trait ToolSource {
-    // A stable, low-cardinality identity — `"local"`, `"mcp:memory"`. It appears in the collision
-    // error naming both sources, so it has to be recognizable in a message.
     fn source_name(): string
-
-    // `gen_ai.tool.type` for every tool from this source: `"function"` or `"mcp"`.
     fn tool_type(): string
-
-    // Every tool this source offers, with its derived schema.
     fn specs(): Result<List<ToolSpec>, AiError>
-
-    // Run one, by its model-facing name, with its raw JSON argument blob. `Err` is not fatal: the
-    // agent turns it into `ToolResult(is_error: true)` and lets the model try again.
     fn call(name: string, args: string): Result<string, AiError>
 }
+// A stable, low-cardinality identity — `"local"`, `"mcp:memory"`. It appears in the collision
+// error naming both sources, so it has to be recognizable in a message.
+
+// `gen_ai.tool.type` for every tool from this source: `"function"` or `"mcp"`.
+
+// Every tool this source offers, with its derived schema.
+
+// Run one, by its model-facing name, with its raw JSON argument blob. `Err` is not fatal: the
+// agent turns it into `ToolResult(is_error: true)` and lets the model try again.
 
 // --- Local: reflection over `#[Tool]` --------------------------------------------------------------
 
@@ -216,7 +221,7 @@ fn target_of(name: string): ?string {
 }
 
 // Everything before a reflection key's last segment: `para.ai.tools` for the free function
-// `para.ai.tools.shout`, `para.ai.tools.Toolbox` for the method `para.ai.tools.Toolbox.call`.
+// `ai.tools.shout`, `ai.tools.Toolbox` for the method `ai.tools.Toolbox.call`.
 fn owner_of(target: string): string {
     parts = target.split(".")
     if parts.len() < 2 {
@@ -234,7 +239,7 @@ fn owner_of(target: string): string {
 // Does this reflection key name a method rather than a top-level function?
 //
 // Not "does it contain a dot": a reflection key is **qualified**, so a namespaced module's own free
-// function is keyed `para.ai.tools.shout` and has plenty of dots. What distinguishes a method is its
+// function is keyed `ai.tools.shout` and has plenty of dots. What distinguishes a method is its
 // owner — the key without its last segment names a declared type, which has a field schema. A
 // method on a fieldless struct or on an enum slips past this and is caught one layer down, where
 // `invoke` reports it by name ("a qualified name dispatches through the three-argument `invoke`").
@@ -386,10 +391,10 @@ pub fn schema_of(target: string): Result<string, string> {
         "type": "object",
         "properties": props,
         "required": required,
-        // The dispatcher rejects an argument no parameter accepts, so the schema says so too. A
-        // model that is told the object is closed sends fewer invented keys.
         "additionalProperties": false,
     }
+    // The dispatcher rejects an argument no parameter accepts, so the schema says so too. A
+    // model that is told the object is closed sends fewer invented keys.
     return Ok(json.stringify(obj))
 }
 
@@ -429,6 +434,32 @@ fn help_of(p: ParamInfo): string {
     for a in p.attrs {
         if a is Arg {
             return a.help
+        }
+    }
+    return ""
+}
+
+// The `#[Arg(help: …)]` on a **field** — the type door's half of the same question the parameter
+// door asks through `ParamInfo.attrs`.
+//
+// It has to be asked differently, and the difference is a language fact rather than a design choice:
+// `ParamInfo` carries its parameter's attributes, and `FieldSpec` does not carry its field's. What
+// the language does give is the other direction — `attributes_of::<Arg>()` is whole-program and
+// reports every `#[Arg]` in it with the target it decorates, and a *field*'s target is
+// `"<Type>.<field>"`. So the lookup is by name rather than by handle, and one linear pass answers
+// every field of every type.
+//
+// **Why it matters more than it looks.** Without it, a `#[Tool]` parameter can tell a model what a
+// bare `string` is for and an `extract::<T>` field cannot — so an output field whose accepted values
+// are `billing | shipping | technical | other` reaches the vendor as `{"type": "string"}` and the
+// model invents `"Lost order"`, which `Validate` then refuses at the decode door. That was measured
+// against a live Gemini, and the repair round costs a model call to say what the schema could have
+// said for free. §8.5's claim that the two doors derive the same bytes is only true with this.
+fn field_help(owner: string, field: string): string {
+    want = "${owner}.${field}"
+    for a in attributes_of::<Arg>() {
+        if a.target == want {
+            return a.value.help
         }
     }
     return ""
@@ -570,6 +601,10 @@ fn object_schema(name: string, fields: List<FieldSpec>, seen: List<string>): Res
                 // `field \`A.b\`: field \`B.c\`: …` rather than as a bare complaint about a type.
                 return Err("field `${name}.${f.name}`: ${e}")
             },
+        }
+        help = field_help(name, f.name)
+        if help != "" {
+            one = one.set("description", help)
         }
         props = props.set(f.name, one)
         if !f.optional && !is_option(f.type) {
@@ -1365,7 +1400,7 @@ pub fn dispatch(box: Toolbox, calls: List<Part>, concurrency: int): List<Part> {
 //
 // They stay at **module level**, unlike the `#[Tool]` fixtures in the `@test` block below, and the
 // difference is load-bearing rather than an oversight. A declaration lifted out of a dev tier is
-// keyed by its **bare** name, where a module-level one is keyed `para.ai.tools.<name>` — so these
+// keyed by its **bare** name, where a module-level one is keyed `ai.tools.<name>` — so these
 // are what keep `schema_of` and `params_of` under test against a *qualified* reflection key, which
 // is the shape every tool in a namespaced consumer module has. Nothing here is `#[Tool]`, so none
 // of it is reachable by a model, which is the property the tier exists to protect.
@@ -1409,7 +1444,7 @@ fn refuses_nested(xs: List<bytes>): void {
 // --- Probe declarations for the nominal walk ------------------------------------------------------
 //
 // Module level, for the same reason the refusals above are: a declaration lifted out of a `@test`
-// block is keyed by its **bare** name, and the qualified key (`para.ai.tools.Mood`) is the shape
+// block is keyed by its **bare** name, and the qualified key (`ai.tools.Mood`) is the shape
 // every type in a namespaced consumer module actually has. None of these is `#[Tool]` and none is
 // `pub`, so nothing here is reachable by a model or nameable by a consumer — they exist to be
 // *reflected*, which needs neither.
@@ -1445,6 +1480,17 @@ struct SchemaProbe {
     confidence: float = 0.5
 }
 
+// A type whose fields carry their own `#[Arg(help: …)]` — the type door's half of the description
+// story. Two annotated fields and one bare one, because "an unannotated field gets no `description`
+// key" is as much of the contract as the annotated ones are.
+struct Described {
+    #[Arg(help: "`billing`, `shipping`, or `other`")]
+    category: string
+    #[Arg(help: "1 (a question) to 5 (money is on fire)")]
+    severity: int
+    plain: bool
+}
+
 // Self-referential: a cycle has no finite JSON Schema without `$ref`.
 struct Cyclic {
     label: string
@@ -1469,7 +1515,6 @@ fn takes_a_struct_hiding_an_enum(p: SchemaProbe): void {
     return
 }
 
-
 // One parameter of each supported declared type, so a coercion test can take its `Type` from a real
 // signature. The same reason the refusals above are real declarations, and it is not the language's:
 // a `Type` value *can* be written in expression position now (`Type.Unit` used to type-check and
@@ -1486,8 +1531,8 @@ fn types_probe(
     si: Set<int>,
     mi: Map<string, int>,
     os: ?string,
-    uis: int|string,
-    uib: int|bool,
+    uis: int | string,
+    uib: int | bool,
 ): void {
     return
 }
@@ -1513,7 +1558,7 @@ fn types_probe(
     // ineffective (AGENTS.md).
     //
     // One consequence to know when reading the tests below: a declaration lifted out of a tier
-    // block is keyed by its **bare** name (`shout`), not `para.ai.tools.shout`.
+    // block is keyed by its **bare** name (`shout`), not `ai.tools.shout`.
 
     #[std.test.Skip("a tool fixture for this module's suite, not a test")]
     #[Tool(about: "Echo a string back, uppercased")]
@@ -1543,7 +1588,7 @@ fn types_probe(
         lookup: Map<string, int>,
         maybe: ?string,
         anything: dyn,
-        either: int|string,
+        either: int | string,
     ): string {
         return "${flag}/${ratio}/${tags.len()}/${uniq.len()}/${lookup.len()}/${maybe ?? "-"}/${anything}/${either}"
     }
@@ -1594,7 +1639,7 @@ fn types_probe(
             }
         }
         // A dev-tier declaration is keyed by its bare name; a module-level one by the **qualified**
-        // reflection key `params_of`/`invoke` take (`para.ai.tools.refuses_bytes`). Both shapes are
+        // reflection key `params_of`/`invoke` take (`ai.tools.refuses_bytes`). Both shapes are
         // asserted here, which is the whole reason the refusal probes stayed at module level.
         assert(tagged.contains("shout"), "roles_of::<Semantic>() sees the tools: ${tagged}")
         assert(tagged.contains("add_ints"), "the role rides the target, not the model-facing name: ${tagged}")
@@ -1611,8 +1656,7 @@ fn types_probe(
     fn a_signature_derives_exactly_this_json_schema(): void {
         derived = schema_or_fail("add_ints")
         assert(derived
-            == "{\"additionalProperties\":false,\"properties\":{\"a\":{\"description\":\"The left operand\",\"type\":\"integer\"},\"b\":{\"description\":\"The right operand\",\"type\":\"integer\"}},\"required\":[\"a\"],\"type\":\"object\"}",
-            derived)
+            == "{\"additionalProperties\":false,\"properties\":{\"a\":{\"description\":\"The left operand\",\"type\":\"integer\"},\"b\":{\"description\":\"The right operand\",\"type\":\"integer\"}},\"required\":[\"a\"],\"type\":\"object\"}", derived)
     }
 
     // `#[Arg(help)]` is the parameter's `description`, which is where a model learns what a bare
@@ -1640,8 +1684,7 @@ fn types_probe(
         // `dyn` is declared to accept anything, so the empty schema is the honest reading.
         assert(s.contains("\"anything\":{}"), s)
         assert(s.contains("\"either\":{\"anyOf\":[{\"type\":\"integer\"},{\"type\":\"string\"}]}"), s)
-        assert(s.contains("\"required\":[\"flag\",\"ratio\",\"tags\",\"uniq\",\"lookup\",\"anything\",\"either\"]"),
-            "an `?T` parameter is never required: ${s}")
+        assert(s.contains("\"required\":[\"flag\",\"ratio\",\"tags\",\"uniq\",\"lookup\",\"anything\",\"either\"]"), "an `?T` parameter is never required: ${s}")
     }
 
     // Total means total: every underivable declared type is a message naming the parameter, the
@@ -1673,40 +1716,39 @@ fn types_probe(
     // absent from the inner `required` because it declared a default), `note` is present in
     // `properties` and absent from `required`, and every object is closed.
     fn a_declared_type_derives_exactly_this_json_schema(): void {
-        derived = type_schema_or_fail("para.ai.tools.SchemaProbe")
+        derived = type_schema_or_fail(local_target("SchemaProbe"))
         assert(derived
-            == "{\"additionalProperties\":false,\"properties\":{\"company\":{\"type\":\"string\"},\"confidence\":{\"type\":\"number\"},\"lead\":{\"additionalProperties\":false,\"properties\":{\"weight\":{\"type\":\"number\"},\"who\":{\"type\":\"string\"}},\"required\":[\"who\"],\"type\":\"object\"},\"mentions\":{\"items\":{\"additionalProperties\":false,\"properties\":{\"weight\":{\"type\":\"number\"},\"who\":{\"type\":\"string\"}},\"required\":[\"who\"],\"type\":\"object\"},\"type\":\"array\"},\"mood\":{\"enum\":[\"Positive\",\"Negative\",\"Mixed\"],\"type\":\"string\"},\"note\":{\"type\":\"string\"},\"tier\":{\"enum\":[\"free\",\"paid\"],\"type\":\"string\"}},\"required\":[\"company\",\"mood\",\"tier\",\"lead\",\"mentions\"],\"type\":\"object\"}",
-            derived)
+            == "{\"additionalProperties\":false,\"properties\":{\"company\":{\"type\":\"string\"},\"confidence\":{\"type\":\"number\"},\"lead\":{\"additionalProperties\":false,\"properties\":{\"weight\":{\"type\":\"number\"},\"who\":{\"type\":\"string\"}},\"required\":[\"who\"],\"type\":\"object\"},\"mentions\":{\"items\":{\"additionalProperties\":false,\"properties\":{\"weight\":{\"type\":\"number\"},\"who\":{\"type\":\"string\"}},\"required\":[\"who\"],\"type\":\"object\"},\"type\":\"array\"},\"mood\":{\"enum\":[\"Positive\",\"Negative\",\"Mixed\"],\"type\":\"string\"},\"note\":{\"type\":\"string\"},\"tier\":{\"enum\":[\"free\",\"paid\"],\"type\":\"string\"}},\"required\":[\"company\",\"mood\",\"tier\",\"lead\",\"mentions\"],\"type\":\"object\"}", derived)
     }
 
     // The two queries are asked as a pair, and this is why: through `field_specs_of` alone an enum
     // and a field-less struct are the same answer. A schema builder that walked fields only would
     // have emitted an empty object for `Mood` and been silently wrong.
     fn an_enum_is_told_from_a_fieldless_struct_by_variants_of(): void {
-        assert(field_specs_of("para.ai.tools.Mood").len() == 0, "an enum has no fields")
-        assert(variants_of("para.ai.tools.Mood").len() == 3, "and three variants")
-        assert(field_specs_of("para.ai.tools.Mention").len() == 2, "a struct has fields")
-        assert(variants_of("para.ai.tools.Mention").len() == 0, "and no variants")
+        assert(field_specs_of(local_target("Mood")).len() == 0, "an enum has no fields")
+        assert(variants_of(local_target("Mood")).len() == 3, "and three variants")
+        assert(field_specs_of(local_target("Mention")).len() == 2, "a struct has fields")
+        assert(variants_of(local_target("Mention")).len() == 0, "and no variants")
     }
 
     // A backed enum's wire value is its backing. Emitting the case names would describe a document
     // nothing produces.
     fn a_backed_enum_carries_its_backings_not_its_case_names(): void {
-        s = type_schema_or_fail("para.ai.tools.Tier")
+        s = type_schema_or_fail(local_target("Tier"))
         assert(s == "{\"enum\":[\"free\",\"paid\"],\"type\":\"string\"}", s)
     }
 
     // A cycle is refused by name rather than walked until the stack runs out.
     fn a_recursive_type_is_refused_naming_the_cycle(): void {
-        e = type_refusal("para.ai.tools.Cyclic")
+        e = type_refusal(local_target("Cyclic"))
         assert(e.contains("is recursive"), e)
-        assert(e.contains("para.ai.tools.Cyclic → para.ai.tools.Cyclic"), "it prints the chain: ${e}")
+        assert(e.contains(local_target("Cyclic") ~ " → " ~ local_target("Cyclic")), "it prints the chain: ${e}")
         assert(e.contains("$ref"), "and says what a cycle would need: ${e}")
     }
 
     // A name nothing declares answers both queries with nothing, which is the one honest "unknown".
     fn a_name_nothing_declares_is_neither_a_struct_nor_an_enum(): void {
-        e = type_refusal("para.ai.tools.NoSuchType")
+        e = type_refusal(local_target("NoSuchType"))
         assert(e.contains("declares neither fields nor variants"), e)
     }
 
@@ -1714,11 +1756,29 @@ fn types_probe(
     // struct-typed *field* produce byte-identical fragments. One walk, one place a bug can live.
     fn the_parameter_door_and_the_type_door_derive_the_same_bytes(): void {
         // `local_target` because `takes_a_struct` is a module-level declaration and so is keyed
-        // `para.ai.tools.takes_a_struct`, where a fixture lifted out of this `@test` block is keyed
+        // `ai.tools.takes_a_struct`, where a fixture lifted out of this `@test` block is keyed
         // by its bare name.
         param = schema_or_fail(local_target("takes_a_struct"))
-        field = type_schema_or_fail("para.ai.tools.Mention")
+        field = type_schema_or_fail(local_target("Mention"))
         assert(param.contains(field), "the parameter schema embeds the type schema verbatim: ${param} vs ${field}")
+    }
+
+    // **A field describes itself, exactly as a parameter does.** `#[Arg(help: …)]` becomes the
+    // field's `description`, which is where a model learns that a `string` named `category` takes
+    // one of four words — the single most valuable line in a structured-output schema, and the one
+    // §8.5's "same bytes" claim was quietly missing. Measured against a live Gemini before it
+    // existed: the model answered `"category": "Lost order"`, `Validate` refused it at the decode
+    // door, and the repair round spent a model call restating what the schema could have said.
+    //
+    // A field is annotated but read through a *different query* than a parameter — `ParamInfo`
+    // carries its attributes and `FieldSpec` does not — so this asserts the whole-program
+    // `attributes_of::<Arg>()` lookup lands on the right field of the right type.
+    fn a_field_describes_itself_exactly_as_a_parameter_does(): void {
+        s = type_schema_or_fail(local_target("Described"))
+        assert(s.contains("\"category\":{\"description\":\"`billing`, `shipping`, or `other`\",\"type\":\"string\"}"), s)
+        assert(s.contains("\"severity\":{\"description\":\"1 (a question) to 5 (money is on fire)\",\"type\":\"integer\"}"), s)
+        // An unannotated field carries no `description` key at all — an empty one would be a claim.
+        assert(s.contains("\"plain\":{\"type\":\"boolean\"}"), "a bare field stays bare: ${s}")
     }
 
     // The refusal DESIGN §6 records has changed layer and reason, and the message says so. The old
@@ -1731,7 +1791,7 @@ fn types_probe(
         assert(!e.contains("there is no `variants_of`"), "the primitive it used to blame has landed: ${e}")
         // And the schema really does derive, which is what makes that claim checkable rather than
         // an apology.
-        assert(type_schema_or_fail("para.ai.tools.Mood") == "{\"enum\":[\"Positive\",\"Negative\",\"Mixed\"],\"type\":\"string\"}")
+        assert(type_schema_or_fail(local_target("Mood")) == "{\"enum\":[\"Positive\",\"Negative\",\"Mixed\"],\"type\":\"string\"}")
     }
 
     // The parameter refusal walks: an enum buried two levels down is caught at the parameter, not
@@ -1745,7 +1805,7 @@ fn types_probe(
     // A payload-carrying enum is refused by the *schema*, separately from the parameter refusal
     // above: a data-carrying sum type has no one spelling every vendor's strict mode accepts.
     fn a_data_carrying_enum_has_no_schema(): void {
-        e = type_refusal("para.ai.Part")
+        e = type_refusal("ai.Part")
         assert(e.contains("carries a payload"), e)
     }
 
@@ -1823,22 +1883,17 @@ fn types_probe(
     // aborts at the first field read.
     fn a_struct_parameter_is_built_from_its_json_object(): void {
         target = local_target("takes_a_struct")
-        assert(coerced_param(target, "m", "{\"who\": \"ada\"}") == "Mention {who: \"ada\", weight: 1.0}",
-            coerced_param(target, "m", "{\"who\": \"ada\"}"))
-        assert(coerced_param(target, "m", "{\"who\": \"ada\", \"weight\": 2}") == "Mention {who: \"ada\", weight: 2.0}",
-            "a neighboring JSON type coerces inside a struct too")
+        assert(coerced_param(target, "m", "{\"who\": \"ada\"}") == "Mention {who: \"ada\", weight: 1.0}", coerced_param(target, "m", "{\"who\": \"ada\"}"))
+        assert(coerced_param(target, "m", "{\"who\": \"ada\", \"weight\": 2}") == "Mention {who: \"ada\", weight: 2.0}", "a neighboring JSON type coerces inside a struct too")
     }
 
     // The closed schema is enforced on the way in, exactly as it is for a callable's arguments: a
     // key no field declares is refused rather than dropped.
     fn a_struct_parameter_refuses_what_its_schema_closed(): void {
         target = local_target("takes_a_struct")
-        assert(coerced_param(target, "m", "{\"who\": \"ada\", \"nope\": 1}").contains("no field `nope`"),
-            coerced_param(target, "m", "{\"who\": \"ada\", \"nope\": 1}"))
-        assert(coerced_param(target, "m", "{}").contains("requires the field `who`"),
-            coerced_param(target, "m", "{}"))
-        assert(coerced_param(target, "m", "{\"who\": {\"a\": 1}}").contains("Mention.who"),
-            "a field failure names its path: ${coerced_param(target, "m", "{\"who\": {\"a\": 1}}")}")
+        assert(coerced_param(target, "m", "{\"who\": \"ada\", \"nope\": 1}").contains("no field `nope`"), coerced_param(target, "m", "{\"who\": \"ada\", \"nope\": 1}"))
+        assert(coerced_param(target, "m", "{}").contains("requires the field `who`"), coerced_param(target, "m", "{}"))
+        assert(coerced_param(target, "m", "{\"who\": {\"a\": 1}}").contains("Mention.who"), "a field failure names its path: ${coerced_param(target, "m", "{\"who\": {\"a\": 1}}")}")
         assert(coerced_param(target, "m", "5").contains("expected an object"))
     }
 
@@ -1996,14 +2051,21 @@ fn types_probe(
 // and produce a value — so the unwrapping lives here instead of being repeated per test.
 
 // A reflection key for a function declared at **module level** in this module. Reflection keys are
-// qualified, so a namespaced module's own `refuses_bytes` is keyed `para.ai.tools.refuses_bytes` and
-// nothing finds a bare `refuses_bytes`.
+// qualified, so this module's own `refuses_bytes` is keyed `ai.tools.refuses_bytes` and nothing
+// finds a bare `refuses_bytes`.
+//
+// **`ai.`, not `para.ai.`** — a module's path is the *importing* program's prefix plus the file's
+// path inside the package, and the program importing this file while this suite runs is this
+// package itself, which contributes the `package` half of `para/ai`. A consumer keying us
+// `para = [{ package = "para/ai" }, …]` derives `para.ai.tools`, but that prefix is the consumer's
+// and no build here ever produces it — so a test hard-coding it asserts against a program that does
+// not exist.
 //
 // Not for the `#[Tool]` fixtures in the `@test` block: a declaration lifted out of a dev tier is
 // keyed by its bare name, because the namespace qualifier is applied to a module's top-level
 // declarations before the tier block is inlined. Those are addressed as `"shout"` and friends.
 fn local_target(name: string): string {
-    return "para.ai.tools." ~ name
+    return "ai.tools." ~ name
 }
 
 fn specs_or_fail(): List<ToolSpec> {
