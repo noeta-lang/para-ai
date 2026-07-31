@@ -30,6 +30,7 @@ use para.api.Api
 use para.api.middleware
 use para.ai.{Agent, AgentConfig, AiError, Message}
 use para.ai.mock.{Mock, Replay}
+use para.ai.provider
 use para.ai.provider.{ModelRequest}
 use para.ai.providers.anthropic.Anthropic
 use para.ai.providers.google.Google
@@ -91,8 +92,11 @@ fn model_for(which: string): string {
     }
 }
 
+// `qwen3:0.6b` because that is the model `ci.yml`'s `local-ollama` job pulls, and a default the
+// live checks are never actually run against is a default nobody maintains. It is a *thinking*
+// model, which the live checks below have to account for — see `live_provider`.
 fn ollama_model(): string {
-    return env.get("OLLAMA_MODEL") ?? "llama3.2"
+    return env.get("OLLAMA_MODEL") ?? "qwen3:0.6b"
 }
 
 // The scripted stand-in used when nothing else is available — and by the first test below.
@@ -162,6 +166,81 @@ fn live_ollama(what: string): bool {
         "OLLAMA_REQUIRED is set and nothing answered at ${ollama_host()} — ${what} may not be skipped here")
     io.outln("skipping ${what}: nothing answering at ${ollama_host()} — start `ollama serve` and `ollama pull ${ollama_model()}` to run it")
     return false
+}
+
+// --- Bounding the live checks -----------------------------------------------------------------------
+//
+// **A live check needs a deadline, and `client.new()` has none.** Every other test in this repo is
+// hermetic, so "how long may this take" never came up; these two talk to a server that can be
+// swapped, overloaded, or simply slow, and a `noeta test` with no bound has nowhere to stop. That is
+// not hypothetical either: this suite has been watched sitting on an open socket to a healthy Ollama
+// for a quarter of an hour. The cause was a toolchain bug (a pooled connection driven by a runtime
+// nobody was running — fixed upstream), and the lesson is the one that outlives it: an unbounded
+// network call in a test suite turns any remote problem into a hang, and a hang reports nothing.
+//
+// So the live checks below build their own transport rather than taking `Agent.from`'s default.
+fn live_timeout_ms(): int {
+    return (env.get("OLLAMA_TIMEOUT_MS") ?? "120000").to_int() ?? 120000
+}
+
+// **No `Retry` layer, deliberately** — unlike `Agent.from`'s default chain. A vendor's 429 is worth
+// retrying; a local Ollama that did not answer within the deadline is telling you something, and
+// three more deadlines is three times as long a wait to hear it.
+fn live_api(): Api {
+    return Api.new(client.new().timeout(live_timeout_ms()).retry(0))
+}
+
+// How many tokens the live checks give the model. Bigger than you would think necessary for "pong",
+// because of `live_provider` below: a thinking model spends its budget reasoning first, and a budget
+// too small to reach an answer produces an empty one.
+fn live_max_tokens(): int {
+    return (env.get("OLLAMA_MAX_TOKENS") ?? "256").to_int() ?? 256
+}
+
+// **A thinking model asked for one word can legitimately answer nothing at all**, and the assertions
+// below would read that as a broken codec. `qwen3` — the family CI pulls — reasons before it
+// answers, and at a small `max_tokens` every token can go to the reasoning, leaving `content` empty:
+// an honest reply to a budget that ran out, and not what this check is about. This check is about
+// whether a real server accepts the request this package encodes.
+//
+// So it asks a thinking-capable model not to think. Whether the model *is* thinking-capable comes
+// from the server rather than from its name: `/api/tags` reports a `capabilities` list per model, so
+// there is no guessing and no list to keep up to date — and it matters, because `"think": false` sent
+// to a model that cannot think is a 400, not a no-op.
+fn model_capabilities(): List<dyn> {
+    return match client.new().timeout(2000).get(ollama_host() ~ "/api/tags") {
+        Ok(r) => capabilities_in(r.body(), ollama_model()),
+        Err(_) => [],
+    }
+}
+
+fn capabilities_in(body: string, model: string): List<dyn> {
+    // `provider.parse_object`, never `json.parse`: this body came off the wire, and `json.parse`
+    // aborts the program on anything malformed.
+    listed: List<dyn> = match provider.parse_object(body, "the Ollama model list") {
+        Ok(o) => provider.list_at(o, "models"),
+        Err(_) => [],
+    }
+    for entry in listed {
+        // `as<T>` is fallible — an entry that is not an object is not this model.
+        one: Map<string, dyn> = entry.as<Map<string, dyn>>() ?? {}
+        if provider.str_at(one, "name") == model || provider.str_at(one, "model") == model {
+            return provider.list_at(one, "capabilities")
+        }
+    }
+    return []
+}
+
+fn live_provider(): Ollama {
+    caps = model_capabilities()
+    thinks = caps.contains("thinking")
+    return if thinks then Ollama.from_env().thinking(false) else Ollama.from_env()
+}
+
+// The configuration both live checks share: this example's system prompt and name, the shared token
+// budget, and one attempt at opening a stream rather than three (same reasoning as `live_api`).
+fn live_config(): AgentConfig {
+    return config(ollama_model()).with_max_tokens(live_max_tokens()).with_stream_retries(0)
 }
 
 // --- Captured vendor bodies -------------------------------------------------------------------------
@@ -329,10 +408,11 @@ os.exit(demo())
         if !live_ollama("the live buffered Ollama check") {
             return
         }
-        agent = Agent.from(config(ollama_model()).with_max_tokens(64), Ollama.from_env())
+        agent = Agent.over(live_config(), live_provider(), live_api())
         match agent.run_sync("Reply with exactly one word: pong") {
             Ok(answer) => {
-                assert(answer.len() > 0, "a live model answered with nothing at all")
+                assert(answer.len() > 0,
+                    "a live model answered with nothing at all — if `${ollama_model()}` reasons before answering, raise OLLAMA_MAX_TOKENS")
                 io.outln("live Ollama (buffered) said: ${answer}")
             },
             Err(e) => {
@@ -347,10 +427,11 @@ os.exit(demo())
         if !live_ollama("the live streamed Ollama check") {
             return
         }
-        agent = Agent.from(config(ollama_model()).with_max_tokens(64).streamed(), Ollama.from_env())
+        agent = Agent.over(live_config().streamed(), live_provider(), live_api())
         match agent.run_sync("Reply with exactly one word: pong") {
             Ok(answer) => {
-                assert(answer.len() > 0, "a live streamed model answered with nothing at all")
+                assert(answer.len() > 0,
+                    "a live streamed model answered with nothing at all — if `${ollama_model()}` reasons before answering, raise OLLAMA_MAX_TOKENS")
                 io.outln("live Ollama (streamed) said: ${answer}")
             },
             Err(e) => {
