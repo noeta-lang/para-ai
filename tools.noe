@@ -79,8 +79,9 @@ pub struct Tool {
 //
 // `Field` is in the target list because the type door (`Output.of` → `schema_for`) walks a declared
 // type's fields through exactly the walk the parameter door walks a signature's parameters, and a
-// description is not a property of which door you came through. See `field_help` for why a field's
-// is read by a different query than a parameter's.
+// description is not a property of which door you came through. Both doors read it through the one
+// `help_of`, off the `attrs` list the descriptor itself carries — `ParamInfo.attrs` for a parameter,
+// `FieldSpec.attrs` for a field.
 @attribute(Param, Field)
 pub struct Arg {
     pub help: string = ""
@@ -422,44 +423,34 @@ fn param_schema(p: ParamInfo): Result<Map<string, dyn>, string> {
         none => {},
     }
     mut s = json_schema(p.type)?
-    help = help_of(p)
+    help = help_of(p.attrs)
     if help != "" {
         s = s.set("description", help)
     }
     return Ok(s)
 }
 
-// The `#[Arg(help: …)]` on a parameter, narrowed off the heterogeneous `attrs` list.
-fn help_of(p: ParamInfo): string {
-    for a in p.attrs {
+// The `#[Arg(help: …)]` on a member, narrowed off the heterogeneous `attrs` list its descriptor
+// carries. ONE function for both doors: a parameter's list comes off `ParamInfo.attrs` and a field's
+// off `FieldSpec.attrs`, and since both are a `List<dyn>` of materialized attribute instances there
+// is nothing left to tell apart. That is the whole of §8.5's "the two doors derive the same bytes"
+// — the descriptors are the same shape, so the walk over them is the same code.
+//
+// **Why it matters more than it looks.** Without a field's `help`, a `#[Tool]` parameter can tell a
+// model what a bare `string` is for and an `extract::<T>` field cannot — so an output field whose
+// accepted values are `billing | shipping | technical | other` reaches the vendor as
+// `{"type": "string"}` and the model invents `"Lost order"`, which `Validate` then refuses at the
+// decode door. That was measured against a live Gemini, and the repair round costs a model call to
+// say what the schema could have said for free.
+//
+// This used to be two functions, because `FieldSpec` did not carry its field's attributes and the
+// field half had to scan the whole-program `attributes_of::<Arg>()` for a `"<Type>.<field>"` target
+// — O(attributes) per field, and a re-implementation of a key format the reflection layer already
+// knows. `FieldSpec.attrs` closed that, and the workaround went with it.
+fn help_of(attrs: List<dyn>): string {
+    for a in attrs {
         if a is Arg {
             return a.help
-        }
-    }
-    return ""
-}
-
-// The `#[Arg(help: …)]` on a **field** — the type door's half of the same question the parameter
-// door asks through `ParamInfo.attrs`.
-//
-// It has to be asked differently, and the difference is a language fact rather than a design choice:
-// `ParamInfo` carries its parameter's attributes, and `FieldSpec` does not carry its field's. What
-// the language does give is the other direction — `attributes_of::<Arg>()` is whole-program and
-// reports every `#[Arg]` in it with the target it decorates, and a *field*'s target is
-// `"<Type>.<field>"`. So the lookup is by name rather than by handle, and one linear pass answers
-// every field of every type.
-//
-// **Why it matters more than it looks.** Without it, a `#[Tool]` parameter can tell a model what a
-// bare `string` is for and an `extract::<T>` field cannot — so an output field whose accepted values
-// are `billing | shipping | technical | other` reaches the vendor as `{"type": "string"}` and the
-// model invents `"Lost order"`, which `Validate` then refuses at the decode door. That was measured
-// against a live Gemini, and the repair round costs a model call to say what the schema could have
-// said for free. §8.5's claim that the two doors derive the same bytes is only true with this.
-fn field_help(owner: string, field: string): string {
-    want = "${owner}.${field}"
-    for a in attributes_of::<Arg>() {
-        if a.target == want {
-            return a.value.help
         }
     }
     return ""
@@ -602,7 +593,7 @@ fn object_schema(name: string, fields: List<FieldSpec>, seen: List<string>): Res
                 return Err("field `${name}.${f.name}`: ${e}")
             },
         }
-        help = field_help(name, f.name)
+        help = help_of(f.attrs)
         if help != "" {
             one = one.set("description", help)
         }
@@ -1770,9 +1761,10 @@ fn types_probe(
     // existed: the model answered `"category": "Lost order"`, `Validate` refused it at the decode
     // door, and the repair round spent a model call restating what the schema could have said.
     //
-    // A field is annotated but read through a *different query* than a parameter — `ParamInfo`
-    // carries its attributes and `FieldSpec` does not — so this asserts the whole-program
-    // `attributes_of::<Arg>()` lookup lands on the right field of the right type.
+    // A field is annotated and read through the *same* descriptor slot a parameter is:
+    // `FieldSpec.attrs` beside `ParamInfo.attrs`, both a `List<dyn>` the one `help_of` narrows. So
+    // this asserts the join lands on the right field of the right type without the whole-program
+    // `attributes_of::<Arg>()` scan the field half used to need.
     fn a_field_describes_itself_exactly_as_a_parameter_does(): void {
         s = type_schema_or_fail(local_target("Described"))
         assert(s.contains("\"category\":{\"description\":\"`billing`, `shipping`, or `other`\",\"type\":\"string\"}"), s)
