@@ -23,7 +23,7 @@ use std.task.{map_bounded, sleep}
 // `uuid` by name, not `use std.id`: a whole-module import binds its last segment as a local, and
 // `id` is what half the `Part` patterns in this file bind — the collision is not a check error but
 // a runtime "cannot assign to `id`" from inside a `match` arm (AGENTS.md).
-use std.id.{uuid}
+use std.id.uuid
 use std.{env, metrics, time, tracing}
 use para.api.Api
 use para.api.middleware.Retry
@@ -142,7 +142,7 @@ pub struct Message {
     // the system prompt's stable part for you, and this is how a caller marks a long stable context
     // turn of their own — a retrieved corpus, a code base, a transcript.
     fn cached(): Message {
-        return Message { ...self, cache_breakpoint: true }
+        return Message { cache_breakpoint: true, ...self }
     }
 
     // Every tool call this message requests, in order. Empty unless the model asked for one.
@@ -455,7 +455,7 @@ pub struct AgentConfig {
     // The system prompt as ordinary text. Unchanged for every existing caller: a plain string is a
     // prompt with no holes, so it is entirely stable and gets the maximal cache prefix.
     fn with_system(text: string): AgentConfig {
-        return AgentConfig { ...self, system: some(Resolved.of(text)) }
+        return AgentConfig { system: some(Resolved.of(text)), ...self }
     }
 
     // The system prompt as a `@prompt { … }` block — the door that carries the split.
@@ -466,7 +466,7 @@ pub struct AgentConfig {
     // the two. Two named doors that agree on one representation beat a `dyn` parameter that agrees
     // on nothing the checker can see.
     fn with_system_prompt(p: Prompt): AgentConfig {
-        return AgentConfig { ...self, system: some(p.resolve()) }
+        return AgentConfig { system: some(p.resolve()), ...self }
     }
 
     // The system prompt flattened back to text, for a caller that only wants to read it. The split
@@ -479,68 +479,68 @@ pub struct AgentConfig {
     }
 
     fn with_max_tokens(n: int): AgentConfig {
-        return AgentConfig { ...self, max_tokens: some(n) }
+        return AgentConfig { max_tokens: some(n), ...self }
     }
 
     fn with_temperature(t: float): AgentConfig {
-        return AgentConfig { ...self, temperature: some(t) }
+        return AgentConfig { temperature: some(t), ...self }
     }
 
     fn with_stop(stop: List<string>): AgentConfig {
-        return AgentConfig { ...self, stop: stop }
+        return AgentConfig { stop: stop, ...self }
     }
 
     fn with_max_turns(n: int): AgentConfig {
-        return AgentConfig { ...self, max_turns: n }
+        return AgentConfig { max_turns: n, ...self }
     }
 
     fn with_tool_concurrency(n: int): AgentConfig {
-        return AgentConfig { ...self, tool_concurrency: n }
+        return AgentConfig { tool_concurrency: n, ...self }
     }
 
     fn named(name: string): AgentConfig {
-        return AgentConfig { ...self, name: name }
+        return AgentConfig { name: name, ...self }
     }
 
     fn with_extra(key: string, json_fragment: string): AgentConfig {
-        return AgentConfig { ...self, extra: self.extra.set(key, json_fragment) }
+        return AgentConfig { extra: self.extra.set(key, json_fragment), ...self }
     }
 
     // Stream every model call, including the ones `run` and `run_sync` make. See `stream` above for
     // what this costs: the `para/api` layers do not cover the streaming path.
     fn streamed(): AgentConfig {
-        return AgentConfig { ...self, stream: true }
+        return AgentConfig { stream: true, ...self }
     }
 
     // Buffer every model call — the default, spelled out for a caller switching back.
     fn buffered(): AgentConfig {
-        return AgentConfig { ...self, stream: false }
+        return AgentConfig { stream: false, ...self }
     }
 
     fn with_stream_retries(n: int): AgentConfig {
-        return AgentConfig { ...self, stream_retries: n }
+        return AgentConfig { stream_retries: n, ...self }
     }
 
     fn with_stream_backoff(ms: int): AgentConfig {
-        return AgentConfig { ...self, stream_backoff_ms: ms }
+        return AgentConfig { stream_backoff_ms: ms, ...self }
     }
 
     // Mark the system prompt's stable prefix for the vendor's prompt cache — the default, spelled
     // out for a caller switching back.
     fn cached(): AgentConfig {
-        return AgentConfig { ...self, cache: true }
+        return AgentConfig { cache: true, ...self }
     }
 
     // Send no cache breakpoint at all. The stable text is still first and still byte-identical, so
     // a vendor that caches implicitly keeps doing so; only the explicit marker goes away.
     fn uncached(): AgentConfig {
-        return AgentConfig { ...self, cache: false }
+        return AgentConfig { cache: false, ...self }
     }
 
     // What a denied run does. `OnDeny.Stop` is the default; `Feedback(max)` hands the reason back to
     // the model, and `Replace(parts)` swaps in a canned reply.
     fn denying(policy: OnDeny): AgentConfig {
-        return AgentConfig { ...self, on_deny: policy }
+        return AgentConfig { on_deny: policy, ...self }
     }
 }
 
@@ -691,8 +691,7 @@ pub trait EventSink {
 // "a buffered run and a streamed run agree" a claim a test can check rather than an aspiration.
 pub struct Silent {
     impl EventSink {
-        async fn emit(e: Event): void {
-        }
+        async fn emit(e: Event): void {}
     }
 }
 
@@ -713,11 +712,10 @@ pub struct Channel {
 // `FrameStream` already share in std: await the next one, `none` when the body ends.
 pub trait Frames {
     async fn next(): ?Frame
-
-    // Release the connection. Called on every path out of the read loop, including the failing
-    // ones — a stream abandoned mid-body otherwise holds a socket open until the process exits.
     fn close(): void
 }
+// Release the connection. Called on every path out of the read loop, including the failing
+// ones — a stream abandoned mid-body otherwise holds a socket open until the process exits.
 
 // Where a streamed request's frames come from.
 //
@@ -868,7 +866,7 @@ fn with_rewritten_tail(conv: Conversation, role: Role, parts: List<Part>): Conve
     if before.parts == parts {
         return conv
     }
-    return Conversation { messages: conv.messages.set(at, Message { ...before, parts: parts }) }
+    return Conversation { messages: conv.messages.set(at, Message { parts: parts, ...before }) }
 }
 
 fn last_index_of_role(conv: Conversation, role: Role): int {
@@ -952,6 +950,56 @@ fn errored(results: List<Part>, reason: string): List<Part> {
     return out
 }
 
+// The turn's results, back in the order the model asked for them.
+//
+// **A guard splits one tool turn into two lists and the split loses the order.** `gate_calls` sorts
+// the requested calls into the approved ones (which go to `dispatch`, and come back in *their* own
+// order) and the denied ones (which are answered on the spot), so concatenating the two puts every
+// refusal in front of every answer — a model that asked for `find_order` and then `open_refund` is
+// handed the refusal first. `dispatch` is careful to preserve per-item order precisely because a
+// result list that does not follow its call list is hard to read and harder to debug, and a guard
+// must not be the thing that undoes that.
+//
+// Matched on the call id rather than by position, because that is the identity a result carries and
+// the one every vendor addresses it by. Anything unmatched — which nothing in this package produces
+// — is appended rather than dropped: a lost result is a call the model never hears back about, and
+// several vendors reject the whole request for it.
+fn in_call_order(calls: List<Part>, results: List<Part>): List<Part> {
+    mut out: List<Part> = []
+    mut placed: List<string> = []
+    for c in calls {
+        id = call_id(c)
+        if id != "" {
+            for r in results {
+                if result_id(r) == id {
+                    out = out ~ [r]
+                    placed = placed ~ [id]
+                }
+            }
+        }
+    }
+    for r in results {
+        if !placed.contains(result_id(r)) {
+            out = out ~ [r]
+        }
+    }
+    return out
+}
+
+fn result_id(p: Part): string {
+    return match p {
+        Part.ToolResult(id, content, is_error) => id,
+        _ => "",
+    }
+}
+
+fn call_id(p: Part): string {
+    return match p {
+        Part.ToolCall(id, name, args) => id,
+        _ => "",
+    }
+}
+
 fn text_of(parts: List<Part>): string {
     mut out = ""
     for p in parts {
@@ -994,14 +1042,14 @@ fn text_of(parts: List<Part>): string {
 // One structured model call — the provider-erased seam `extract` drives. `Agent<P>` implements it
 // inline; the comment on that impl says why the erasure is load-bearing rather than tidy.
 pub trait Structured {
-    // Ask for one document in `out`'s shape, and hand back its raw JSON text.
-    //
-    // Synchronous, like `ToolSource.call` and for the same reason: it is held as `dyn`. That also
-    // makes `extract` callable from a plain `fn`, which is what keeps its tests real — an `async fn`
-    // in a `@test` block is never driven on a released toolchain, so an async extraction's
-    // assertions would be vacuous exactly where they matter most.
     fn ask_json(conv: Conversation, out: Output): Result<string, AiError>
 }
+// Ask for one document in `out`'s shape, and hand back its raw JSON text.
+//
+// Synchronous, like `ToolSource.call` and for the same reason: it is held as `dyn`. That also
+// makes `extract` callable from a plain `fn`, which is what keeps its tests real — an `async fn`
+// in a `@test` block is never driven on a released toolchain, so an async extraction's
+// assertions would be vacuous exactly where they matter most.
 
 // Ask for a value of type `T`, and get one — or a typed error saying why not.
 //
@@ -1239,7 +1287,7 @@ pub struct Agent<P: Provider> {
     // Read streamed frames from somewhere other than the network — the door `Mock` uses, and the
     // one a recorded-transcript fixture would. The buffered half still goes through `api`.
     fn frames(src: dyn Streamer): Agent<P> {
-        return Agent { ...self, transport: src }
+        return Agent { transport: src, ...self }
     }
 
     // Give the agent a source of tools.
@@ -1250,19 +1298,19 @@ pub struct Agent<P: Provider> {
     // `Agent.from(cfg, p).tools(Local.new())?.tools(mcp)?`.
     fn tools(src: dyn ToolSource): Result<Agent<P>, AiError> {
         grown = self.toolbox.with(src)?
-        return Ok(Agent { ...self, toolbox: grown })
+        return Ok(Agent { toolbox: grown, ...self })
     }
 
     // Attach a `Toolbox` you assembled yourself — the infallible door, for a caller that would
     // rather handle the collision error once at construction than at each `tools` call.
     fn with_toolbox(box: Toolbox): Agent<P> {
-        return Agent { ...self, toolbox: box }
+        return Agent { toolbox: box, ...self }
     }
 
     // The same agent, asked to answer in a declared shape. `extract` uses this; a caller who wants
     // the raw document rather than a typed value can use it directly and read `Run.text()`.
     fn expecting(out: Output): Agent<P> {
-        return Agent { ...self, output: some(out) }
+        return Agent { output: some(out), ...self }
     }
 
     // Register a guard. Chains, and the **order is the order they are consulted in** — the first
@@ -1273,7 +1321,7 @@ pub struct Agent<P: Provider> {
     // worker; ship the config, which carries the `on_deny` *policy* because a policy is a plain
     // value.
     fn with(g: dyn Guard): Agent<P> {
-        return Agent { ...self, guards: self.guards ~ [g] }
+        return Agent { guards: self.guards ~ [g], ...self }
     }
 
     // Consult `Stage.ToolCall` for each requested call, keeping the approved ones and turning a
@@ -1788,7 +1836,9 @@ pub struct Agent<P: Provider> {
                     none => {},
                 }
                 dispatched = tools.dispatch(self.toolbox, allowed.approved, self.config.tool_concurrency)
-                mut results = allowed.canned ~ dispatched
+                // Back in the order the model asked, not "every refusal, then every answer" — see
+                // `in_call_order`. A guard splitting the turn must not reorder it.
+                mut results = in_call_order(calls, allowed.canned ~ dispatched)
                 if self.guards.len() > 0 {
                     seen = gate(self.guards, Stage.ToolResult, turn_ctx(Stage.ToolResult, so_far, run_id, turn, usage, results))
                     fired = fired ~ seen.fired
@@ -1983,6 +2033,34 @@ fn refusal_text(reply: ModelReply): string {
         }
         assert(m.tool_calls().len() == 2)
         assert(Message.user("hi").tool_calls() == [])
+    }
+
+    // **A guard splits a tool turn, and the split must not reorder it.** `gate_calls` sorts the
+    // requested calls into the approved ones (which go to `dispatch` and come back in *their* order)
+    // and the denied ones (answered on the spot), so concatenating the two lists put every refusal in
+    // front of every answer — a model that asked for `find` and then `write` was handed the refusal
+    // first. `dispatch` preserves per-item order on purpose; a guard must not be what undoes it.
+    fn a_split_tool_turn_comes_back_in_the_order_the_model_asked(): void {
+        calls = [
+            Part.ToolCall(id: "a", name: "find", args: "{}"),
+            Part.ToolCall(id: "b", name: "write", args: "{}"),
+            Part.ToolCall(id: "c", name: "find", args: "{}"),
+        ]
+        // What the loop holds at the merge: the denied one first (answered without dispatching),
+        // then the dispatched ones in their own order.
+        results = [
+            Part.ToolResult(id: "b", content: "denied", is_error: true),
+            Part.ToolResult(id: "a", content: "one", is_error: false),
+            Part.ToolResult(id: "c", content: "three", is_error: false),
+        ]
+        ordered = in_call_order(calls, results)
+        assert(ordered.map(fn(p) => result_id(p)) == ["a", "b", "c"], "${ordered}")
+
+        // Nothing is dropped, even a result whose call is not in the list — a lost result is a call
+        // the model never hears back about, which several vendors reject the whole request for.
+        stray = in_call_order(calls, results ~ [Part.ToolResult(id: "z", content: "?", is_error: false)])
+        assert(stray.len() == 4, "${stray}")
+        assert(result_id(stray[3]) == "z", "an unmatched result is appended, not dropped: ${stray}")
     }
 
     fn conversation_builders_are_immutable(): void {
