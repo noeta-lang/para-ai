@@ -50,7 +50,7 @@
 //     way it is and what it costs.
 //   * **A chatty server** cannot spin forever either way: a reply is awaited for at most
 //     `read_budget` intervening documents (default 64), after which the exchange fails.
-use std.{env, fs, json, os, time}
+use std.{env, fs, json, os}
 use std.http.client
 use std.http.server
 use std.http.{Framing, FrameStream, HttpError, Request, Response}
@@ -404,12 +404,18 @@ pub class Stdio {
     // shrug. So poll for a bounded moment instead. A server that exited becomes reapable almost at
     // once; one that is still running never will, and pays this wait exactly once, at the end of a
     // session that is already over. `eof` then means what it says: still up, no longer talking.
+    //
+    // **The pause between polls is `nap`, not `time.sleep`.** `time.sleep` advances a *logical*
+    // clock and returns at once, so the first version of this loop was twenty `try_wait`s back to
+    // back with no wall clock between them — which spends its whole budget in microseconds and
+    // reports `eof` for an exiting server exactly as a single poll would. It flaked at about one run
+    // in eight until this became a real pause.
     fn ended(): Result<?string, AiError> {
         mut tries = 0
         while !self.exited && tries < exit_settle_tries() {
             self.reap()
             if !self.exited {
-                time.sleep(exit_settle_ms())
+                nap(exit_settle_ms())
             }
             tries = tries + 1
         }
@@ -560,7 +566,8 @@ fn temp_dir(): string {
 
 // How long `Stdio.ended` lets a just-closed stdout become an observable exit status, and in how many
 // steps. Module-level `fn`s rather than methods: one that never mentions `self` is an associated
-// function (E0047) and cannot be called on a value. 100ms in total, paid only on the `eof` path.
+// function (E0047) and cannot be called on a value. 100 ms of real wall clock in total (through
+// `nap`, not `time.sleep` — see `ended`), paid only on the `eof` path.
 fn exit_settle_ms(): int {
     return 5
 }
