@@ -201,6 +201,20 @@ The whole pipeline is four reflection primitives and no codegen:
 
 `#[Arg(help)]` becomes the parameter's `description`, which is the only place a model learns what a bare `string` is *for*. A parameter with a default is absent from `required`; so is an `?T`, because an omitted optional argument means `none`.
 
+**The same attribute annotates a struct field**, because the type door walks fields through the walk the parameter door walks parameters and a description is not a property of which door you came through:
+
+```noeta
+@derive(Deserialize<Json>)
+struct Triage {
+    #[Arg(help: "One of `billing`, `shipping`, `technical`, `other` — exactly those words.")]
+    category: string
+    #[Arg(help: "1 (a question) to 5 (money is on fire). 4 and 5 always need a human.")]
+    severity: int
+}
+```
+
+That line is worth more than it looks on a structured output. Without it a model is sent `{"type": "string"}` for `category` and invents a value — measured against a live Gemini, which answered `"Lost order"` three runs running, was refused by `Validate` at the decode door, and cost a repair round each time to be told what the schema could have said for free. A field's annotation is read through `attributes_of::<Arg>()` rather than off its `FieldSpec` (which carries name, type and optionality only), so nothing about a field's *declaration* changes to make this work.
+
 ### Tools are a trust boundary, and the package says so
 
 ```noeta
@@ -299,7 +313,7 @@ loop:
 
 Three properties are decisions:
 
-- **All the results ride one tool turn.** A message per result would produce consecutive same-role turns, which several vendors reject outright — and it would make it possible for a context strategy to split a `ToolCall` from its `ToolResult`, the single most common bug in hand-rolled trimming. One message makes that unrepresentable.
+- **All the results ride one tool turn, in the order the model asked for them.** A guard splits the turn into the calls it approved (dispatched concurrently, and returned in *their* order) and the ones it denied (answered on the spot), and the two are merged back on call id rather than concatenated — a model that asks for `find_order` and then `open_refund` must not be handed the refusal first. A message per result would produce consecutive same-role turns, which several vendors reject outright — and it would make it possible for a context strategy to split a `ToolCall` from its `ToolResult`, the single most common bug in hand-rolled trimming. One message makes that unrepresentable.
 - **Dispatch is concurrent and bounded**, over `std.task.map_bounded`, which gives per-item order and a concurrency cap for free. `AgentConfig.tool_concurrency` defaults to 4. Unbounded parallel dispatch is a good way to get rate-limited by your own agent: a model that asks for twelve web fetches should not open twelve sockets.
 - **`AgentConfig.max_turns` (default 8) is a hard rail, and exceeding it is `AiError.MaxTurns`** rather than a truncated `Ok`. A run that stops mid-loop has an assistant turn whose last word was a tool call nobody answered; handing that back as an answer is the silent-truncation failure §10 refuses for context strategies, for the same reason. (The `MaxTurns` *guard* of phase 5 is a different thing at a different layer — a policy a caller opts into, reported as `Guard(...)`. This is the loop's own rail, always on.)
 
@@ -331,6 +345,8 @@ e   = extract::<Extraction>(agent, conv, out)?
 ```
 
 The schema is **derived from the declaration** by the same walk the table above describes — there is nothing to write and nothing to keep in sync. Each codec then spells it its own vendor's way: Anthropic a forced single tool (`tool_choice` naming it, with the document arriving as that call's arguments), OpenAI `response_format: json_schema` with `strict`, Google `responseSchema` alongside `responseMimeType`, Ollama a bare `format`.
+
+**One vendor cannot do this with tools attached.** Gemini refuses `functionDeclarations` and `responseMimeType: application/json` in the same request, so `extract::<T>` from an agent that still carries its toolbox is a 400 there and works everywhere else. The Google codec turns that into a refusal at `encode` naming the fix rather than a vendor error naming nothing: run the tool loop first, then ask for the document from `agent.with_toolbox(Toolbox.new())` — which is also the cheaper shape, since the lookups already happened and their answers are in the conversation being handed over.
 
 ### The best output guardrail is already in the language
 
@@ -567,6 +583,8 @@ Worth knowing before writing a fourth, because each of these is a place a codec 
 | one tool turn becomes | one `user` turn | **one message per result** | one `user` turn | one message per result |
 | tool arguments on the wire | a JSON object | **a JSON string** | a JSON object | a JSON object |
 | "the model wants a tool" | `stop_reason: tool_use` | `finish_reason: tool_calls` | **`STOP` — derived from the parts** | **`stop` — derived from the parts** |
+| tool schema dialect | JSON Schema | JSON Schema | **an OpenAPI-3.0 `Schema` subset — an unknown key is a 400** | JSON Schema |
+| tools + structured output | fine (structured output *is* a forced tool) | fine | **refused by the vendor** | fine |
 | stream framing | SSE | SSE | SSE (`?alt=sse`) | **NDJSON** |
 | stream terminator | `message_stop` | `[DONE]`, but `finish_reason` is what means *complete* | none — `finishReason` is the only signal | `"done": true` |
 | inline media | images, PDF | images, PDF | images, audio, video, PDF, text | **images only** |

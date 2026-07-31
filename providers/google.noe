@@ -23,7 +23,7 @@
 //     Anthropic's signature is.
 //   * **Inline media is anything**, not just images. Gemini takes audio, video, and PDFs in the same
 //     `inlineData` envelope, so this codec accepts a `Part.File` that Anthropic's refuses.
-use std.http.{Frame}
+use std.http.Frame
 use std.{env, json}
 use ai.{AiError, Message, Part, Role}
 use ai.provider
@@ -242,6 +242,19 @@ fn encode_contents(msgs: List<Message>): Result<(List<dyn>, List<dyn>), AiError>
 //
 // One entry holding all the declarations, not one entry each: `tools` is a list of *tool kinds*
 // here — function declarations, code execution, search grounding — rather than a list of functions.
+//
+// **`parameters` is the same OpenAPI-3.0 `Schema` subset `responseSchema` is, not JSON Schema**, so
+// it goes through the same translation and for the same reason: a key Gemini does not know is a 400,
+// not an ignored hint. Passing the derived schema through verbatim was measured against the live
+// endpoint and is a hard failure on the very first call of any tool-using run —
+//
+//     400 INVALID_ARGUMENT: Invalid JSON payload received. Unknown name "additionalProperties"
+//     at 'tools[0].function_declarations[0].parameters': Cannot find field.
+//
+// — because `schema_of` closes every derived object with `"additionalProperties": false`, which is
+// exactly the key `to_gemini_schema` exists to drop. One shared translation is also the only way the
+// two doors cannot disagree: a `Map<string, T>` that `responseSchema` refuses by name is now refused
+// by name in a tool signature too, rather than reaching the vendor as an unconstrained object.
 fn encode_tools(specs: List<ToolSpec>): Result<List<dyn>, AiError> {
     mut decls: List<dyn> = []
     for t in specs {
@@ -254,15 +267,27 @@ fn encode_tools(specs: List<ToolSpec>): Result<List<dyn>, AiError> {
                 return Err(refuse("${e}"))
             },
         }
-        entry: Map<string, dyn> = {
-            "name": t.name,
-            "description": t.description,
-            "parameters": schema,
+        mut entry: Map<string, dyn> = {"name": t.name, "description": t.description}
+        // A tool that takes nothing derives the empty schema, and Gemini's shape for that is an
+        // *absent* `parameters` rather than an empty `Schema` — one with no `type` is rejected.
+        // `to_gemini_schema` would refuse it with a message about `dyn`, which is the right message
+        // for a field declaration and the wrong one for a nullary tool.
+        if is_empty_object(schema) {
+            decls = decls ~ [entry]
+        } else {
+            entry = entry.set("parameters", to_gemini_schema("tool `${t.name}`", schema)?)
+            decls = decls ~ [entry]
         }
-        decls = decls ~ [entry]
     }
     kind: Map<string, dyn> = {"functionDeclarations": decls}
     return Ok([kind])
+}
+
+fn is_empty_object(v: dyn): bool {
+    return match v.as<Map<string, dyn>>() {
+        some(m) => m.keys().len() == 0,
+        none => false,
+    }
 }
 
 // Structured output, Gemini's way: `responseSchema` alongside `responseMimeType`.
@@ -304,10 +329,9 @@ fn to_gemini_schema(path: string, v: dyn): Result<dyn, AiError> {
             if !is_false(obj[k]) {
                 return Err(refuse("`${path}` is a `Map`, and Gemini's `responseSchema` has no open-ended object with typed values (there is no `additionalProperties`); declare the keys as fields, or take the map as a JSON `string` field"))
             }
-        } else if k == "uniqueItems" {
+        } else if k == "uniqueItems" {} else {
             // A `Set` becomes an array. Gemini has no uniqueness constraint, and the declared type
             // deduplicates on the way back in anyway, so the guarantee survives where it matters.
-        } else {
             // `enum`, `description`, `required`, `format`, `nullable`, `minItems`, `maxItems` — the
             // keys whose spelling the two dialects already share.
             out = out.set(k, obj[k])
@@ -335,7 +359,7 @@ fn gemini_properties(path: string, v: dyn): Result<Map<string, dyn>, AiError> {
 fn gemini_branches(path: string, v: dyn): Result<List<dyn>, AiError> {
     empty: List<dyn> = []
     mut out: List<dyn> = []
-    for b in (v.as<List<dyn>>() ?? empty) {
+    for b in v.as<List<dyn>>() ?? empty {
         out = out ~ [to_gemini_schema(path, b)?]
     }
     return Ok(out)
@@ -461,7 +485,7 @@ fn typed_error(status: int, doc: Map<string, dyn>): AiError {
     n = provider.int_at(inner, "code")
     return AiError.Provider(
         status: status,
-        code: if code == "" then (if n == 0 then "" else "${n}") else code,
+        code: if code == "" then if n == 0 then "" else "${n}" else code,
         message: provider.str_at(inner, "message"),
     )
 }
@@ -482,7 +506,7 @@ fn decode_candidate(candidate: Map<string, dyn>, at: int): Result<(List<Delta>, 
     }
     raw = provider.str_at(candidate, "finishReason")
     if raw != "" {
-        asked_for_a_tool = calls > at && (raw == "STOP")
+        asked_for_a_tool = calls > at && raw == "STOP"
         out = out ~ [Delta.Stop(reason: if asked_for_a_tool then StopReason.ToolUse else decode_stop(raw))]
     }
     return Ok((out, calls))
@@ -610,10 +634,10 @@ impl Provider for Google {
         return "google"
     }
 
-    // **The model and the transport are both in the URL.** A streamed call is a different method on
-    // a different path, not a body flag — which is why the framing and the path are decided together
-    // here and never apart.
     fn encode(req: ModelRequest): Result<Wire, AiError> {
+        // **The model and the transport are both in the URL.** A streamed call is a different method on
+        // a different path, not a body flag — which is why the framing and the path are decided together
+        // here and never apart.
         (system, turns) = encode_contents(req.messages)?
 
         mut body: Map<string, dyn> = {"contents": turns}
@@ -647,6 +671,16 @@ impl Provider for Google {
         }
         match req.output {
             some(out) => {
+                // **Gemini cannot do both at once**, and says so as a 400 whose message names
+                // neither the tool nor a way out: `Function calling with a response mime type:
+                // 'application/json' is unsupported`. It is refused here instead, at encode, because
+                // that is where a codec is supposed to reject what its vendor cannot express — and
+                // because a request built from an agent that happens to carry a toolbox would
+                // otherwise work on Anthropic, OpenAI and Ollama and fail only on this one, at run
+                // time, in production.
+                if req.tools.len() > 0 {
+                    return Err(refuse("Gemini cannot combine function declarations with structured output (`responseMimeType: application/json`) in one request — ask for the document from an agent with no toolbox (`agent.with_toolbox(Toolbox.new())`), running the tool loop first and the extraction after it"))
+                }
                 shaped = encode_output(out)?
                 for k in shaped.keys() {
                     config = config.set(k, shaped[k])
@@ -734,11 +768,11 @@ impl Provider for Google {
         }
     }
 
-    // **`none`, and that is a real answer.** Gemini's exact count comes from the `countTokens`
-    // endpoint, which is a network round trip and therefore not something a pure codec may do.
-    // Returning a fabricated number here would be trusted absolutely and be wrong by a few percent,
-    // which surfaces as a vendor-side context error in the middle of a run.
     fn estimate_tokens(msgs: List<Message>): ?int {
+        // **`none`, and that is a real answer.** Gemini's exact count comes from the `countTokens`
+        // endpoint, which is a network round trip and therefore not something a pure codec may do.
+        // Returning a fabricated number here would be trusted absolutely and be wrong by a few percent,
+        // which surfaces as a vendor-side context error in the middle of a run.
         return none
     }
 }
@@ -882,10 +916,8 @@ fn captured_function_call_reply(): string {
         }
         wire = encode_or_fail(Google.new("k"), req)
         // The model rides in the URL and the method is part of the path.
-        assert(wire.url == "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
-            wire.url)
-        assert(wire.body == "{\"contents\":[{\"parts\":[{\"text\":\"Say hello.\"}],\"role\":\"user\"}],\"generationConfig\":{\"maxOutputTokens\":64,\"stopSequences\":[\"\\n\\n\"],\"temperature\":0.0},\"systemInstruction\":{\"parts\":[{\"text\":\"Answer in Swedish.\"}]}}",
-            "exact request body, got: ${wire.body}")
+        assert(wire.url == "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent", wire.url)
+        assert(wire.body == "{\"contents\":[{\"parts\":[{\"text\":\"Say hello.\"}],\"role\":\"user\"}],\"generationConfig\":{\"maxOutputTokens\":64,\"stopSequences\":[\"\\n\\n\"],\"temperature\":0.0},\"systemInstruction\":{\"parts\":[{\"text\":\"Answer in Swedish.\"}]}}", "exact request body, got: ${wire.body}")
     }
 
     // Gemini's `responseSchema` is a subset of OpenAPI 3.0, not JSON Schema: the type is an
@@ -904,8 +936,7 @@ fn captured_function_call_reply(): string {
         wire = encode_or_fail(Google.new("k"), req)
         assert(wire.body.contains("\"responseMimeType\":\"application/json\""), wire.body)
         // Upper-cased types, no `additionalProperties`, no `uniqueItems`, everything else verbatim.
-        assert(wire.body.contains("\"responseSchema\":{\"properties\":{\"company\":{\"type\":\"STRING\"},\"tags\":{\"items\":{\"type\":\"INTEGER\"},\"type\":\"ARRAY\"}},\"required\":[\"company\"],\"type\":\"OBJECT\"}"),
-            wire.body)
+        assert(wire.body.contains("\"responseSchema\":{\"properties\":{\"company\":{\"type\":\"STRING\"},\"tags\":{\"items\":{\"type\":\"INTEGER\"},\"type\":\"ARRAY\"}},\"required\":[\"company\"],\"type\":\"OBJECT\"}"), wire.body)
     }
 
     // Two shapes this dialect genuinely cannot express are refused at `encode`, naming the field —
@@ -936,6 +967,32 @@ fn captured_function_call_reply(): string {
         assert(encode_error(Google.new("k"), anything).contains("\"any value\" shape"))
     }
 
+    // **Gemini cannot do tools and structured output in one request**, and the other three vendors
+    // can — so an agent that carries its toolbox into `extract::<T>` works everywhere else and 400s
+    // here, at run time, in production. Refused at `encode` instead, which is where a codec rejects
+    // what its vendor cannot express, with a message naming the fix rather than the vendor's own
+    // `Function calling with a response mime type: 'application/json' is unsupported`, which names
+    // neither the tool nor a way out.
+    fn tools_and_a_requested_output_together_are_refused_at_encode(): void {
+        both = ModelRequest {
+            model: "m",
+            messages: [Message.user("x")],
+            tools: [ToolSpec { name: "clock", description: "The time", parameters: "{\"type\":\"object\"}" }],
+            output: some(Output {
+                name: "M",
+                target: "app.M",
+                schema: "{\"properties\":{\"a\":{\"type\":\"string\"}},\"type\":\"object\"}",
+            }),
+        }
+        e = encode_error(Google.new("k"), both)
+        assert(e.contains("cannot combine function declarations with structured output"), e)
+        assert(e.contains("with_toolbox(Toolbox.new())"), "the message names the fix: ${e}")
+
+        // Either half alone is fine, which is what makes the refusal about the combination.
+        assert(encode_or_fail(Google.new("k"), ModelRequest { ...both, output: none }).body.contains("functionDeclarations"))
+        assert(encode_or_fail(Google.new("k"), ModelRequest { ...both, tools: [] }).body.contains("responseSchema"))
+    }
+
     fn encode_sends_the_key_as_a_header(): void {
         wire = encode_or_fail(Google.new("AIza-test"), ModelRequest { model: "m", messages: [Message.user("hi")] })
         assert(wire.headers["x-goog-api-key"] == "AIza-test")
@@ -943,8 +1000,7 @@ fn captured_function_call_reply(): string {
     }
 
     fn encode_points_at_a_gateway_when_told_to(): void {
-        wire = encode_or_fail(Google.at("https://gateway.internal", "k"),
-            ModelRequest { model: "m", messages: [Message.user("hi")] })
+        wire = encode_or_fail(Google.at("https://gateway.internal", "k"), ModelRequest { model: "m", messages: [Message.user("hi")] })
         assert(wire.url == "https://gateway.internal/v1beta/models/m:generateContent", wire.url)
     }
 
@@ -960,8 +1016,7 @@ fn captured_function_call_reply(): string {
                 Message.assistant("b"),
             ],
         })
-        assert(wire.body.contains("\"systemInstruction\":{\"parts\":[{\"text\":\"first\"},{\"text\":\"second\"}]}"),
-            "both system turns hoisted, in order: ${wire.body}")
+        assert(wire.body.contains("\"systemInstruction\":{\"parts\":[{\"text\":\"first\"},{\"text\":\"second\"}]}"), "both system turns hoisted, in order: ${wire.body}")
         assert(wire.body.contains("\"role\":\"model\""), wire.body)
         assert(!wire.body.contains("\"role\":\"assistant\""), "there is no assistant role here")
         assert(!wire.body.contains("\"role\":\"system\""), wire.body)
@@ -991,12 +1046,10 @@ fn captured_function_call_reply(): string {
                 },
             ],
         })
-        assert(wire.body.contains("{\"functionResponse\":{\"name\":\"get_weather\",\"response\":{\"output\":\"18C\"}}}"),
-            wire.body)
+        assert(wire.body.contains("{\"functionResponse\":{\"name\":\"get_weather\",\"response\":{\"output\":\"18C\"}}}"), wire.body)
         // Gemini has no error flag either, but it does have an arbitrary response object — so a
         // failing result keeps its shape instead of having prose put in its mouth.
-        assert(wire.body.contains("{\"functionResponse\":{\"name\":\"distance_km\",\"response\":{\"error\":\"no road on file\"}}}"),
-            wire.body)
+        assert(wire.body.contains("{\"functionResponse\":{\"name\":\"distance_km\",\"response\":{\"error\":\"no road on file\"}}}"), wire.body)
         // The arguments go out as a real map, not as a quoted string.
         assert(wire.body.contains("{\"functionCall\":{\"args\":{\"city\":\"Malmö\"},\"name\":\"get_weather\"}}"), wire.body)
     }
@@ -1027,12 +1080,18 @@ fn captured_function_call_reply(): string {
             model: "m",
             messages: [Message.user("first"), Message.user("second")],
         })
-        assert(wire.body.contains("\"contents\":[{\"parts\":[{\"text\":\"first\"},{\"text\":\"second\"}],\"role\":\"user\"}]"),
-            "one user turn carrying both: ${wire.body}")
+        assert(wire.body.contains("\"contents\":[{\"parts\":[{\"text\":\"first\"},{\"text\":\"second\"}],\"role\":\"user\"}]"), "one user turn carrying both: ${wire.body}")
     }
 
     // All the declarations go in **one** `tools` entry: that list is of tool *kinds* — functions,
     // code execution, search grounding — not of functions.
+    //
+    // And the schema is **translated**, not passed through: `parameters` is the same OpenAPI-3.0
+    // `Schema` subset `responseSchema` is, so `type` is the shouted enum member and a key Gemini
+    // does not know is a 400. This fixture asserted the untranslated bytes until a live call proved
+    // them wrong — a derived schema closes its object with `"additionalProperties": false`, and
+    // every tool-using request carrying one was rejected outright. A fixture table proves a codec is
+    // *consistent*; only the endpoint proves it is right.
     fn encode_sends_every_tool_in_one_function_declarations_entry(): void {
         wire = encode_or_fail(Google.new("k"), ModelRequest {
             model: "m",
@@ -1046,8 +1105,7 @@ fn captured_function_call_reply(): string {
                 ToolSpec { name: "clock", description: "The time", parameters: "{\"type\":\"object\"}" },
             ],
         })
-        assert(wire.body.contains("\"tools\":[{\"functionDeclarations\":[{\"description\":\"Current weather for a city\",\"name\":\"weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"}},{\"description\":\"The time\",\"name\":\"clock\",\"parameters\":{\"type\":\"object\"}}]}]"),
-            wire.body)
+        assert(wire.body.contains("\"tools\":[{\"functionDeclarations\":[{\"description\":\"Current weather for a city\",\"name\":\"weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"STRING\"}},\"required\":[\"city\"],\"type\":\"OBJECT\"}},{\"description\":\"The time\",\"name\":\"clock\",\"parameters\":{\"type\":\"OBJECT\"}}]}]"), wire.body)
     }
 
     fn encode_omits_the_tools_key_when_there_are_none(): void {
@@ -1088,8 +1146,7 @@ fn captured_function_call_reply(): string {
             }],
         })
         assert(wire.body.contains("{\"inlineData\":{\"data\":\"Zm9vYmFy\",\"mimeType\":\"image/png\"}}"), wire.body)
-        assert(wire.body.contains("{\"inlineData\":{\"data\":\"Zm9v\",\"mimeType\":\"video/mp4\"}}"),
-            "a video Anthropic refuses: ${wire.body}")
+        assert(wire.body.contains("{\"inlineData\":{\"data\":\"Zm9v\",\"mimeType\":\"video/mp4\"}}"), "a video Anthropic refuses: ${wire.body}")
         assert(wire.body.contains("{\"inlineData\":{\"data\":\"Zm8=\",\"mimeType\":\"application/pdf\"}}"), wire.body)
     }
 
@@ -1122,8 +1179,7 @@ fn captured_function_call_reply(): string {
             }],
         })
         assert(wire.body.contains("{\"text\":\"let me see\",\"thought\":true,\"thoughtSignature\":\"CikBVKhc7uS0lQ\"}")
-            || wire.body.contains("{\"thought\":true,\"thoughtSignature\":\"CikBVKhc7uS0lQ\",\"text\":\"let me see\"}"),
-            wire.body)
+            || wire.body.contains("{\"thought\":true,\"thoughtSignature\":\"CikBVKhc7uS0lQ\",\"text\":\"let me see\"}"), wire.body)
     }
 
     // `args` must be a map of named parameters; a fragment that parses to an array is a request the
@@ -1158,10 +1214,8 @@ fn captured_function_call_reply(): string {
                 "safetySettings": "[{\"category\":\"HARM_CATEGORY_HARASSMENT\",\"threshold\":\"BLOCK_NONE\"}]",
             },
         })
-        assert(wire.body.contains("\"generationConfig\":{\"maxOutputTokens\":128,\"thinkingConfig\":{\"thinkingBudget\":0}}"),
-            "the escape hatch wins over the codec's own block: ${wire.body}")
-        assert(wire.body.contains("\"safetySettings\":[{\"category\":\"HARM_CATEGORY_HARASSMENT\",\"threshold\":\"BLOCK_NONE\"}]"),
-            wire.body)
+        assert(wire.body.contains("\"generationConfig\":{\"maxOutputTokens\":128,\"thinkingConfig\":{\"thinkingBudget\":0}}"), "the escape hatch wins over the codec's own block: ${wire.body}")
+        assert(wire.body.contains("\"safetySettings\":[{\"category\":\"HARM_CATEGORY_HARASSMENT\",\"threshold\":\"BLOCK_NONE\"}]"), wire.body)
     }
 
     // Phase 8 places a cache breakpoint on a `@prompt`'s stable prefix. Gemini's implicit cache
@@ -1176,8 +1230,7 @@ fn captured_function_call_reply(): string {
             model: "m",
             messages: [Message.system("a long stable system prefix").cached(), Message.user("hi")],
         }
-        assert(encode_or_fail(Google.new("k"), plain).body == encode_or_fail(Google.new("k"), marked).body,
-            "Gemini caches implicitly, so the breakpoint must not change a byte")
+        assert(encode_or_fail(Google.new("k"), plain).body == encode_or_fail(Google.new("k"), marked).body, "Gemini caches implicitly, so the breakpoint must not change a byte")
         // And the saving the cache produced is still reported, because that part is the vendor's.
         assert(decode_or_fail(Google.new("k"), captured_text_reply()).usage.cached_input_tokens == 1024)
     }
@@ -1223,10 +1276,8 @@ fn captured_function_call_reply(): string {
                 Message.tool("call_0", "18°C, clear", false),
             ],
         })
-        assert(wire.body.contains("{\"functionResponse\":{\"name\":\"get_current_weather\",\"response\":{\"output\":\"18°C, clear\"}}}"),
-            "the synthesized id resolved back to the vendor's name: ${wire.body}")
-        assert(wire.body.contains("{\"functionCall\":{\"args\":{\"location\":\"Boston\",\"unit\":\"celsius\"},\"name\":\"get_current_weather\"}}"),
-            wire.body)
+        assert(wire.body.contains("{\"functionResponse\":{\"name\":\"get_current_weather\",\"response\":{\"output\":\"18°C, clear\"}}}"), "the synthesized id resolved back to the vendor's name: ${wire.body}")
+        assert(wire.body.contains("{\"functionCall\":{\"args\":{\"location\":\"Boston\",\"unit\":\"celsius\"},\"name\":\"get_current_weather\"}}"), wire.body)
     }
 
     fn decode_maps_every_finish_reason(): void {
@@ -1342,8 +1393,7 @@ fn captured_function_call_reply(): string {
             messages: [Message.user("hi")],
             stream: true,
         })
-        assert(streamed.url == "https://generativelanguage.googleapis.com/v1beta/models/m:streamGenerateContent?alt=sse",
-            streamed.url)
+        assert(streamed.url == "https://generativelanguage.googleapis.com/v1beta/models/m:streamGenerateContent?alt=sse", streamed.url)
         assert(!streamed.body.contains("\"stream\""), "the flag is in the path, not the body: ${streamed.body}")
         assert(streamed.streamed())
         assert(!streamed.ndjson(), "`?alt=sse` is what makes it server-sent events rather than a JSON array")
@@ -1448,7 +1498,10 @@ fn captured_function_call_reply(): string {
             Delta.TextDelta(id: "0", text: "the prompt was blocked: PROHIBITED_CONTENT"),
             Delta.Stop(reason: StopReason.Refusal),
         ], "${deltas}")
-        assert(match decoder.finish() { Ok(_) => true, Err(_) => false }, "a refusal is a complete answer")
+        assert(match decoder.finish() {
+            Ok(_) => true,
+            Err(_) => false,
+        }, "a refusal is a complete answer")
     }
 
     // The whole point of `decode_deltas`: the buffered door speaks the same vocabulary the streaming
