@@ -34,14 +34,24 @@ jobs:
   package:
     name: Package (noeta check + test)
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: para-ai
     steps:
+      # Both repos are checked out as siblings UNDER the workspace, and every `run`
+      # step works from `para-ai/`. Checking the dependency out at `../para-api`
+      # instead is what actions/checkout refuses — it will not write outside
+      # `$GITHUB_WORKSPACE` — so the sibling layout `path = "../para-api"` names has
+      # to be built inside the workspace rather than around it.
       - uses: actions/checkout@v4
+        with:
+          path: para-ai
       # `para/api` is a sibling path dependency until it resolves from the registry.
       - name: Check out para/api alongside
         uses: actions/checkout@v4
         with:
           repository: noeta-lang/para-api
-          path: ../para-api
+          path: para-api
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
       - name: Install noeta ${{ env.NOETA_VERSION }}
@@ -84,13 +94,19 @@ jobs:
   local-ollama:
     name: Live Ollama (no secret, end to end)
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: para-ai
     steps:
+      # Same sibling-inside-the-workspace layout as `package` above, for the same reason.
       - uses: actions/checkout@v4
+        with:
+          path: para-ai
       - name: Check out para/api alongside
         uses: actions/checkout@v4
         with:
           repository: noeta-lang/para-api
-          path: ../para-api
+          path: para-api
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
       - name: Install noeta ${{ env.NOETA_VERSION }}
