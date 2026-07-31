@@ -50,7 +50,7 @@
 //     way it is and what it costs.
 //   * **A chatty server** cannot spin forever either way: a reply is awaited for at most
 //     `read_budget` intervening documents (default 64), after which the exchange fails.
-use std.{env, fs, json, os}
+use std.{env, fs, json, os, time}
 use std.http.client
 use std.http.server
 use std.http.{Framing, FrameStream, HttpError, Request, Response}
@@ -395,8 +395,27 @@ pub class Stdio {
 
     // The child's stdout closed. Either it exited — in which case the status and its last words are
     // the useful part — or it closed the channel and stayed up, which is just as terminal.
+    //
+    // **Telling those two apart needs a bounded wait, not a single poll.** A process closes its file
+    // descriptors and becomes reapable in that order, so at the instant EOF surfaces here a server
+    // that *did* exit may not have a status yet, and one `try_wait` reports it as the second case.
+    // That is measured rather than theorized: this package's own crash-mid-call test asked for
+    // `server_exited` and got `eof` once under machine load, and passed on every re-run.
+    //
+    // Accepting either code would make the test pass and the *library* worse — "exit status 3, and
+    // here is what it said on stderr" is the whole difference between a diagnosable failure and a
+    // shrug. So poll for a bounded moment instead. A server that exited becomes reapable almost at
+    // once; one that is still running never will, and pays this wait exactly once, at the end of a
+    // session that is already over. `eof` then means what it says: still up, no longer talking.
     fn ended(): Result<?string, AiError> {
-        self.reap()
+        mut tries = 0
+        while !self.exited && tries < exit_settle_tries() {
+            self.reap()
+            if !self.exited {
+                time.sleep(exit_settle_ms())
+            }
+            tries = tries + 1
+        }
         if self.exited {
             self.running = false
             return Err(AiError.Mcp(server: self.label(), code: "server_exited", message: self.exit_note()))
@@ -556,6 +575,17 @@ pub fn resolve_command(command: string): string {
 
 fn temp_dir(): string {
     return env.get("TMPDIR") ?? "/tmp"
+}
+
+// How long `Stdio.ended` lets a just-closed stdout become an observable exit status, and in how many
+// steps. Module-level `fn`s rather than methods: one that never mentions `self` is an associated
+// function (E0047) and cannot be called on a value. 100ms in total, paid only on the `eof` path.
+fn exit_settle_ms(): int {
+    return 5
+}
+
+fn exit_settle_tries(): int {
+    return 20
 }
 
 // --- The deadline watchdog --------------------------------------------------------------------------
@@ -2475,6 +2505,13 @@ fn connect_error(t: dyn Transport): string {
     // The crash case, end to end: the server exits mid-call, the call in flight becomes a typed
     // failure carrying the exit status, and the session stays dead instead of being written to
     // again — which matters because a write to a dead child aborts the process.
+    //
+    // **`server_exited`, never `eof`, and that is a contract rather than a coin toss.** This test
+    // once reported `eof` under machine load: EOF on the child's stdout reached the client before
+    // the exit status was reapable, and both codes were honest about what had been observed at that
+    // instant. Loosening the assertion to accept either would have been the wrong repair — the exit
+    // status is the diagnostic value of the whole path — so `Stdio.ended` waits a bounded moment for
+    // the status instead, and this stays a single-code assertion. See `ended` for the ordering.
     fn a_server_that_dies_mid_call_is_typed_and_stays_dead(): void {
         c = probe_client("crash")
         first = call_error(c, "echo", "{\"text\": \"hello\"}")
