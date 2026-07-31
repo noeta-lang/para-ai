@@ -55,7 +55,7 @@ Pure Noeta — no cargo anywhere in this repo. But note:
 
 ## Conventions
 
-- `noeta.lock` files are **not** committed — neither the root's (it pins a developer-machine path dependency) nor the examples' (`.gitignore` carries `examples/*/noeta.lock`, since `49792b5`). They regenerate on every run.
+- `noeta.lock` files are **not** committed here, but the root's is an exception rather than the rule. A package root's lock is normally tracked — the generated file says "it is meant to be committed" in its own header, and no sibling para repo gitignores it. This one stays out only while para/ai's sole dependency resolves through a sibling path, which makes the lock's one entry `source = "path"`, `path = "../para-api"` — a developer-machine layout no other checkout shares. Commit it (and drop `/noeta.lock` from `.gitignore`) once para/api resolves from the registry. The examples' locks are a different case and are never committed: they are demo sub-projects, not package roots, and regenerate on every run (`.gitignore` carries `examples/*/noeta.lock`, since `49792b5`).
 - Markdown never hard-wraps lines.
 - **American English** throughout — code, comments, and docs (`behavior`, not `behaviour`).
 - **Conventional commits** for all commit titles. Commit each green slice as it completes, but **never `git push` without explicit authorization**. Never move a published `v*` tag — a release is a new tag.

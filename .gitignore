@@ -1,6 +1,11 @@
 target/
-# The package's own lock pins a developer-machine path dependency, so it stays out; the examples'
-# locks ARE committed (see AGENTS.md).
+# A package root's noeta.lock is meant to be committed — the generated file says so in its own
+# header — and every sibling para repo leaves it tracked. This one is the exception, and only
+# until it stops being true: para/ai's sole dependency still resolves through a sibling path
+# (`para = [{ path = "../para-api" }]`), so the lock's one entry is `source = "path"`,
+# `path = "../para-api"` — a developer-machine layout no other checkout shares. Drop this line and
+# commit the lock once para/api resolves from the registry (tracked in the pre-alpha run-list,
+# same flip `ci.yml` is waiting on).
 /noeta.lock
 .claude/
 
