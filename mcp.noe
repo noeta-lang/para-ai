@@ -1529,19 +1529,19 @@ fn is_reply_to(doc: Map<string, dyn>, id: int): bool {
 }
 
 // The `result` of a reply, or the server's `error` as a typed failure.
-fn result_of(doc: Map<string, dyn>, server: string, method: string): Result<Map<string, dyn>, AiError> {
+fn result_of(doc: Map<string, dyn>, server_name: string, method: string): Result<Map<string, dyn>, AiError> {
     if doc.has("error") {
         err = provider.obj_at(doc, "error")
         code = provider.int_at(err, "code")
         return Err(AiError.Mcp(
-            server: server,
+            server: server_name,
             code: "protocol",
             message: "`${method}` failed with JSON-RPC error ${code}: ${provider.str_at(err, "message")}",
         ))
     }
     if !doc.has("result") {
         return Err(AiError.Mcp(
-            server: server,
+            server: server_name,
             code: "protocol",
             message: "`${method}` answered with neither `result` nor `error`",
         ))
@@ -1595,7 +1595,7 @@ fn prompt_spec_of(o: Map<string, dyn>): PromptSpec {
 // A non-text content block is **refused, loudly**: this package has no base64 decoder, so an image
 // or audio block cannot become a `Part.Image` without inventing its bytes, and dropping it would
 // silently change what the prompt says. The message names the door that does work.
-fn prompt_message(o: Map<string, dyn>, server: string): Result<Message, AiError> {
+fn prompt_message(o: Map<string, dyn>, server_name: string): Result<Message, AiError> {
     role = match provider.str_at(o, "role") {
         "assistant" => Role.Assistant,
         _ => Role.User,
@@ -1613,7 +1613,7 @@ fn prompt_message(o: Map<string, dyn>, server: string): Result<Message, AiError>
         }
     }
     return Err(AiError.Mcp(
-        server: server,
+        server: server_name,
         code: "protocol",
         message: "a `${kind}` prompt content block needs base64 decoding, which this package has no decoder for — read it with `client.read(uri)` and attach it yourself",
     ))

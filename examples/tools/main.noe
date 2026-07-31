@@ -194,11 +194,11 @@ io.outln(schema_of_the_weather_tool())
     // same index `noeta mcp` serves to an editor or an agent.
     fn every_tool_is_a_declared_trust_boundary(): void {
         reachable = trust_boundaries()
-        assert(reachable.contains("noeta.tools.weather"), "${reachable}")
-        assert(reachable.contains("noeta.tools.distance_km"), "${reachable}")
+        assert(reachable.contains("tools.main.weather"), "${reachable}")
+        assert(reachable.contains("tools.main.distance_km"), "${reachable}")
         // And nothing else in this program is one — `config`, `ask`, and `offline` are not
         // reachable by a model, and the index says so.
-        assert(!reachable.contains("noeta.tools.ask"), "${reachable}")
+        assert(!reachable.contains("tools.main.ask"), "${reachable}")
     }
 
     // **A dependency's test fixtures must not reach this program's model.**
@@ -229,7 +229,7 @@ io.outln(schema_of_the_weather_tool())
                 assert(false, "${e}")
             },
         }
-        assert(trust_boundaries() == ["noeta.tools.weather", "noeta.tools.distance_km"],
+        assert(trust_boundaries() == ["tools.main.weather", "tools.main.distance_km"],
             "and the trust-boundary index agrees: ${trust_boundaries()}")
     }
 

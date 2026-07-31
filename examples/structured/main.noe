@@ -75,7 +75,7 @@ fn config(): AgentConfig {
 
 // The schema for `Extraction`, or a message saying why it has none.
 //
-// **`type_name::<Extraction>()` rather than the string `"noeta.structured.Extraction"`** — the
+// **`type_name::<Extraction>()` rather than the string `"structured.main.Extraction"`** — the
 // compiler resolves the name, so it follows the namespace, a `use … as` alias and a rename, none of
 // which a string literal does. It is spelled here rather than inside `extract` because a generic
 // function cannot reflect over its own type parameter: generics are erased, so `T` names nothing at
@@ -179,7 +179,7 @@ main()
     // every object is closed.
     fn the_schema_is_derived_from_the_declaration(): void {
         out = shape_or_fail()
-        assert(out.target == "noeta.structured.Extraction", out.target)
+        assert(out.target == "structured.main.Extraction", out.target)
         assert(out.name == "Extraction", out.name)
         assert(out.schema
             == "{\"additionalProperties\":false,\"properties\":{\"company\":{\"type\":\"string\"},\"confidence\":{\"type\":\"number\"},\"lead\":{\"additionalProperties\":false,\"properties\":{\"weight\":{\"type\":\"number\"},\"who\":{\"type\":\"string\"}},\"required\":[\"who\"],\"type\":\"object\"},\"note\":{\"type\":\"string\"},\"sentiment\":{\"type\":\"string\"}},\"required\":[\"company\",\"sentiment\",\"confidence\",\"lead\"],\"type\":\"object\"}",
