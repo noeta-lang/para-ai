@@ -1030,7 +1030,7 @@ fn text_of(parts: List<Part>): string {
 //         }
 //     }
 //
-//     out = Output.of(type_name::<Extraction>())?
+//     out = Output.of::<Extraction>()?
 //     e   = extract::<Extraction>(agent, conv, out)?
 //
 // **The best output guardrail is already in the language, and para/ai does not implement it.**

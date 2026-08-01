@@ -1948,7 +1948,7 @@ impl Middleware for Mock {
     // rename, none of which a literal does.
     #[std.test.Skip("a helper for this module's suite, not a test")]
     fn output_or_fail(): Output {
-        match Output.of(type_name::<Extraction>()) {
+        match Output.of::<Extraction>() {
             Ok(out) => {
                 return out
             },
@@ -1961,7 +1961,7 @@ impl Middleware for Mock {
 
     #[std.test.Skip("a helper for this module's suite, not a test")]
     fn report_output_or_fail(): Output {
-        match Output.of(type_name::<Report>()) {
+        match Output.of::<Report>() {
             Ok(out) => {
                 return out
             },
