@@ -107,7 +107,7 @@ pub struct ToolSpec {
 // is emphatic that structured output needs no schema machinery of its own, only the same
 // `field_specs_of` walk §6's parameters already take. One walk, two doors.
 //
-//     out = Output.of(type_name::<Extraction>())?
+//     out = Output.of::<Extraction>()?
 //     e   = extract::<Extraction>(agent, conv, out)?
 //
 // `target` is the **qualified** reflection identity (`app.review.Extraction`), which is what
@@ -122,16 +122,29 @@ pub struct Output {
 
     // The schema for a declared type, derived from its fields, recursively.
     //
+    // **The turbofish supplies the identity**, so the type is named once at the call site rather
+    // than twice — `Output.of::<Extraction>()` where this used to demand
+    // `Output.of(type_name::<Extraction>())`. A name resolved by the compiler also survives a
+    // rename, a move between modules and a `use … as` alias, none of which a string literal does.
+    //
     // Fallible for the same reason `ToolSource.specs` is: a field whose declared type has no JSON
     // representation is a bug in the *type*, and answering with a half-schema would let a vendor
     // enforce a shape that decodes into nothing.
-    fn of(target: string): Result<Output, AiError> {
-        return Output.described(target, "")
+    fn of<T>(): Result<Output, AiError> {
+        return Output.for_name(type_name::<T>(), "")
     }
 
     // The same, with a description the model reads — the structured-output counterpart of
-    // `#[Tool(about: …)]`, and worth writing for the same reason.
-    fn described(target: string, about: string): Result<Output, AiError> {
+    // `#[Tool(about: …)]`, and worth writing for the same reason. The description is the half of an
+    // `Output` that cannot be derived from a declaration, which is why it is still passed in.
+    fn described<T>(about: string): Result<Output, AiError> {
+        return Output.for_name(type_name::<T>(), about)
+    }
+
+    // The same, keyed by a reflection identity computed at run time rather than named in source.
+    // `of`/`described` are what a call site wants; this is for the case where the type is not
+    // statically known — a name read from a registry, a table, or a wire message.
+    fn for_name(target: string, about: string): Result<Output, AiError> {
         return match schema_for(target) {
             Ok(text) => Ok(Output {
                 name: last_segment(target),

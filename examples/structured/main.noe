@@ -82,7 +82,7 @@ fn config(): AgentConfig {
 // run time (E0058, and the diagnostic's own advice is to reflect where the type is concrete and pass
 // the result in — which is exactly this line).
 fn shape(): Result<Output, AiError> {
-    return Output.described(type_name::<Extraction>(), "What one article says about one company.")
+    return Output.described::<Extraction>("What one article says about one company.")
 }
 
 // --- The entry point -----------------------------------------------------------------------------

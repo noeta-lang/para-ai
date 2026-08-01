@@ -340,7 +340,7 @@ struct Extraction {
     }
 }
 
-out = Output.of(type_name::<Extraction>())?
+out = Output.of::<Extraction>()?
 e   = extract::<Extraction>(agent, conv, out)?
 ```
 
