@@ -9,7 +9,7 @@ version = "0.1.0"
 [dependencies]
 para = [
     { path = "../..", package = "para/ai" },
-    { path = "../../../para-api", package = "para/api" },
+    { version = "^0.2", package = "para/api" },
 ]
 
 # `para/ai` is pure Noeta, but `para/api` ships a native extension crate. A native grant is per
