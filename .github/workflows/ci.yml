@@ -6,10 +6,10 @@ name: CI
 # later ones reuse the cached binary. That is why a Rust toolchain and a cargo cache are set up
 # here even though this repo contains no Rust.
 #
-# NOTE: these workflows go green once the noeta toolchain repo is published under
-# github.com/noeta-lang/noeta and the ecosystem's pre-publish `file:///` git deps are flipped to
-# it, and once `para/api` resolves from the registry rather than the sibling path (tracked in the
-# pre-alpha run-list). Until then they fail at the noeta-install step by design.
+# `para/api` resolves from the registry (`{ version = "^0.2", package = "para/api" }`), so nothing
+# here checks it out: `noeta` fetches the release the lockfile pins. Checking it out as a sibling is
+# what this workflow used to do, and it could not work on a runner — `actions/checkout` will not
+# write outside `$GITHUB_WORKSPACE`, which is where a `../para-api` sibling would have to go.
 
 on:
   push:
@@ -34,24 +34,8 @@ jobs:
   package:
     name: Package (noeta check + test)
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: para-ai
     steps:
-      # Both repos are checked out as siblings UNDER the workspace, and every `run`
-      # step works from `para-ai/`. Checking the dependency out at `../para-api`
-      # instead is what actions/checkout refuses — it will not write outside
-      # `$GITHUB_WORKSPACE` — so the sibling layout `path = "../para-api"` names has
-      # to be built inside the workspace rather than around it.
       - uses: actions/checkout@v4
-        with:
-          path: para-ai
-      # `para/api` is a sibling path dependency until it resolves from the registry.
-      - name: Check out para/api alongside
-        uses: actions/checkout@v4
-        with:
-          repository: noeta-lang/para-api
-          path: para-api
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
       - name: Install noeta ${{ env.NOETA_VERSION }}
@@ -94,19 +78,8 @@ jobs:
   local-ollama:
     name: Live Ollama (no secret, end to end)
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: para-ai
     steps:
-      # Same sibling-inside-the-workspace layout as `package` above, for the same reason.
       - uses: actions/checkout@v4
-        with:
-          path: para-ai
-      - name: Check out para/api alongside
-        uses: actions/checkout@v4
-        with:
-          repository: noeta-lang/para-api
-          path: para-api
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
       - name: Install noeta ${{ env.NOETA_VERSION }}

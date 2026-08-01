@@ -28,7 +28,7 @@ The split that decides everything else: **a provider is a codec, not a client.**
 [dependencies]
 para = [
     { version = "^0.1", package = "para/ai" },
-    { version = "^0.1", package = "para/api" },
+    { version = "^0.2", package = "para/api" },
 ]
 
 [trust]
@@ -869,7 +869,7 @@ The design's remaining example (`chat-cli`) arrives with the phase it exercises;
 
 ## Requirements
 
-The `noeta` toolchain, and `para/api` (declared as a path dependency during pre-release development). This package is pure Noeta — no `crates/`, no `native/`.
+The `noeta` toolchain, and `para/api` (resolved from the registry — `{ version = "^0.2", package = "para/api" }`). This package is pure Noeta — no `crates/`, no `native/`.
 
 ## Development
 
