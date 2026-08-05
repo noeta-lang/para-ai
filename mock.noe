@@ -31,8 +31,8 @@ use ai.guard.{Approval, Approve, Blocklist, Guard, OnDeny, Recall, Redact, Stage
 use ai.provider
 use ai.provider.{Delta, ModelReply, ModelRequest, Provider, StopReason, StreamDecoder, Usage, Wire}
 // The `@prompt` tier's value type, so this file's suite can drive the run loop with a real split
-// prompt. The tier *itself* (`para.ai.prompt.render`) is deliberately not imported: a `Prompt` is
-// an ordinary value and a mock has no business declaring block syntax for its consumers.
+// prompt. Only the type: a `Prompt` is an ordinary value, and whether a consumer may write the
+// block at all is their manifest's `[directives]` binding to decide, not this file's.
 use ai.prompt.{Prompt}
 use ai.tools.{Arg, Local, Output, Tool, ToolSource, ToolSpec}
 
@@ -40,9 +40,9 @@ use ai.tools.{Arg, Local, Output, Tool, ToolSource, ToolSpec}
 // one, so a test can script a malformed blob and watch the dispatcher refuse it.
 @derive(Equatable, Display)
 pub struct ScriptedCall {
-    pub id: string
-    pub name: string
-    pub args: string = "{}"
+    id: string
+    name: string
+    args: string = "{}"
 }
 
 // One scripted answer. The script is consumed in order, one entry per model call.
@@ -326,7 +326,7 @@ pub class ScriptedFrames {
     mut at: int
     mut closed: bool
 
-    fn of(frames: List<Frame>): ScriptedFrames {
+    pub fn of(frames: List<Frame>): ScriptedFrames {
         return ScriptedFrames { frames: frames, at: 0, closed: false }
     }
 
@@ -339,7 +339,7 @@ pub class ScriptedFrames {
 }
 
 impl Frames for ScriptedFrames {
-    async fn next(): ?Frame {
+    pub async fn next(): ?Frame {
         if self.at >= self.frames.len() {
             return none
         }
@@ -348,7 +348,7 @@ impl Frames for ScriptedFrames {
         return some(f)
     }
 
-    fn close(): void {
+    pub fn close(): void {
         self.closed = true
     }
 }
@@ -358,14 +358,14 @@ pub class MockStream {
     mut usage: Usage
     mut done: bool
 
-    fn new(): MockStream {
+    pub fn new(): MockStream {
         return MockStream { usage: Usage {}, done: false }
     }
 
     // Inline for the reason `AnthropicStream`'s is: a standalone `impl StreamDecoder for
     // MockStream` block is invisible to `dyn` coercion when this module is not the entry.
     impl StreamDecoder {
-        fn push(frame: Frame): Result<List<Delta>, AiError> {
+        pub fn push(frame: Frame): Result<List<Delta>, AiError> {
             if frame.data == "" {
                 return Ok([])
             }
@@ -407,7 +407,7 @@ pub class MockStream {
             return Err(AiError.Decode(path: "type", message: "mock cannot decode a `${kind}` frame"))
         }
 
-        fn finish(): Result<Usage, AiError> {
+        pub fn finish(): Result<Usage, AiError> {
             if !self.done {
                 return Err(AiError.Decode(
                     path: "",
@@ -429,7 +429,7 @@ pub class Replay {
     mut frames: List<Frame>
     mut streams: List<ScriptedFrames>
 
-    fn of(frames: List<Frame>): Replay {
+    pub fn of(frames: List<Frame>): Replay {
         return Replay { frames: frames, streams: [] }
     }
 
@@ -439,7 +439,7 @@ pub class Replay {
 
     // Inline for the reason `MockStream`'s impl is; see there.
     impl Streamer {
-        fn open(req: Request, framing: Framing): Result<dyn Frames, AiError> {
+        pub fn open(req: Request, framing: Framing): Result<dyn Frames, AiError> {
             s = ScriptedFrames.of(self.frames)
             self.streams = self.streams ~ [s]
             return Ok(s)
@@ -452,11 +452,11 @@ pub class Replay {
 pub class Collector {
     mut seen: List<Event>
 
-    fn new(): Collector {
+    pub fn new(): Collector {
         return Collector { seen: [] }
     }
 
-    fn events(): List<Event> {
+    pub fn events(): List<Event> {
         return self.seen
     }
 
@@ -466,7 +466,7 @@ pub class Collector {
 
     // The run id this run was given, read off its `RunStarted`. A run id is a fresh uuid, so a test
     // asserting on the exact sequence takes it from the run rather than predicting it.
-    fn run_id(): string {
+    pub fn run_id(): string {
         mut found = ""
         for e in self.seen {
             found = match e {
@@ -479,7 +479,7 @@ pub class Collector {
 }
 
 impl EventSink for Collector {
-    async fn emit(e: Event): void {
+    pub async fn emit(e: Event): void {
         self.seen = self.seen ~ [e]
     }
 }
@@ -499,7 +499,7 @@ pub class Mock {
     // "this vendor reported nothing" — unless a test says otherwise, so no existing assertion moves.
     mut cache_reads: int
 
-    fn new(): Mock {
+    pub fn new(): Mock {
         return Mock { script: [], cursor: 0, sent: [], chunk: 0, streams: [], cache_reads: 0 }
     }
 
@@ -510,14 +510,14 @@ pub class Mock {
     // of a request the server has seen before, and this mock has no cache. So the number is
     // declared rather than earned, and what the assertion proves is that the figure a vendor
     // reports reaches `Run.usage` and the run's telemetry — not that any caching happened.
-    fn with_cache_reads(n: int): Mock {
+    pub fn with_cache_reads(n: int): Mock {
         self.cache_reads = n
         return self
     }
 
     // Deliver streamed payloads in runs of `n` characters — the knob that makes a scripted stream
     // behave like a real one, where a sentence arrives as a dozen frames.
-    fn chunked(n: int): Mock {
+    pub fn chunked(n: int): Mock {
         self.chunk = n
         return self
     }
@@ -538,30 +538,30 @@ pub class Mock {
     // Each of these appends one answer and returns the same `Mock`, so a multi-turn script reads
     // top to bottom in the order the model would produce it.
 
-    fn reply_text(text: string): Mock {
+    pub fn reply_text(text: string): Mock {
         self.script = self.script ~ [Scripted.Text(text: text)]
         return self
     }
 
     // One tool call in a turn.
-    fn reply_tool(id: string, name: string, args: string): Mock {
+    pub fn reply_tool(id: string, name: string, args: string): Mock {
         self.script = self.script ~ [Scripted.Tools(calls: [ScriptedCall { id: id, name: name, args: args }])]
         return self
     }
 
     // Several tool calls in **one** turn — the parallel case, and the one that exercises
     // `AgentConfig.tool_concurrency`.
-    fn reply_tools(calls: List<ScriptedCall>): Mock {
+    pub fn reply_tools(calls: List<ScriptedCall>): Mock {
         self.script = self.script ~ [Scripted.Tools(calls: calls)]
         return self
     }
 
-    fn refuse(reason: string): Mock {
+    pub fn refuse(reason: string): Mock {
         self.script = self.script ~ [Scripted.Refusal(reason: reason)]
         return self
     }
 
-    fn fail(status: int, code: string, message: string): Mock {
+    pub fn fail(status: int, code: string, message: string): Mock {
         self.script = self.script ~ [Scripted.Failure(status: status, code: code, message: message)]
         return self
     }
@@ -571,18 +571,18 @@ pub class Mock {
     // Every request body the codec produced, in order — the answer to "what did the agent actually
     // send?". Worth asserting on: it is the difference between "the agent replied" and "the agent
     // asked the right question".
-    fn calls(): List<string> {
+    pub fn calls(): List<string> {
         return self.sent
     }
 
     // How many model calls the agent made.
-    fn call_count(): int {
+    pub fn call_count(): int {
         return self.sent.len()
     }
 
     // How many scripted answers are still unused. A test that ends with this above zero scripted
     // more turns than the run took.
-    fn remaining(): int {
+    pub fn remaining(): int {
         return self.script.len() - self.cursor
     }
 
@@ -597,23 +597,23 @@ pub class Mock {
     // The whole hermetic setup in one call: an agent whose codec and **both** transports are this
     // mock — the middleware answers a buffered call, the `Streamer` answers a streamed one, and
     // neither opens a socket.
-    fn agent(cfg: AgentConfig): Agent<Mock> {
+    pub fn agent(cfg: AgentConfig): Agent<Mock> {
         return Agent.over(cfg, self, self.api()).frames(self)
     }
 
     // The same, with a source of tools attached — the full tool loop with no socket in it.
     // `Result` because attaching a source derives every schema and checks every name.
-    fn tool_agent(cfg: AgentConfig, src: dyn ToolSource): Result<Agent<Mock>, AiError> {
+    pub fn tool_agent(cfg: AgentConfig, src: dyn ToolSource): Result<Agent<Mock>, AiError> {
         return self.agent(cfg).tools(src)
     }
 }
 
 impl Provider for Mock {
-    fn name(): string {
+    pub fn name(): string {
         return "mock"
     }
 
-    fn encode(req: ModelRequest): Result<Wire, AiError> {
+    pub fn encode(req: ModelRequest): Result<Wire, AiError> {
         mut msgs: List<dyn> = []
         for m in req.messages {
             msgs = msgs ~ [message_to_json(m)]
@@ -686,7 +686,7 @@ impl Provider for Mock {
         return Ok(if req.stream then wire.as_ndjson() else wire)
     }
 
-    fn decode_deltas(body: string): Result<List<Delta>, AiError> {
+    pub fn decode_deltas(body: string): Result<List<Delta>, AiError> {
         doc = provider.parse_object(body, "mock reply")?
         mut deltas: List<Delta> = [Delta.ModelDelta(model: provider.str_at(doc, "model"))]
         for (i, raw) in provider.list_at(doc, "parts").enumerate() {
@@ -715,15 +715,15 @@ impl Provider for Mock {
         ])
     }
 
-    fn decode_reply(body: string): Result<ModelReply, AiError> {
+    pub fn decode_reply(body: string): Result<ModelReply, AiError> {
         return Ok(provider.fold(self.decode_deltas(body)?, ""))
     }
 
-    fn decoder(): dyn StreamDecoder {
+    pub fn decoder(): dyn StreamDecoder {
         return MockStream.new()
     }
 
-    fn decode_error(status: int, body: string): AiError {
+    pub fn decode_error(status: int, body: string): AiError {
         return match provider.parse_object(body, "mock error") {
             Ok(doc) => AiError.Provider(
                 status: status,
@@ -737,7 +737,7 @@ impl Provider for Mock {
     // The `some(n)` half of O-5, so a caller's `match provider.estimate_tokens(...)` has both
     // branches reachable in a test. Rough by construction — a mock has nothing better to offer,
     // and saying `none` here would make the `some` path untestable without a real tokenizer.
-    fn estimate_tokens(msgs: List<Message>): ?int {
+    pub fn estimate_tokens(msgs: List<Message>): ?int {
         return some(provider.rough_token_estimate(msgs))
     }
 }
@@ -750,7 +750,7 @@ impl Provider for Mock {
 // incompatibility being a **compile error** — a `FrameStream` is simply not a `Response` — instead
 // of a `Retry` layer quietly re-requesting a body somebody was halfway through reading.
 impl Streamer for Mock {
-    fn open(req: Request, framing: Framing): Result<dyn Frames, AiError> {
+    pub fn open(req: Request, framing: Framing): Result<dyn Frames, AiError> {
         self.sent = self.sent ~ [req.body()]
         if self.cursor >= self.script.len() {
             // Status `0`, not 500. A 500 is retryable and this is not a vendor answer at all — it
@@ -778,7 +778,7 @@ impl Streamer for Mock {
 // The transport half. A layer that never calls `next` answers on its own — which is exactly what a
 // mock is, and why `para/api`'s middleware takes a callable `next` rather than a hook pair.
 impl Middleware for Mock {
-    fn handle(req: Request, next: Next): Result<Response, HttpError> {
+    pub fn handle(req: Request, next: Next): Result<Response, HttpError> {
         self.sent = self.sent ~ [req.body()]
         if self.cursor >= self.script.len() {
             // Loud. A run that outlasts its script is a test that scripted the wrong number of
@@ -856,7 +856,7 @@ impl Middleware for Mock {
         confidence: float
 
         impl Validate {
-            fn validate(): Result<void, string> {
+            pub fn validate(): Result<void, string> {
                 if self.confidence < 0.0 || self.confidence > 1.0 {
                     return Err("confidence out of range: ${self.confidence}")
                 }
@@ -2041,20 +2041,20 @@ class RecordingMemory {
     }
 
     impl ToolSource {
-        fn source_name(): string {
+        pub fn source_name(): string {
             return "recording-memory"
         }
 
-        fn tool_type(): string {
+        pub fn tool_type(): string {
             return "mcp"
         }
 
-        fn specs(): Result<List<ToolSpec>, AiError> {
+        pub fn specs(): Result<List<ToolSpec>, AiError> {
             empty: List<ToolSpec> = []
             return Ok(empty)
         }
 
-        fn call(name: string, args: string): Result<string, AiError> {
+        pub fn call(name: string, args: string): Result<string, AiError> {
             self.calls = self.calls ~ ["${name} ${args}"]
             return Ok(self.hits)
         }

@@ -27,13 +27,18 @@ The split that decides everything else: **a provider is a codec, not a client.**
 ```toml
 [dependencies]
 para = [
-    { version = "^0.1", package = "para/ai" },
-    { version = "^0.2", package = "para/api" },
+    { version = "^0.3", package = "para/ai" },
+    { version = "^0.3", package = "para/api" },
 ]
+
+[directives]
+prompt = "para/ai"      # lets your source write `@prompt { … }` blocks
 
 [trust]
 native = ["para/api"]
 ```
+
+**`@prompt` comes from the `[directives]` binding, not from an import.** A tier is a tier directive: `prompt = "para/ai"` is what makes `@prompt { … }` an expression in your source, no `use` enables it, and the binding names the *package* because the `para` key is a scope array covering two members and could not say which one you meant. Drop the line if you never write the block.
 
 The package is keyed `para`, so its modules address as `para.ai.*`. **para/ai itself is pure Noeta and ships no native code** — the `[trust]` line is `para/api`'s, whose native half is the `@openapi` directive and the `para.url` percent-encoder. A native grant is per package and is never self-authorized, not even by the dependency that pulls it in, so a consumer names it even though it never writes `use para.api`. An honest extra line beats a hidden duplicate implementation of retry, mocking, and recording.
 
@@ -109,9 +114,13 @@ pub struct Run { messages: List<Message>  usage: Usage  turns: int  stop: StopRe
 
 `@prompt { … }` is an **expression tier** — a typed value built from the block's text, not a string:
 
-```noeta
-use para.ai.prompt.render          // the one import that makes `@prompt { … }` exist here
+```toml
+# noeta.toml — this binding is what makes `@prompt { … }` exist in your source
+[directives]
+prompt = "para/ai"
+```
 
+```noeta
 cfg = AgentConfig.new("claude-opus-5").with_system_prompt(@prompt {
     You are a support agent. Answer in at most three sentences and never promise a refund.
 
@@ -869,7 +878,7 @@ The design's remaining example (`chat-cli`) arrives with the phase it exercises;
 
 ## Requirements
 
-The `noeta` toolchain, and `para/api` (resolved from the registry — `{ version = "^0.2", package = "para/api" }`). This package is pure Noeta — no `crates/`, no `native/`.
+The `noeta` toolchain, and `para/api` (resolved from the registry — `{ version = "^0.3", package = "para/api" }`). This package is pure Noeta — no `crates/`, no `native/`.
 
 ## Development
 

@@ -9,8 +9,15 @@ version = "0.1.0"
 [dependencies]
 para = [
     { path = "../..", package = "para/ai" },
-    { version = "^0.2", package = "para/api" },
+    { version = "^0.3", package = "para/api" },
 ]
+
+# The `@prompt { … }` tier directive this example writes. A tier is bound, never imported — no `use`
+# enables it — and the binding names the *package*, not the `para` key, since that key is a scope
+# array covering two members and could not say which one you meant. The `package =` claim above is
+# what lets the path dependency be named this way.
+[directives]
+prompt = "para/ai"
 
 # `para/ai` is pure Noeta, but `para/api` ships a native extension crate. A native grant is per
 # package and never self-authorized — not even by the dependency that pulls it in — so a consumer of

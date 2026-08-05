@@ -167,15 +167,15 @@ fn object_of(v: dyn, text: string, what: string): Result<Map<string, dyn>, AiErr
 // wrong place.
 @derive(Equatable, Display)
 pub struct Capabilities {
-    pub tools: bool = false
-    pub tools_list_changed: bool = false
-    pub resources: bool = false
-    pub resources_subscribe: bool = false
-    pub resources_list_changed: bool = false
-    pub prompts: bool = false
-    pub prompts_list_changed: bool = false
-    pub logging: bool = false
-    pub completions: bool = false
+    tools: bool = false
+    tools_list_changed: bool = false
+    resources: bool = false
+    resources_subscribe: bool = false
+    resources_list_changed: bool = false
+    prompts: bool = false
+    prompts_list_changed: bool = false
+    logging: bool = false
+    completions: bool = false
 }
 
 fn sub_flag(caps: Map<string, dyn>, group: string, key: string): bool {
@@ -203,11 +203,11 @@ pub fn capabilities_of(caps: Map<string, dyn>): Capabilities {
 // isolate boundary like every other type in this package (DESIGN §2.3).
 @derive(Equatable, Display)
 pub struct Resource {
-    pub uri: string
-    pub name: string = ""
-    pub title: string = ""
-    pub description: string = ""
-    pub mime: string = ""
+    uri: string
+    name: string = ""
+    title: string = ""
+    description: string = ""
+    mime: string = ""
 }
 
 // One resource's contents.
@@ -217,25 +217,25 @@ pub struct Resource {
 // back the text that arrived — so a binary resource is passed through for the caller to decode.
 @derive(Equatable, Display)
 pub struct ResourceContent {
-    pub uri: string
-    pub mime: string = ""
-    pub text: string = ""
-    pub blob: string = ""
+    uri: string
+    mime: string = ""
+    text: string = ""
+    blob: string = ""
 }
 
 @derive(Equatable, Display)
 pub struct PromptArg {
-    pub name: string
-    pub description: string = ""
-    pub required: bool = false
+    name: string
+    description: string = ""
+    required: bool = false
 }
 
 @derive(Equatable, Display)
 pub struct PromptSpec {
-    pub name: string
-    pub title: string = ""
-    pub description: string = ""
-    pub arguments: List<PromptArg> = []
+    name: string
+    title: string = ""
+    description: string = ""
+    arguments: List<PromptArg> = []
 }
 
 // --- The transport seam ---------------------------------------------------------------------------
@@ -300,7 +300,7 @@ pub class Stdio {
     mut exited: bool
     mut last_error: string
 
-    fn new(command: string, args: List<string> = []): Stdio {
+    pub fn new(command: string, args: List<string> = []): Stdio {
         return Stdio {
             command: command,
             args: args,
@@ -342,7 +342,7 @@ pub class Stdio {
     //
     // What you get for that: a hung server ends the *call* rather than the process, as
     // `AiError.Mcp(server, "timeout", …)` — a failed turn like any other.
-    fn with_deadline(ms: int): Stdio {
+    pub fn with_deadline(ms: int): Stdio {
         self.deadline_ms = ms
         return self
     }
@@ -460,13 +460,13 @@ pub class Stdio {
     // invisible to `dyn` coercion from every module but this one, which makes `McpClient.connect`
     // fail from a consumer and pass here (AGENTS.md).
     impl Transport {
-        fn label(): string {
+        pub fn label(): string {
             return "stdio:${self.command}"
         }
 
         // Resolve the command *before* spawning, because `os.spawn` aborts on a missing binary
         // rather than returning an error — see the class comment.
-        fn start(): Result<void, AiError> {
+        pub fn start(): Result<void, AiError> {
             if self.running {
                 return Ok()
             }
@@ -484,7 +484,7 @@ pub class Stdio {
             return Ok()
         }
 
-        fn send_doc(doc: string): Result<void, AiError> {
+        pub fn send_doc(doc: string): Result<void, AiError> {
             p = self.handle()?
             self.reap()
             if !self.running {
@@ -496,7 +496,7 @@ pub class Stdio {
             return Ok()
         }
 
-        fn next_doc(): Result<?string, AiError> {
+        pub fn next_doc(): Result<?string, AiError> {
             self.reap()
             if !self.running {
                 return Err(AiError.Mcp(server: self.label(), code: "server_exited", message: self.exit_note()))
@@ -516,14 +516,14 @@ pub class Stdio {
         // messages therefore reach the client where they actually arrive in practice — interleaved
         // with a reply, which `McpClient.await_reply` handles — and this stays empty rather than
         // pretending to poll.
-        fn poll(max: int): Result<List<string>, AiError> {
+        pub fn poll(max: int): Result<List<string>, AiError> {
             empty: List<string> = []
             return Ok(empty)
         }
 
         // A stdio session has no request headers to carry the revision on: both sides already
         // agreed to it in the handshake, and there is no intermediary to re-tell.
-        fn negotiated(revision: string): void {
+        pub fn negotiated(revision: string): void {
             return
         }
 
@@ -531,7 +531,7 @@ pub class Stdio {
         // Then reap, and kill whatever is still there. **No unbounded wait** — a synchronous wait
         // cannot be bounded (see `with_deadline`), and a server that ignores EOF would otherwise
         // hang the caller's `close`.
-        fn shutdown(): void {
+        pub fn shutdown(): void {
             match self.child {
                 some(p) => {
                     p.close_stdin()
@@ -695,13 +695,13 @@ pub class Http {
     // The deadline is the *client's*, which is where a streamable-HTTP timeout belongs — unlike
     // stdio, `std.http` already bounds a request and a stream open, so this transport needs no
     // watchdog and no kill.
-    fn new(endpoint: string, timeout_ms: int = 30000): Http {
+    pub fn new(endpoint: string, timeout_ms: int = 30000): Http {
         return Http.over(endpoint, Api.new(client.new().timeout(timeout_ms)))
     }
 
     // Over a transport chain you composed yourself — the door for a bearer token, a recorder, or a
     // scripted middleware in a test.
-    fn over(endpoint: string, api: Api): Http {
+    pub fn over(endpoint: string, api: Api): Http {
         return Http {
             endpoint: endpoint,
             api: api,
@@ -792,17 +792,17 @@ pub class Http {
 
     // Inline for the `dyn`-coercion reason every impl in this file is inline; see `Stdio`.
     impl Transport {
-        fn label(): string {
+        pub fn label(): string {
             return "http:${self.endpoint}"
         }
 
         // Nothing to start. An HTTP transport has no child to spawn and no connection to hold —
         // the first POST is the first thing that can fail, and it fails as itself.
-        fn start(): Result<void, AiError> {
+        pub fn start(): Result<void, AiError> {
             return Ok()
         }
 
-        fn send_doc(doc: string): Result<void, AiError> {
+        pub fn send_doc(doc: string): Result<void, AiError> {
             if self.closed {
                 return Err(AiError.Mcp(
                     server: self.label(),
@@ -824,7 +824,7 @@ pub class Http {
 
         // Whatever the last POST brought back, one document at a time. `none` means this exchange
         // is out of documents — for HTTP that is an ordinary end rather than a broken session.
-        fn next_doc(): Result<?string, AiError> {
+        pub fn next_doc(): Result<?string, AiError> {
             if self.pending.len() == 0 {
                 return Ok(none)
             }
@@ -838,7 +838,7 @@ pub class Http {
         // `Events.drain` reads the **head before any frame**, so a 405 (the spec's way of saying
         // "this server offers no such channel") and a 429 are visible without waiting on a frame
         // that is never coming — which is what `FrameStream.status()`/`error_for_status()` are for.
-        fn poll(max: int): Result<List<string>, AiError> {
+        pub fn poll(max: int): Result<List<string>, AiError> {
             if self.closed || max <= 0 {
                 empty: List<string> = []
                 return Ok(empty)
@@ -849,14 +849,14 @@ pub class Http {
         // Every later request carries the revision the server agreed to, which is how it knows
         // which revision's rules to apply. Read off the *reply* rather than off our own request:
         // what matters is what was agreed, not what was asked for.
-        fn negotiated(revision: string): void {
+        pub fn negotiated(revision: string): void {
             self.protocol = revision
             return
         }
 
         // The spec's own teardown: `DELETE` with the session id ends the session server-side.
         // Best-effort — a server that already forgot us is not an error worth raising at `close`.
-        fn shutdown(): void {
+        pub fn shutdown(): void {
             if self.session != "" && !self.closed {
                 farewell: Request = self.api.prepare("delete", self.endpoint, "", self.headers())
                 said_goodbye = self.api.send(farewell)
@@ -888,7 +888,7 @@ pub trait Events {
 // is consumed.
 pub struct HttpEvents {
     impl Events {
-        fn drain(endpoint: string, headers: Map<string, string>, max: int): Result<List<string>, AiError> {
+        pub fn drain(endpoint: string, headers: Map<string, string>, max: int): Result<List<string>, AiError> {
             req: Request = client.new().prepare("get", endpoint, "", headers)
             opened = client.stream(req, Framing.Sse)?
             // 405 is how the spec says "this server has no server→client channel", and it is not a
@@ -996,7 +996,7 @@ pub trait Sampler {
 // an ignored request is a server that waits forever.
 pub struct NoSampling {
     impl Sampler {
-        fn sample(params: string): Result<string, AiError> {
+        pub fn sample(params: string): Result<string, AiError> {
             return Err(AiError.Mcp(
                 server: "",
                 code: "sampling",
@@ -1033,7 +1033,7 @@ pub class McpClient {
     // capability exchange, `notifications/initialized`, and the first `tools/list` — so an agent
     // that has a client has a usable one, and a server that is broken says so here rather than at
     // the first model call.
-    fn connect(t: dyn Transport): Result<McpClient, AiError> {
+    pub fn connect(t: dyn Transport): Result<McpClient, AiError> {
         return McpClient.begin(t, NoSampling {}, false, 0)
     }
 
@@ -1042,7 +1042,7 @@ pub class McpClient {
     // Explicit and budgeted because it hands a subprocess your API key: the capability is advertised
     // only on this path, every request is counted, and the one past the budget is refused with a
     // JSON-RPC error rather than quietly served.
-    fn connect_sampling(t: dyn Transport, s: dyn Sampler, budget: int): Result<McpClient, AiError> {
+    pub fn connect_sampling(t: dyn Transport, s: dyn Sampler, budget: int): Result<McpClient, AiError> {
         return McpClient.begin(t, s, true, budget)
     }
 
@@ -1053,7 +1053,7 @@ pub class McpClient {
     // *some* value after its failed assertion, because a `match` arm cannot both fail an assertion
     // and produce one, and a `class`'s fields are private so only the class can build it. Public
     // because a **consumer's** helper needs it too (`examples/memory` has one).
-    fn unstarted(): McpClient {
+    pub fn unstarted(): McpClient {
         return McpClient {
             transport: Stdio.new("true", []),
             server: "unstarted",
@@ -1097,7 +1097,7 @@ pub class McpClient {
 
     // The server's own name, once it has said one — `mcp:memory` rather than `mcp:npx`, which is
     // what makes a collision message name something a reader recognizes.
-    fn server_name(): string {
+    pub fn server_name(): string {
         return self.server
     }
 
@@ -1120,7 +1120,7 @@ pub class McpClient {
         return self.notifications
     }
 
-    fn is_closed(): bool {
+    pub fn is_closed(): bool {
         return self.closed
     }
 
@@ -1349,7 +1349,7 @@ pub class McpClient {
     //
     // **Not injected into anything.** DESIGN §7 is explicit: what to do with a resource is the
     // caller's decision, because auto-injection is how context windows quietly fill up.
-    fn resources(): Result<List<Resource>, AiError> {
+    pub fn resources(): Result<List<Resource>, AiError> {
         self.require(self.caps.resources, "resources")?
         mut out: List<Resource> = []
         mut cursor = ""
@@ -1378,7 +1378,7 @@ pub class McpClient {
 
     // One resource's contents. A resource may answer with several parts (a directory-ish URI, a
     // document and its attachments), so this is a list rather than a string.
-    fn read(uri: string): Result<List<ResourceContent>, AiError> {
+    pub fn read(uri: string): Result<List<ResourceContent>, AiError> {
         self.require(self.caps.resources, "resources")?
         params: Map<string, dyn> = {"uri": uri}
         reply = self.exchange("resources/read", params)?
@@ -1420,7 +1420,7 @@ pub class McpClient {
     // A server-supplied prompt as an ordinary conversation prefix — which is the whole point:
     // `Conversation { messages: client.prompt("review", args)? }` and the rest of the package does
     // not know the difference.
-    fn prompt(name: string, args: Map<string, string> = {}): Result<List<Message>, AiError> {
+    pub fn prompt(name: string, args: Map<string, string> = {}): Result<List<Message>, AiError> {
         self.require(self.caps.prompts, "prompts")?
         params: Map<string, dyn> = {"arguments": args, "name": name}
         reply = self.exchange("prompts/get", params)?
@@ -1456,7 +1456,7 @@ pub class McpClient {
     // Caller-driven rather than a background reader, and that is forced rather than chosen:
     // structured concurrency has no detached tasks — a `concurrent` block joins everything it
     // spawned at its closing brace — so there is nowhere for a listener to live between calls.
-    fn listen(max: int): Result<int, AiError> {
+    pub fn listen(max: int): Result<int, AiError> {
         docs = self.transport.poll(max)?
         mut seen = 0
         for text in docs {
@@ -1468,7 +1468,7 @@ pub class McpClient {
     }
 
     // Release the server. Idempotent, and safe on a session that already died.
-    fn close(): void {
+    pub fn close(): void {
         self.transport.shutdown()
         self.closed = true
         return
@@ -1479,18 +1479,18 @@ pub class McpClient {
         // `mcp:memory` once the server has introduced itself, which is what a `Toolbox` collision
         // message prints — "declared by both `local` and `mcp:memory`" is a sentence a reader can
         // act on.
-        fn source_name(): string {
+        pub fn source_name(): string {
             return self.server
         }
 
-        fn tool_type(): string {
+        pub fn tool_type(): string {
             return "mcp"
         }
 
         // The cached list from `connect`, refetched only when the server said it changed. A
         // `Toolbox` asks for this at construction, and a network round trip per construction would
         // make attaching a source a surprising cost.
-        fn specs(): Result<List<ToolSpec>, AiError> {
+        pub fn specs(): Result<List<ToolSpec>, AiError> {
             self.require(self.caps.tools, "tools")?
             if !self.listed {
                 self.refresh_tools()?
@@ -1504,7 +1504,7 @@ pub class McpClient {
         // `ToolResult(is_error: true)` exactly as it does for a local tool's `Err`, so a failing MCP
         // tool is a turn the model can react to rather than an outage — and the phase-5 approval
         // guard, which attaches above `Toolbox.call`, covers both without knowing about either.
-        fn call(name: string, args: string): Result<string, AiError> {
+        pub fn call(name: string, args: string): Result<string, AiError> {
             arguments = arguments_of(name, args)?
             params: Map<string, dyn> = {"arguments": arguments, "name": name}
             return match self.exchange("tools/call", params) {
@@ -1859,7 +1859,7 @@ class ScriptedEndpoint {
 
     // Inline, for the `dyn`-coercion reason every impl in this file is.
     impl Middleware {
-        fn handle(req: Request, next: Next): Result<Response, HttpError> {
+        pub fn handle(req: Request, next: Next): Result<Response, HttpError> {
             self.sent = self.sent ~ [req.body()]
             self.sessions = self.sessions ~ [req.header("mcp-session-id") ?? ""]
             if self.at >= self.replies.len() {
@@ -1889,7 +1889,7 @@ class ScriptedEvents {
     }
 
     impl Events {
-        fn drain(endpoint: string, headers: Map<string, string>, max: int): Result<List<string>, AiError> {
+        pub fn drain(endpoint: string, headers: Map<string, string>, max: int): Result<List<string>, AiError> {
             self.drains = self.drains + 1
             return Ok(self.docs)
         }
@@ -1961,7 +1961,7 @@ class ProbeSampler {
 
     // Inline, for the `dyn`-coercion reason every other impl in this file is inline.
     impl Sampler {
-        fn sample(params: string): Result<string, AiError> {
+        pub fn sample(params: string): Result<string, AiError> {
             self.seen = self.seen + 1
             answer: Map<string, dyn> = {
                 "content": {"text": "sampled", "type": "text"},

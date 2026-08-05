@@ -37,21 +37,21 @@ use ai.tools.{Output, ToolSpec}
 // thinking, thought signatures, and the current function-calling shape, which `v1` does not.
 @derive(Equatable, Display)
 pub struct Google {
-    pub key: string
-    pub base_url: string = "https://generativelanguage.googleapis.com"
-    pub version: string = "v1beta"
+    key: string
+    base_url: string = "https://generativelanguage.googleapis.com"
+    version: string = "v1beta"
 
-    fn new(key: string): Google {
+    pub fn new(key: string): Google {
         return Google { key: key }
     }
 
-    fn at(base_url: string, key: string): Google {
+    pub fn at(base_url: string, key: string): Google {
         return Google { key: key, base_url: base_url }
     }
 
     // Read the key from `GEMINI_API_KEY`, falling back to `GOOGLE_API_KEY` — the vendor's own tools
     // read both, and a caller who exported the other one should not have to discover which.
-    fn from_env(): ?Google {
+    pub fn from_env(): ?Google {
         key = env.get("GEMINI_API_KEY") ?? (env.get("GOOGLE_API_KEY") ?? "")
         if key == "" {
             return none
@@ -557,7 +557,7 @@ pub class GoogleStream {
     mut opened: bool
     mut stopped: bool
 
-    fn new(): GoogleStream {
+    pub fn new(): GoogleStream {
         return GoogleStream { usage: Usage {}, model: "", calls: 0, opened: false, stopped: false }
     }
 
@@ -566,7 +566,7 @@ pub class GoogleStream {
     // module is not the entry, so `Google.decoder()` fails to check from a consuming package while
     // this file's own suite passes. See AGENTS.md.
     impl StreamDecoder {
-        fn push(frame: Frame): Result<List<Delta>, AiError> {
+        pub fn push(frame: Frame): Result<List<Delta>, AiError> {
             if frame.data == "" {
                 return Ok([])
             }
@@ -611,7 +611,7 @@ pub class GoogleStream {
             return Ok(out)
         }
 
-        fn finish(): Result<Usage, AiError> {
+        pub fn finish(): Result<Usage, AiError> {
             if !self.opened {
                 return Err(AiError.Decode(
                     path: "",
@@ -630,11 +630,11 @@ pub class GoogleStream {
 }
 
 impl Provider for Google {
-    fn name(): string {
+    pub fn name(): string {
         return "google"
     }
 
-    fn encode(req: ModelRequest): Result<Wire, AiError> {
+    pub fn encode(req: ModelRequest): Result<Wire, AiError> {
         // **The model and the transport are both in the URL.** A streamed call is a different method on
         // a different path, not a body flag — which is why the framing and the path are decided together
         // here and never apart.
@@ -720,7 +720,7 @@ impl Provider for Google {
         })
     }
 
-    fn decode_deltas(body: string): Result<List<Delta>, AiError> {
+    pub fn decode_deltas(body: string): Result<List<Delta>, AiError> {
         doc = provider.parse_object(body, "google reply")?
         if doc.has("error") {
             return Err(typed_error(0, doc))
@@ -751,15 +751,15 @@ impl Provider for Google {
         return Ok(out ~ more ~ [usage])
     }
 
-    fn decode_reply(body: string): Result<ModelReply, AiError> {
+    pub fn decode_reply(body: string): Result<ModelReply, AiError> {
         return Ok(provider.fold(self.decode_deltas(body)?, ""))
     }
 
-    fn decoder(): dyn StreamDecoder {
+    pub fn decoder(): dyn StreamDecoder {
         return GoogleStream.new()
     }
 
-    fn decode_error(status: int, body: string): AiError {
+    pub fn decode_error(status: int, body: string): AiError {
         return match provider.parse_object(body, "google error") {
             Ok(doc) => typed_error(status, doc),
             // An HTML error page from a proxy, or an empty 502: the raw text is the only evidence of
@@ -768,7 +768,7 @@ impl Provider for Google {
         }
     }
 
-    fn estimate_tokens(msgs: List<Message>): ?int {
+    pub fn estimate_tokens(msgs: List<Message>): ?int {
         // **`none`, and that is a real answer.** Gemini's exact count comes from the `countTokens`
         // endpoint, which is a network round trip and therefore not something a pure codec may do.
         // Returning a fabricated number here would be trusted absolutely and be wrong by a few percent,

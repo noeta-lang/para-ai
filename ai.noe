@@ -30,9 +30,10 @@ use para.api.middleware.Retry
 use ai.provider.{Delta, ModelRequest, ModelReply, Provider, StopReason, StreamDecoder, Usage, Wire, fold}
 // The `@prompt` tier's value types by name, for the same reason `uuid` is: a whole-module
 // `use para.ai.prompt` would bind `prompt` as a local, and this file is full of bindings that want
-// that word. Importing the types does **not** bring the tier into a consumer's file — a consumer
-// writing `@prompt { … }` imports `para.ai.prompt.render` itself, which is the one line that
-// declares the block syntax exists.
+// that word. Importing the types does **not** bring the tier into a consumer's file, and neither
+// does any other import: from noeta 0.5 a consumer writing `@prompt { … }` binds it in their
+// manifest — `[directives] prompt = "para/ai"` — which is what links the handler into their
+// program.
 use ai.prompt.{Prompt, Resolved}
 use ai.tools
 use ai.tools.{Output, Toolbox, ToolSource}
@@ -87,9 +88,9 @@ pub enum Part {
 // a hint and dropping it changes nothing about what was said.
 @derive(Equatable, Display)
 pub struct Message {
-    pub role: Role
-    pub parts: List<Part>
-    pub name: ?string = none
+    role: Role
+    parts: List<Part>
+    name: ?string = none
     // "Everything up to and including this turn may be served from the vendor's prompt cache."
     //
     // A **hint**, exactly like `name`: a codec whose vendor has no explicit breakpoint (OpenAI and
@@ -101,17 +102,17 @@ pub struct Message {
     //
     // Defaulted to `false`, so nothing that builds a `Message` today changes, and meaningless on a
     // message that came *back* from a model — a reply is not a request.
-    pub cache_breakpoint: bool = false
+    cache_breakpoint: bool = false
 
-    fn system(text: string): Message {
+    pub fn system(text: string): Message {
         return Message { role: Role.System, parts: [Part.Text(text: text)] }
     }
 
-    fn user(text: string): Message {
+    pub fn user(text: string): Message {
         return Message { role: Role.User, parts: [Part.Text(text: text)] }
     }
 
-    fn assistant(text: string): Message {
+    pub fn assistant(text: string): Message {
         return Message { role: Role.Assistant, parts: [Part.Text(text: text)] }
     }
 
@@ -127,7 +128,7 @@ pub struct Message {
     // Every `Text` part, concatenated. The plain-string view of a turn — what a chat UI renders and
     // what `run_sync` hands back. Thinking, tool calls, and attachments are deliberately absent:
     // they are not what the message *said*.
-    fn text(): string {
+    pub fn text(): string {
         mut out = ""
         for p in self.parts {
             out = out ~ match p {
@@ -141,7 +142,7 @@ pub struct Message {
     // The same turn, marked as the end of a cacheable prefix. The hand door: `AgentConfig` marks
     // the system prompt's stable part for you, and this is how a caller marks a long stable context
     // turn of their own — a retrieved corpus, a code base, a transcript.
-    fn cached(): Message {
+    pub fn cached(): Message {
         return Message { cache_breakpoint: true, ...self }
     }
 
@@ -192,26 +193,26 @@ pub fn prompt_turns(role: Role, r: Resolved, mark: bool): List<Message> {
 // can be shared across concurrent runs without any of them disturbing the others.
 @derive(Equatable, Display)
 pub struct Conversation {
-    pub messages: List<Message> = []
+    messages: List<Message> = []
 
-    fn new(): Conversation {
+    pub fn new(): Conversation {
         return Conversation {}
     }
 
     // The one-user-turn conversation — the shape behind `run_sync`.
-    fn of(text: string): Conversation {
+    pub fn of(text: string): Conversation {
         return Conversation { messages: [Message.user(text)] }
     }
 
-    fn with(m: Message): Conversation {
+    pub fn with(m: Message): Conversation {
         return Conversation { messages: self.messages ~ [m] }
     }
 
-    fn user(text: string): Conversation {
+    pub fn user(text: string): Conversation {
         return self.with(Message.user(text))
     }
 
-    fn assistant(text: string): Conversation {
+    pub fn assistant(text: string): Conversation {
         return self.with(Message.assistant(text))
     }
 
@@ -234,15 +235,15 @@ pub struct Conversation {
         return Conversation { messages: self.messages ~ prompt_turns(role, p.resolve(), cache) }
     }
 
-    fn system_prompt(p: Prompt, cache: bool = false): Conversation {
+    pub fn system_prompt(p: Prompt, cache: bool = false): Conversation {
         return self.with_prompt(Role.System, p, cache)
     }
 
-    fn user_prompt(p: Prompt, cache: bool = false): Conversation {
+    pub fn user_prompt(p: Prompt, cache: bool = false): Conversation {
         return self.with_prompt(Role.User, p, cache)
     }
 
-    fn last(): ?Message {
+    pub fn last(): ?Message {
         return self.messages.last()
     }
 }
@@ -251,10 +252,10 @@ pub struct Conversation {
 // aggregate token usage, how many model calls it took, and why the model stopped.
 @derive(Equatable, Display)
 pub struct Run {
-    pub messages: List<Message>
-    pub usage: Usage = Usage {}
-    pub turns: int = 0
-    pub stop: StopReason = StopReason.EndTurn
+    messages: List<Message>
+    usage: Usage = Usage {}
+    turns: int = 0
+    stop: StopReason = StopReason.EndTurn
     // Every non-`Allow` guard verdict this run produced, in the order they fired.
     //
     // **This is what makes "the guardrails are firing" observable without a metrics backend** —
@@ -264,17 +265,17 @@ pub struct Run {
     //
     // Defaulted, so nothing that builds a `Run` today changes. A run stopped *by* a guard returns
     // `AiError.Guard` instead and carries the stage, the guard and the reason there.
-    pub verdicts: List<Fired> = []
+    verdicts: List<Fired> = []
 
     // The assistant's answer as plain text, or `""` if the run produced no assistant turn.
-    fn text(): string {
+    pub fn text(): string {
         return match self.messages.last() {
             some(m) => m.text(),
             none => "",
         }
     }
 
-    fn conversation(): Conversation {
+    pub fn conversation(): Conversation {
         return Conversation { messages: self.messages }
     }
 }
@@ -341,7 +342,7 @@ pub enum AiError {
     Cancelled
 
     impl Display {
-        fn to_string(): string {
+        pub fn to_string(): string {
             return match self {
                 AiError.Transport(inner) => "transport failed (${inner.kind()}): ${inner.message()}",
                 AiError.Provider(status, code, message) => "provider error ${status} ${code}: ${message}",
@@ -359,7 +360,7 @@ pub enum AiError {
     }
 
     impl From<HttpError> {
-        fn from(e: HttpError): AiError {
+        pub fn from(e: HttpError): AiError {
             return AiError.Transport(inner: e)
         }
     }
@@ -375,7 +376,7 @@ pub enum AiError {
 // slots (tool sources, guards). Build the agent per worker; ship the config.
 @derive(Equatable, Display)
 pub struct AgentConfig {
-    pub model: string
+    model: string
     // The system prompt, **kept split** rather than flattened to a string.
     //
     // A `Resolved` from `.with_system("…")` is one static and no holes; one from
@@ -388,22 +389,22 @@ pub struct AgentConfig {
     // call per turn and re-sends the system prompt on each; a hole re-evaluated per call could
     // produce different text each time, and the stable prefix would stop being byte-identical —
     // which is the *only* thing OpenAI's and Google's implicit prefix caching keys on.
-    pub system: ?Resolved = none
-    pub max_tokens: ?int = none
-    pub temperature: ?float = none
-    pub stop: List<string> = []
+    system: ?Resolved = none
+    max_tokens: ?int = none
+    temperature: ?float = none
+    stop: List<string> = []
     // How many model calls one run may make. The tool loop is the only thing that continues it, so
     // this is what stops a model that keeps asking for tools from spending an afternoon and a
     // budget. Eight is enough for the multi-step tasks tools exist for and small enough that a loop
     // costs pennies to discover; exceeding it is `AiError.MaxTurns`, never a truncated answer.
-    pub max_turns: int = 8
+    max_turns: int = 8
     // How many tool calls may be in flight at once. **Unbounded parallel dispatch is a good way to
     // get rate-limited by your own agent** — a model that asks for twelve web fetches should not
     // open twelve sockets — so `std.task.map_bounded` caps it here rather than in each tool.
-    pub tool_concurrency: int = 4
+    tool_concurrency: int = 4
     // Names the run's root span (`invoke_agent {name}`) and its `gen_ai.agent.name` attribute. Keep
     // it low-cardinality — it is a span attribute, not an identifier.
-    pub name: string = "agent"
+    name: string = "agent"
     // Whether `run` and `run_sync` stream the model call. `stream` streams regardless.
     //
     // **False by default, and that is a decision rather than an omission.** Streaming and buffering
@@ -412,20 +413,20 @@ pub struct AgentConfig {
     // The buffered path is therefore the one `Retry`, `Cache`, `Record`, `Mock`, and `Logging`
     // cover, and defaulting to streaming would quietly take those away from every caller who never
     // asked for it. Turning it on is one builder call and the README states the trade.
-    pub stream: bool = false
+    stream: bool = false
     // How many times a *streamed* call is retried before giving up.
     //
     // The streaming path owns its retry: `para/api`'s `Retry` middleware sits on the buffered path
     // only, because retrying means asking for the body again and a stream you have begun reading
     // cannot be asked twice. Two attempts after the first is the same shape `Retry` defaults to.
-    pub stream_retries: int = 2
+    stream_retries: int = 2
     // The first backoff between streamed attempts, in milliseconds; each further attempt doubles
     // it. Small, because a streamed call that failed at all failed at the head, which is fast.
-    pub stream_backoff_ms: int = 500
+    stream_backoff_ms: int = 500
     // Vendor-specific request-body keys, as raw JSON fragments, merged verbatim by the codec.
     // Documented as unchecked: this is the escape hatch for a knob the neutral model has not
     // grown yet, and a malformed fragment surfaces at `encode`.
-    pub extra: Map<string, string> = {}
+    extra: Map<string, string> = {}
     // Whether the run loop marks the system prompt's stable prefix as a prompt-cache breakpoint.
     //
     // **True by default**, which is the whole claim of DESIGN §14: caching is correct by default
@@ -437,7 +438,7 @@ pub struct AgentConfig {
     // Turn it off for a single-call workload with a large system prompt that is never repeated
     // inside the cache's TTL — that is the one shape where a cache *write* (Anthropic prices it at
     // 1.25× input) is a real cost with no return.
-    pub cache: bool = true
+    cache: bool = true
     // What the run does when a guard denies (DESIGN §9).
     //
     // On the **config** rather than on the agent, where the guards themselves live, and the split is
@@ -446,15 +447,15 @@ pub struct AgentConfig {
     //
     // `Stop` by default. A guard that fired and was silently worked around is not a guard, and a
     // default that quietly continues would make every guardrail advisory unless its author noticed.
-    pub on_deny: OnDeny = OnDeny.Stop
+    on_deny: OnDeny = OnDeny.Stop
 
-    fn new(model: string): AgentConfig {
+    pub fn new(model: string): AgentConfig {
         return AgentConfig { model: model }
     }
 
     // The system prompt as ordinary text. Unchanged for every existing caller: a plain string is a
     // prompt with no holes, so it is entirely stable and gets the maximal cache prefix.
-    fn with_system(text: string): AgentConfig {
+    pub fn with_system(text: string): AgentConfig {
         return AgentConfig { system: some(Resolved.of(text)), ...self }
     }
 
@@ -465,7 +466,7 @@ pub struct AgentConfig {
     // `string`: it is not a record, class, or enum declared in this module`), so no bound can span
     // the two. Two named doors that agree on one representation beat a `dyn` parameter that agrees
     // on nothing the checker can see.
-    fn with_system_prompt(p: Prompt): AgentConfig {
+    pub fn with_system_prompt(p: Prompt): AgentConfig {
         return AgentConfig { system: some(p.resolve()), ...self }
     }
 
@@ -478,7 +479,7 @@ pub struct AgentConfig {
         }
     }
 
-    fn with_max_tokens(n: int): AgentConfig {
+    pub fn with_max_tokens(n: int): AgentConfig {
         return AgentConfig { max_tokens: some(n), ...self }
     }
 
@@ -490,15 +491,15 @@ pub struct AgentConfig {
         return AgentConfig { stop: stop, ...self }
     }
 
-    fn with_max_turns(n: int): AgentConfig {
+    pub fn with_max_turns(n: int): AgentConfig {
         return AgentConfig { max_turns: n, ...self }
     }
 
-    fn with_tool_concurrency(n: int): AgentConfig {
+    pub fn with_tool_concurrency(n: int): AgentConfig {
         return AgentConfig { tool_concurrency: n, ...self }
     }
 
-    fn named(name: string): AgentConfig {
+    pub fn named(name: string): AgentConfig {
         return AgentConfig { name: name, ...self }
     }
 
@@ -508,7 +509,7 @@ pub struct AgentConfig {
 
     // Stream every model call, including the ones `run` and `run_sync` make. See `stream` above for
     // what this costs: the `para/api` layers do not cover the streaming path.
-    fn streamed(): AgentConfig {
+    pub fn streamed(): AgentConfig {
         return AgentConfig { stream: true, ...self }
     }
 
@@ -517,7 +518,7 @@ pub struct AgentConfig {
         return AgentConfig { stream: false, ...self }
     }
 
-    fn with_stream_retries(n: int): AgentConfig {
+    pub fn with_stream_retries(n: int): AgentConfig {
         return AgentConfig { stream_retries: n, ...self }
     }
 
@@ -527,19 +528,19 @@ pub struct AgentConfig {
 
     // Mark the system prompt's stable prefix for the vendor's prompt cache — the default, spelled
     // out for a caller switching back.
-    fn cached(): AgentConfig {
+    pub fn cached(): AgentConfig {
         return AgentConfig { cache: true, ...self }
     }
 
     // Send no cache breakpoint at all. The stable text is still first and still byte-identical, so
     // a vendor that caches implicitly keeps doing so; only the explicit marker goes away.
-    fn uncached(): AgentConfig {
+    pub fn uncached(): AgentConfig {
         return AgentConfig { cache: false, ...self }
     }
 
     // What a denied run does. `OnDeny.Stop` is the default; `Feedback(max)` hands the reason back to
     // the model, and `Replace(parts)` swaps in a canned reply.
-    fn denying(policy: OnDeny): AgentConfig {
+    pub fn denying(policy: OnDeny): AgentConfig {
         return AgentConfig { on_deny: policy, ...self }
     }
 }
@@ -594,8 +595,8 @@ pub enum Event {
 // that is for both to open a new block on the same condition — a change of `(id, kind)`.
 @derive(Equatable, Display)
 pub struct Open {
-    pub kind: string = ""
-    pub id: string = ""
+    kind: string = ""
+    id: string = ""
 }
 
 // The events that close whatever block is open, if any.
@@ -691,16 +692,16 @@ pub trait EventSink {
 // "a buffered run and a streamed run agree" a claim a test can check rather than an aspiration.
 pub struct Silent {
     impl EventSink {
-        async fn emit(e: Event): void {}
+        pub async fn emit(e: Event): void {}
     }
 }
 
 // Sends every event down a channel, and lets the channel's backpressure reach the run.
 pub struct Channel {
-    pub tx: Sender<Event>
+    tx: Sender<Event>
 
     impl EventSink {
-        async fn emit(e: Event): void {
+        pub async fn emit(e: Event): void {
             self.tx.send(e).await
         }
     }
@@ -739,7 +740,7 @@ pub trait Streamer {
 // `StreamDecoder.finish` says so in its message; see the README.
 pub struct HttpStreamer {
     impl Streamer {
-        fn open(req: Request, framing: Framing): Result<dyn Frames, AiError> {
+        pub fn open(req: Request, framing: Framing): Result<dyn Frames, AiError> {
             return Ok(LiveFrames { stream: client.stream(req, framing)? })
         }
     }
@@ -749,11 +750,11 @@ struct LiveFrames {
     stream: FrameStream
 
     impl Frames {
-        async fn next(): ?Frame {
+        pub async fn next(): ?Frame {
             return self.stream.recv().await
         }
 
-        fn close(): void {
+        pub fn close(): void {
             self.stream.close()
         }
     }
@@ -1246,14 +1247,14 @@ fn dispatchable_calls(calls: List<Part>, output: ?Output): List<Part> {
 // trade `api`'s middleware stack already makes. Ship the `AgentConfig`, build the `Agent` per
 // worker.
 pub struct Agent<P: Provider> {
-    pub config: AgentConfig
-    pub provider: P
-    pub api: Api
+    config: AgentConfig
+    provider: P
+    api: Api
     // Where a *streamed* call's frames come from. A second transport slot rather than a second
     // middleware, because a streaming body cannot go through `api` at all (DESIGN O-4) — see
     // `Streamer`. Defaults to the real client; `frames` swaps in a scripted replay.
-    pub transport: dyn Streamer
-    pub toolbox: Toolbox = Toolbox.new()
+    transport: dyn Streamer
+    toolbox: Toolbox = Toolbox.new()
     // The shape this agent's next reply must take, when one was asked for.
     //
     // On the `Agent` rather than on `AgentConfig` because it is a **per-call** decision, not a
@@ -1261,32 +1262,32 @@ pub struct Agent<P: Provider> {
     // a config field would make "which of my agents is the structured one" a thing to keep track of.
     // `expecting` returns a new agent, so nothing is mutated and a structured call cannot leak into
     // the next ordinary one.
-    pub output: ?Output = none
+    output: ?Output = none
     // The guards this agent consults, in registration order (DESIGN §9).
     //
     // A `List<dyn Guard>` for the same reason the toolbox holds `List<dyn ToolSource>`: a guard is
     // an ordinary Noeta value and none is privileged, so the only thing they have in common is the
     // trait. It also means an agent with guards is `!Send`, which is the trade `dyn` always is —
     // ship the `AgentConfig`, build the agent per worker.
-    pub guards: List<dyn Guard> = []
+    guards: List<dyn Guard> = []
 
     // An agent over the default transport: a plain client wrapped in `Retry`, which honors a
     // vendor's `Retry-After` and backs off on 429/502/503/504. `retry(0)` on the client is
     // deliberate and load-bearing — std's own retry lives *inside* `send`, beneath every
     // middleware, and leaving both on multiplies the attempts.
-    fn from(cfg: AgentConfig, p: P): Agent<P> {
+    pub fn from(cfg: AgentConfig, p: P): Agent<P> {
         return Agent.over(cfg, p, Api.new(client.new().retry(0)).with(Retry.new()))
     }
 
     // An agent over a transport chain you composed yourself — the door for `Mock`, `Record`,
     // `Cache`, a custom auth layer, or a client with a different timeout.
-    fn over(cfg: AgentConfig, p: P, api: Api): Agent<P> {
+    pub fn over(cfg: AgentConfig, p: P, api: Api): Agent<P> {
         return Agent { config: cfg, provider: p, api: api, transport: HttpStreamer {} }
     }
 
     // Read streamed frames from somewhere other than the network — the door `Mock` uses, and the
     // one a recorded-transcript fixture would. The buffered half still goes through `api`.
-    fn frames(src: dyn Streamer): Agent<P> {
+    pub fn frames(src: dyn Streamer): Agent<P> {
         return Agent { transport: src, ...self }
     }
 
@@ -1296,14 +1297,14 @@ pub struct Agent<P: Provider> {
     // checks every name against what is already there, and both can fail — a name collision across
     // sources is a construction-time error naming both, never a last-one-wins. Chains:
     // `Agent.from(cfg, p).tools(Local.new())?.tools(mcp)?`.
-    fn tools(src: dyn ToolSource): Result<Agent<P>, AiError> {
+    pub fn tools(src: dyn ToolSource): Result<Agent<P>, AiError> {
         grown = self.toolbox.with(src)?
         return Ok(Agent { toolbox: grown, ...self })
     }
 
     // Attach a `Toolbox` you assembled yourself — the infallible door, for a caller that would
     // rather handle the collision error once at construction than at each `tools` call.
-    fn with_toolbox(box: Toolbox): Agent<P> {
+    pub fn with_toolbox(box: Toolbox): Agent<P> {
         return Agent { toolbox: box, ...self }
     }
 
@@ -1320,7 +1321,7 @@ pub struct Agent<P: Provider> {
     // is not `Send`, and `AgentConfig` is the value you ship to a worker. Build the guards per
     // worker; ship the config, which carries the `on_deny` *policy* because a policy is a plain
     // value.
-    fn with(g: dyn Guard): Agent<P> {
+    pub fn with(g: dyn Guard): Agent<P> {
         return Agent { guards: self.guards ~ [g], ...self }
     }
 
@@ -1375,7 +1376,7 @@ pub struct Agent<P: Provider> {
     // Erasing the provider behind this trait leaves exactly one parameter to name, which is the one
     // the caller actually cares about. See §8.1's divergence note.
     impl Structured {
-        fn ask_json(conv: Conversation, out: Output): Result<string, AiError> {
+        pub fn ask_json(conv: Conversation, out: Output): Result<string, AiError> {
             run = drive_sync(self.expecting(out), conv)?
             return structured_json(run, out)
         }
@@ -1392,7 +1393,7 @@ pub struct Agent<P: Provider> {
     //
     // `streamed` is an argument rather than a config read because the two doors disagree on
     // purpose: `stream(conv, out)` streams whatever the config says, and `run_sync` never does.
-    fn request(conv: Conversation, streamed: bool = false): ModelRequest {
+    pub fn request(conv: Conversation, streamed: bool = false): ModelRequest {
         mut msgs = conv.messages
         match self.config.system {
             some(sys) => {
@@ -1613,7 +1614,7 @@ pub struct Agent<P: Provider> {
     // the `runId` it sent. Both default to `""`, which means "the loop decides" — an empty thread
     // id stays empty, and an empty run id becomes a fresh uuid, exactly as before. See
     // `para.ai.agui.respond`, which is the caller that passes them.
-    async fn stream(conv: Conversation, out: Sender<Event>, thread_id: string = "", run_id: string = ""): Result<Run, AiError> {
+    pub async fn stream(conv: Conversation, out: Sender<Event>, thread_id: string = "", run_id: string = ""): Result<Run, AiError> {
         return self.drive(conv, Channel { tx: out }, true, thread_id, run_id).await
     }
 
@@ -1624,7 +1625,7 @@ pub struct Agent<P: Provider> {
     // exact event sequence is a `@test` block with no server and no socket. Unlike `stream`, this
     // follows `AgentConfig.stream` — a synchronous renderer over a buffered call is a legitimate
     // thing to want, and it gets the identical events.
-    async fn run_into(conv: Conversation, sink: dyn EventSink): Result<Run, AiError> {
+    pub async fn run_into(conv: Conversation, sink: dyn EventSink): Result<Run, AiError> {
         return self.drive(conv, sink, self.config.stream).await
     }
 
@@ -1634,7 +1635,7 @@ pub struct Agent<P: Provider> {
     // vocabulary, one accumulator, one emitter, and the sink as the only difference. Whether the
     // model call is streamed follows `AgentConfig.stream`, which is off by default because the
     // buffered transport is the one the `para/api` layers cover (DESIGN O-4).
-    async fn run(conv: Conversation): Result<Run, AiError> {
+    pub async fn run(conv: Conversation): Result<Run, AiError> {
         return self.drive(conv, Silent {}, self.config.stream).await
     }
 
@@ -1644,7 +1645,7 @@ pub struct Agent<P: Provider> {
     // string entry point is what makes a framework testable in a `@test` block. It stays
     // synchronous so it is callable from anywhere, including a plain `fn` — see `drive_sync` for
     // how a synchronous door drives an asynchronous loop without a second copy of the loop.
-    fn run_sync(text: string): Result<string, AiError> {
+    pub fn run_sync(text: string): Result<string, AiError> {
         run = drive_sync(self, Conversation.of(text))?
         return Ok(run.text())
     }
@@ -1664,7 +1665,7 @@ pub struct Agent<P: Provider> {
     // which is what every other door passes: an empty thread id stays empty rather than being
     // invented, and an empty run id becomes a fresh uuid. The run id is also the span's
     // `para.ai.run.id`, so a client-supplied one correlates a trace with the caller's own record.
-    async fn drive(conv: Conversation, sink: dyn EventSink, streamed: bool, thread_id: string = "", run_id: string = ""): Result<Run, AiError> {
+    pub async fn drive(conv: Conversation, sink: dyn EventSink, streamed: bool, thread_id: string = "", run_id: string = ""): Result<Run, AiError> {
         id = if run_id == "" then "${uuid()}" else run_id
         root = tracing.span("invoke_agent ${self.config.name}")
         root.set_attribute("gen_ai.operation.name", "invoke_agent")

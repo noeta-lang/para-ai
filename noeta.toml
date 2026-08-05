@@ -1,7 +1,10 @@
 [package]
 name = "para/ai"
-version = "0.2.0"
-toolchain = ">=0.3"
+version = "0.3.0"
+# The minimum noeta this package works with; enforced at resolve time from noeta 0.2.1 on. 0.5 is a
+# floor rather than a preference: a method is private by default from 0.5 on, so this package's
+# `pub` surface is not grammar an earlier toolchain reads the same way.
+toolchain = ">=0.5"
 license = "MIT OR Apache-2.0"
 description = "An agent harness for Noeta: a provider codec seam, a run loop over para/api, and GenAI-semconv telemetry."
 keywords = ["ai", "llm", "agent", "anthropic", "openai"]
@@ -10,7 +13,7 @@ keywords = ["ai", "llm", "agent", "anthropic", "openai"]
 # The transport para/ai composes over (DESIGN O-6). Retry-with-`Retry-After`, `Mock`, `Record`,
 # `Cache`, and `Logging` are already written and already the idiom this suite documents; the run
 # loop bottoms out in an `Api`, so none of them is para/ai code.
-para = [{ version = "^0.2", package = "para/api" }]
+para = [{ version = "^0.3", package = "para/api" }]
 
 # `para/api` ships a native extension crate — the `@openapi` directive's compile-time expansion hook
 # and the `para.api.url` percent-encoder its generated query strings are built with. para/ai
