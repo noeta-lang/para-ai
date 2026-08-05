@@ -696,9 +696,13 @@ The `para/api` line holds here too: `Err` means the call failed, while an HTTP e
 
 Noeta's expression tiers turn a `@name { … }` block into a typed value built from **statics and hole thunks**, with `${…}` holes parsed by the full grammar, closed over the enclosing scope, and type-checked:
 
-```noeta
-use para.ai.prompt.render
+```toml
+# noeta.toml — a tier is bound, never imported (noeta 0.5)
+[directives]
+prompt = "para/ai"
+```
 
+```noeta
 sys = @prompt {
     You are a support agent for ${company.name}.
     The customer's plan is ${account.plan}, opened ${account.opened_at}.
@@ -788,8 +792,8 @@ para-ai/
 ```toml
 [dependencies]
 para = [
-    { version = "^0.1", package = "para/ai" },
-    { version = "^0.1", package = "para/api" },   # the transport chain para/ai composes over
+    { version = "^0.3", package = "para/ai" },
+    { version = "^0.3", package = "para/api" },   # the transport chain para/ai composes over
 ]
 
 [trust]

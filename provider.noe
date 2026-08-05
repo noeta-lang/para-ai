@@ -58,17 +58,17 @@ pub enum Framing {
 // absolute `url` also flows through a based client unchanged.
 @derive(Equatable, Display)
 pub struct Wire {
-    pub url: string
-    pub method: string = "post"
-    pub headers: Map<string, string> = {}
-    pub body: string = ""
-    pub framing: Framing = Framing.Whole
+    url: string
+    method: string = "post"
+    headers: Map<string, string> = {}
+    body: string = ""
+    framing: Framing = Framing.Whole
 
     // Whether this request's body has to be read incrementally. The run loop's one branch point:
     // `false` goes through the `para/api` chain and `decode_deltas`, `true` through
     // `client.stream` and a `StreamDecoder`. Everything after the deltas is the same code either
     // way.
-    fn streamed(): bool {
+    pub fn streamed(): bool {
         return self.framing != Framing.Whole
     }
 
@@ -80,18 +80,18 @@ pub struct Wire {
     // "does this go down the streaming path?" is a better thing for the run loop to ask than an enum
     // comparison. The run loop turns this back into `std.http.Framing` at the one place it calls
     // `client.stream`.
-    fn ndjson(): bool {
+    pub fn ndjson(): bool {
         return self.framing == Framing.Ndjson
     }
 
     // The same request, read as a stream. Two constructors rather than a settable field, so that a
     // codec whose module already names `std.http.Framing` — which every codec that touches frames
     // does — never has to name this enum too.
-    fn as_sse(): Wire {
+    pub fn as_sse(): Wire {
         return Wire { ...self, framing: Framing.Sse }
     }
 
-    fn as_ndjson(): Wire {
+    pub fn as_ndjson(): Wire {
         return Wire { ...self, framing: Framing.Ndjson }
     }
 }
@@ -109,9 +109,9 @@ pub struct Wire {
 // vendor.
 @derive(Equatable, Display)
 pub struct ModelRequest {
-    pub model: string
-    pub messages: List<Message>
-    pub tools: List<ToolSpec> = []
+    model: string
+    messages: List<Message>
+    tools: List<ToolSpec> = []
     // The shape the reply must take, when the caller asked for one (DESIGN §8).
     //
     // **Defaulted, so adding it broke no caller** — and every codec that honors it does so in its
@@ -123,16 +123,16 @@ pub struct ModelRequest {
     // A codec with **no** structured-output mode must refuse at `encode` rather than send the
     // request unconstrained. A caller who asked for a schema and silently got prose learns about it
     // as a decode failure with no path, which is the worst place to find out.
-    pub output: ?Output = none
-    pub max_tokens: ?int = none
-    pub temperature: ?float = none
-    pub stop: List<string> = []
-    pub extra: Map<string, string> = {}
+    output: ?Output = none
+    max_tokens: ?int = none
+    temperature: ?float = none
+    stop: List<string> = []
+    extra: Map<string, string> = {}
     // Ask the vendor to stream the answer. A codec that honors it sets the vendor's streaming knob
     // (Anthropic: `"stream": true`) **and** a non-`Whole` `Wire.framing`; the run loop reads the
     // framing, not this flag, so a codec with no streaming endpoint simply ignores it and still
     // produces a correct request.
-    pub stream: bool = false
+    stream: bool = false
 }
 
 // --- The neutral reply ---------------------------------------------------------------------------
@@ -145,18 +145,18 @@ pub struct ModelRequest {
 // fold reasoning into `output_tokens` (Anthropic does).
 @derive(Equatable, Display)
 pub struct Usage {
-    pub input_tokens: int = 0
-    pub output_tokens: int = 0
-    pub cached_input_tokens: int = 0
-    pub reasoning_tokens: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cached_input_tokens: int = 0
+    reasoning_tokens: int = 0
 
-    fn total(): int {
+    pub fn total(): int {
         return self.input_tokens + self.output_tokens
     }
 
     // Aggregating usage across the turns of a run is `a + b`, which is what the run loop does.
     impl Add {
-        fn add(other: Usage): Usage {
+        pub fn add(other: Usage): Usage {
             return Usage {
                 input_tokens: self.input_tokens + other.input_tokens,
                 output_tokens: self.output_tokens + other.output_tokens,
@@ -180,7 +180,7 @@ pub enum StopReason {
 
     // The `gen_ai.response.finish_reasons` spelling, which is the OTel GenAI convention's — not
     // this enum's Noeta rendering.
-    fn semconv(): string {
+    pub fn semconv(): string {
         return match self {
             StopReason.EndTurn => "stop",
             StopReason.ToolUse => "tool_calls",
@@ -196,10 +196,10 @@ pub enum StopReason {
 // which is not always the one that was asked for.
 @derive(Equatable, Display)
 pub struct ModelReply {
-    pub parts: List<Part>
-    pub usage: Usage = Usage {}
-    pub stop: StopReason = StopReason.EndTurn
-    pub model: string = ""
+    parts: List<Part>
+    usage: Usage = Usage {}
+    stop: StopReason = StopReason.EndTurn
+    model: string = ""
 }
 
 // --- Deltas: the incremental unit ------------------------------------------------------------------

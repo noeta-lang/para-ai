@@ -37,24 +37,24 @@ use ai.tools.{Output, ToolSpec}
 // vendor requires on every request; `beta` is the `anthropic-beta` header's comma-joined list.
 @derive(Equatable, Display)
 pub struct Anthropic {
-    pub key: string
-    pub base_url: string = "https://api.anthropic.com"
-    pub version: string = "2023-06-01"
-    pub beta: List<string> = []
+    key: string
+    base_url: string = "https://api.anthropic.com"
+    version: string = "2023-06-01"
+    beta: List<string> = []
 
-    fn new(key: string): Anthropic {
+    pub fn new(key: string): Anthropic {
         return Anthropic { key: key }
     }
 
     // Point the codec at a gateway or a proxy. The path (`/v1/messages`) is unchanged — this
     // replaces the origin only.
-    fn at(base_url: string, key: string): Anthropic {
+    pub fn at(base_url: string, key: string): Anthropic {
         return Anthropic { key: key, base_url: base_url }
     }
 
     // Read the key from `ANTHROPIC_API_KEY`. `none` when it is unset or empty — para/ai never
     // reads a config file and never writes one, so the environment is the whole story.
-    fn from_env(): ?Anthropic {
+    pub fn from_env(): ?Anthropic {
         key = env.get("ANTHROPIC_API_KEY") ?? ""
         if key == "" {
             return none
@@ -63,14 +63,14 @@ pub struct Anthropic {
     }
 
     // Opt into one or more `anthropic-beta` features.
-    fn with_beta(flag: string): Anthropic {
+    pub fn with_beta(flag: string): Anthropic {
         return Anthropic { ...self, beta: self.beta ~ [flag] }
     }
 
     // `max_tokens` is **required** by the Messages API, so a request that does not name one gets
     // this. 4096 is deliberately unambitious: it is large enough for ordinary answers and small
     // enough that forgetting to set a budget cannot run up a bill.
-    fn default_max_tokens(): int {
+    pub fn default_max_tokens(): int {
         return 4096
     }
 }
@@ -444,7 +444,7 @@ pub class AnthropicStream {
     mut opened: bool
     mut closed: bool
 
-    fn new(): AnthropicStream {
+    pub fn new(): AnthropicStream {
         return AnthropicStream {
             ids: {},
             usage: Usage {},
@@ -549,7 +549,7 @@ pub class AnthropicStream {
     // anthropic.noe` — where this file *is* the entry — passes. Inline, it resolves everywhere.
     // See AGENTS.md for the minimal repro.
     impl StreamDecoder {
-        fn push(frame: Frame): Result<List<Delta>, AiError> {
+        pub fn push(frame: Frame): Result<List<Delta>, AiError> {
             // A keepalive comment dispatches no data. Nothing to decode, and it is not an error.
             if frame.data == "" {
                 return Ok([])
@@ -590,7 +590,7 @@ pub class AnthropicStream {
             return Ok([])
         }
 
-        fn finish(): Result<Usage, AiError> {
+        pub fn finish(): Result<Usage, AiError> {
             if !self.opened {
                 return Err(AiError.Decode(
                     path: "",
@@ -609,11 +609,11 @@ pub class AnthropicStream {
 }
 
 impl Provider for Anthropic {
-    fn name(): string {
+    pub fn name(): string {
         return "anthropic"
     }
 
-    fn encode(req: ModelRequest): Result<Wire, AiError> {
+    pub fn encode(req: ModelRequest): Result<Wire, AiError> {
         (system, turns) = encode_messages(req.messages)?
 
         mut body: Map<string, dyn> = {
@@ -679,7 +679,7 @@ impl Provider for Anthropic {
         return Ok(if req.stream then wire.as_sse() else wire)
     }
 
-    fn decode_deltas(body: string): Result<List<Delta>, AiError> {
+    pub fn decode_deltas(body: string): Result<List<Delta>, AiError> {
         doc = provider.parse_object(body, "anthropic reply")?
         // The served model leads, so the delta list describes the reply completely and the
         // streaming path needs no side channel for it.
@@ -693,18 +693,18 @@ impl Provider for Anthropic {
         ])
     }
 
-    fn decode_reply(body: string): Result<ModelReply, AiError> {
+    pub fn decode_reply(body: string): Result<ModelReply, AiError> {
         return Ok(provider.fold(self.decode_deltas(body)?, ""))
     }
 
-    fn decoder(): dyn StreamDecoder {
+    pub fn decoder(): dyn StreamDecoder {
         return AnthropicStream.new()
     }
 
     // Anthropic's error body is `{"type":"error","error":{"type":…,"message":…}}`. Decoding it into
     // `AiError.Provider(status, code, message)` is what makes `code == "rate_limit_error"`
     // matchable instead of a regex over prose.
-    fn decode_error(status: int, body: string): AiError {
+    pub fn decode_error(status: int, body: string): AiError {
         return match provider.parse_object(body, "anthropic error") {
             Ok(doc) => typed_error(status, doc),
             // A body that is not the documented envelope (an HTML error page from a proxy, an
@@ -719,7 +719,7 @@ impl Provider for Anthropic {
     // pure codec may do. Returning a fabricated number here would be trusted absolutely and be
     // wrong by a few percent, which surfaces as a vendor-side context error in the middle of a run.
     // A caller that needs a budget names its own margin instead.
-    fn estimate_tokens(msgs: List<Message>): ?int {
+    pub fn estimate_tokens(msgs: List<Message>): ?int {
         return none
     }
 }

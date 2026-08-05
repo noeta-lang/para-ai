@@ -29,7 +29,9 @@
 // (`prompt_turns`) and `para.ai.providers.*` owns the vendor spelling. That keeps the dependency
 // one-way — `ai.noe` imports this, never the reverse.
 //
-//     use para.ai.prompt.render                 // one import brings the tier into existence
+//     # noeta.toml — a tier is bound, never imported
+//     [directives]
+//     prompt = "para/ai"
 //
 //     sys = @prompt {
 //         You are a support agent for ${company.name}.
@@ -48,19 +50,19 @@
 // nor `Display`. That is the trade for laziness, and it is why `resolve()` exists — a `Resolved` is
 // a plain value struct that derives both, and it is what the rest of the package stores.
 pub struct Prompt {
-    pub statics: List<string>
-    pub holes: List<() -> string>
+    statics: List<string>
+    holes: List<() -> string>
 
     // A prompt with no holes, from ordinary text — the door a plain `string` comes through, so that
     // `AgentConfig.with_system("…")` and `.with_system_prompt(@prompt { … })` end up in exactly one
     // representation instead of two code paths.
-    fn of(text: string): Prompt {
+    pub fn of(text: string): Prompt {
         return Prompt { statics: [text], holes: [] }
     }
 
     // Whether this prompt interpolates nothing. Such a prompt is stable in its entirety, which is
     // the *maximal* cache prefix — the best case, not a degenerate one.
-    fn is_static(): bool {
+    pub fn is_static(): bool {
         return self.holes.len() == 0
     }
 
@@ -69,7 +71,7 @@ pub struct Prompt {
     //
     // **This evaluates no holes.** It is a read of `statics[0]`, which is why a cache decision
     // costs nothing even when the prompt interpolates a database read.
-    fn stable(): string {
+    pub fn stable(): string {
         return self.statics.first() ?? ""
     }
 
@@ -79,7 +81,7 @@ pub struct Prompt {
     // a counter must contribute the same text to every turn of a run, or the stable prefix stops
     // being byte-identical and implicit prefix caching silently stops matching. `AgentConfig`
     // resolves at configuration time for exactly that reason.
-    fn resolve(): Resolved {
+    pub fn resolve(): Resolved {
         mut values: List<string> = []
         for h in self.holes {
             values = values ~ [h()]
@@ -89,7 +91,7 @@ pub struct Prompt {
 
     // The whole prompt as text, holes evaluated. The escape hatch for a caller who wants a plain
     // string and is giving up the cache split to get it.
-    fn text(): string {
+    pub fn text(): string {
         return self.resolve().text()
     }
 
@@ -105,7 +107,7 @@ pub struct Prompt {
     // A combinator rather than something `render` does, because the tier's contract is that the
     // body is *verbatim* and a handler that quietly rewrote it would be lying about the bytes a
     // vendor's cache is keyed on. Trimming stays lazy — it rewrites statics and never calls a hole.
-    fn trimmed(): Prompt {
+    pub fn trimmed(): Prompt {
         n = self.statics.len()
         if n == 0 {
             return self
@@ -126,26 +128,26 @@ pub struct Prompt {
 // crosses a channel to a worker, and it still knows where the cache breakpoint goes.
 @derive(Equatable, Display)
 pub struct Resolved {
-    pub statics: List<string>
-    pub holes: List<string>
+    statics: List<string>
+    holes: List<string>
 
-    fn of(text: string): Resolved {
+    pub fn of(text: string): Resolved {
         return Resolved { statics: [text], holes: [] }
     }
 
-    fn is_static(): bool {
+    pub fn is_static(): bool {
         return self.holes.len() == 0
     }
 
     // Everything before the first hole — the text a prompt cache may keep.
-    fn stable(): string {
+    pub fn stable(): string {
         return self.statics.first() ?? ""
     }
 
     // Everything from the first hole on, interleaved back together. Stable *text* appears in here
     // too (`statics[1]` and after), and that is correct rather than sloppy: a cache prefix has to
     // be contiguous, so a static that sits behind a hole cannot be part of it.
-    fn volatile(): string {
+    pub fn volatile(): string {
         mut out = ""
         mut i = 0
         for h in self.holes {
@@ -158,7 +160,7 @@ pub struct Resolved {
         return out
     }
 
-    fn text(): string {
+    pub fn text(): string {
         return self.stable() ~ self.volatile()
     }
 }

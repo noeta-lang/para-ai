@@ -38,11 +38,11 @@ use para.ai.mock.Mock
 use para.ai.provider.ModelRequest
 use para.ai.providers.anthropic.Anthropic
 use para.ai.prompt.{Prompt, Resolved}
-// **This one import is what makes `@prompt { … }` exist in this file.** An expression tier is an
-// ordinary `@tier` declaration on a handler function, so bringing the handler into scope brings the
-// block syntax with it — no compiler plugin, no build step, and the same mechanism a package would
-// use to ship `@sql` or `@html`.
-use para.ai.prompt.render
+// **What makes `@prompt { … }` exist in this file is the manifest, not an import.** From noeta 0.5
+// a tier is a *tier directive*, and `[directives] prompt = "para/ai"` in `noeta.toml` is what links
+// this package's handler into the program. No `use` enables it and none is needed — which is the
+// point: nothing about importing `render` ever said "this is what makes the block an expression".
+// The same rule holds for every `@name`, whichever package and whichever kind — `@sql`, `@html`.
 
 // The account this run is about. Everything interpolated into the prompt comes from here, and every
 // field read is a hole the compiler type-checks: rename `plan` and the prompt stops compiling.
@@ -58,11 +58,11 @@ struct Account {
 class CountingRecall {
     pub mut calls: int
 
-    fn new(): CountingRecall {
+    pub fn new(): CountingRecall {
         return CountingRecall { calls: 0 }
     }
 
-    fn history(company: string): string {
+    pub fn history(company: string): string {
         self.calls = self.calls + 1
         return "${company} last contacted support on 2026-07-02 about billing."
     }

@@ -64,8 +64,8 @@ use ai.tools.{Arg, Local, Tool}
 // caller's behalf. `decode_input` hands them over; `respond_to`'s caller decides.
 @derive(Equatable, Display)
 pub struct Context {
-    pub description: string = ""
-    pub value: string = ""
+    description: string = ""
+    value: string = ""
 }
 
 // One tool the *client* declares in `RunAgentInput.tools` — a frontend tool, executed by the client
@@ -77,11 +77,11 @@ pub struct Context {
 // conversation itself.
 @derive(Equatable, Display)
 pub struct ClientTool {
-    pub name: string = ""
-    pub description: string = ""
+    name: string = ""
+    description: string = ""
     // The JSON Schema for the tool's parameters, as the text it arrived as — the same treatment
     // `Part.ToolCall.args` gets, and for the same reason: nothing here interprets it.
-    pub parameters: string = "{}"
+    parameters: string = "{}"
 }
 
 // AG-UI's `RunAgentInput`, decoded.
@@ -96,17 +96,17 @@ pub struct ClientTool {
 // vocabulary and not a conversion.
 @derive(Equatable, Display)
 pub struct RunInput {
-    pub thread_id: string = ""
+    thread_id: string = ""
     // The client's run id. Empty means the client sent none, and the run loop mints a uuid.
-    pub run_id: string = ""
-    pub messages: List<Message> = []
-    pub state: string = ""
-    pub forwarded_props: string = ""
-    pub context: List<Context> = []
-    pub tools: List<ClientTool> = []
+    run_id: string = ""
+    messages: List<Message> = []
+    state: string = ""
+    forwarded_props: string = ""
+    context: List<Context> = []
+    tools: List<ClientTool> = []
 
     // The conversation the run starts from.
-    fn conversation(): Conversation {
+    pub fn conversation(): Conversation {
         return Conversation { messages: self.messages }
     }
 }
@@ -552,10 +552,10 @@ pub trait FrameOut {
 // Live` block, because a standalone one is invisible to `dyn` coercion from any entry but this
 // module's own — see AGENTS.md, and the five stream decoders that are written the same way.
 pub struct Live {
-    pub sink: SseSink
+    sink: SseSink
 
     impl FrameOut {
-        fn send(f: Frame): void {
+        pub fn send(f: Frame): void {
             self.sink.send(f)
         }
     }
@@ -570,7 +570,7 @@ pub struct Live {
 pub class Tape {
     mut written: List<Frame>
 
-    fn new(): Tape {
+    pub fn new(): Tape {
         return Tape { written: [] }
     }
 
@@ -583,7 +583,7 @@ pub class Tape {
     }
 
     // Every frame's `data` payload, in order — the JSON documents a client would have parsed.
-    fn payloads(): List<string> {
+    pub fn payloads(): List<string> {
         mut out: List<string> = []
         for f in self.written {
             out = out ~ [f.data]
@@ -592,7 +592,7 @@ pub class Tape {
     }
 
     // The whole stream as the bytes it would have been on the wire.
-    fn wire(): string {
+    pub fn wire(): string {
         mut out = ""
         for f in self.written {
             out = out ~ wire_of(f)
@@ -601,7 +601,7 @@ pub class Tape {
     }
 
     impl FrameOut {
-        fn send(f: Frame): void {
+        pub fn send(f: Frame): void {
             self.written = self.written ~ [f]
         }
     }

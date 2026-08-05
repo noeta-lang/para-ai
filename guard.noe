@@ -104,25 +104,25 @@ pub enum OnDeny {
 // from a string is worse than passing the value.
 @derive(Equatable, Display)
 pub struct GuardCtx {
-    pub stage: Stage
-    pub run_id: string
+    stage: Stage
+    run_id: string
     // How many model calls the run has already made. `MaxTurns` is this and a comparison.
-    pub turn: int
-    pub parts: List<Part>
-    pub conversation: Conversation
+    turn: int
+    parts: List<Part>
+    conversation: Conversation
     // The tool under review, on the two tool stages; empty elsewhere.
-    pub tool: string = ""
+    tool: string = ""
     // The tool call's raw JSON arguments, on `ToolCall`; empty elsewhere.
-    pub args: string = ""
+    args: string = ""
     // Tokens the run has spent so far, aggregated over its calls. `TokenBudget` is this and a
     // comparison.
-    pub input_tokens: int = 0
-    pub output_tokens: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
 
     // Every `Text` part of the content under review, concatenated — what a textual guard actually
     // looks at. Thinking, attachments and tool blocks are deliberately absent, exactly as
     // `Message.text()` leaves them out: they are not what the content *said*.
-    fn text(): string {
+    pub fn text(): string {
         mut out = ""
         for p in self.parts {
             out = out ~ match p {
@@ -135,7 +135,7 @@ pub struct GuardCtx {
     }
 
     // The tokens spent so far, as one number.
-    fn tokens(): int {
+    pub fn tokens(): int {
         return self.input_tokens + self.output_tokens
     }
 }
@@ -160,9 +160,9 @@ pub trait Guard {
 // tell "the guardrails are configured" from "the guardrails are firing" without a metrics backend.
 @derive(Equatable, Display)
 pub struct Fired {
-    pub stage: Stage
-    pub guard: string
-    pub verdict: Verdict
+    stage: Stage
+    guard: string
+    verdict: Verdict
 }
 
 // --- Running them ----------------------------------------------------------------------------------
@@ -171,8 +171,8 @@ pub struct Fired {
 // of the guard that produced it.
 @derive(Equatable, Display)
 pub struct Decision {
-    pub verdict: Verdict
-    pub guard: string = ""
+    verdict: Verdict
+    guard: string = ""
 
     fn allowed(): bool {
         return self.verdict == Verdict.Allow
@@ -278,22 +278,22 @@ fn rewrites_counter(): dyn {
 // The plain one. `Approval` below is the four-way policy that also covers "ask a human"; this is the
 // case where the answer is a fixed list and there is nothing to decide at run time.
 pub struct ToolAllowlist {
-    pub allowed: List<string>
+    allowed: List<string>
 
-    fn new(allowed: List<string>): ToolAllowlist {
+    pub fn new(allowed: List<string>): ToolAllowlist {
         return ToolAllowlist { allowed: allowed }
     }
 
     impl Guard {
-        fn guard_name(): string {
+        pub fn guard_name(): string {
             return "tool_allowlist"
         }
 
-        fn stages(): List<Stage> {
+        pub fn stages(): List<Stage> {
             return [Stage.ToolCall]
         }
 
-        fn check(stage: Stage, ctx: GuardCtx): Verdict {
+        pub fn check(stage: Stage, ctx: GuardCtx): Verdict {
             if contains(self.allowed, ctx.tool) {
                 return Verdict.Allow
             }
@@ -326,9 +326,9 @@ pub enum Approve {
 // point of `ToolSource` — so approval needed no MCP-specific hook and `mcp.noe` adds no dispatch of
 // its own.
 pub struct Approval {
-    pub policy: Approve
+    policy: Approve
 
-    fn new(policy: Approve): Approval {
+    pub fn new(policy: Approve): Approval {
         return Approval { policy: policy }
     }
 
@@ -338,15 +338,15 @@ pub struct Approval {
     }
 
     impl Guard {
-        fn guard_name(): string {
+        pub fn guard_name(): string {
             return "approval"
         }
 
-        fn stages(): List<Stage> {
+        pub fn stages(): List<Stage> {
             return [Stage.ToolCall]
         }
 
-        fn check(stage: Stage, ctx: GuardCtx): Verdict {
+        pub fn check(stage: Stage, ctx: GuardCtx): Verdict {
             return match self.policy {
                 Approve.Auto => Verdict.Allow,
                 Approve.Deny => Verdict.Deny(reason: "tool calls are not approved on this run — `${ctx.tool}` was refused"),
@@ -378,22 +378,22 @@ fn asked(ask: (string, string) -> bool, ctx: GuardCtx): Verdict {
 // a guard so it lands in the same place every other policy decision does — and so `OnDeny.Replace`
 // can turn "this went on too long" into a civil answer rather than an error.
 pub struct MaxTurns {
-    pub max: int
+    max: int
 
-    fn new(max: int): MaxTurns {
+    pub fn new(max: int): MaxTurns {
         return MaxTurns { max: max }
     }
 
     impl Guard {
-        fn guard_name(): string {
+        pub fn guard_name(): string {
             return "max_turns"
         }
 
-        fn stages(): List<Stage> {
+        pub fn stages(): List<Stage> {
             return [Stage.Output]
         }
 
-        fn check(stage: Stage, ctx: GuardCtx): Verdict {
+        pub fn check(stage: Stage, ctx: GuardCtx): Verdict {
             if ctx.turn <= self.max {
                 return Verdict.Allow
             }
@@ -407,22 +407,22 @@ pub struct MaxTurns {
 // Checked after each model call rather than before, because the cost of a call is not knowable until
 // it has been made — so this bounds the *next* one, which is the only bound anybody can offer.
 pub struct TokenBudget {
-    pub max: int
+    max: int
 
-    fn new(max: int): TokenBudget {
+    pub fn new(max: int): TokenBudget {
         return TokenBudget { max: max }
     }
 
     impl Guard {
-        fn guard_name(): string {
+        pub fn guard_name(): string {
             return "token_budget"
         }
 
-        fn stages(): List<Stage> {
+        pub fn stages(): List<Stage> {
             return [Stage.Output]
         }
 
-        fn check(stage: Stage, ctx: GuardCtx): Verdict {
+        pub fn check(stage: Stage, ctx: GuardCtx): Verdict {
             if ctx.tokens() <= self.max {
                 return Verdict.Allow
             }
@@ -449,11 +449,11 @@ pub struct TokenBudget {
 // first. Filed upstream rather than worked around, because the workaround would be a regex
 // validator in this package, which would be a second, worse implementation of `regex.compile`.
 pub struct Redact {
-    pub pattern: Pattern
-    pub replacement: string
-    pub at: List<Stage>
+    pattern: Pattern
+    replacement: string
+    at: List<Stage>
 
-    fn new(pattern: string, replacement: string): Redact {
+    pub fn new(pattern: string, replacement: string): Redact {
         return Redact {
             pattern: regex.compile(pattern),
             replacement: replacement,
@@ -467,17 +467,17 @@ pub struct Redact {
     }
 
     impl Guard {
-        fn guard_name(): string {
+        pub fn guard_name(): string {
             return "redact"
         }
 
-        fn stages(): List<Stage> {
+        pub fn stages(): List<Stage> {
             return self.at
         }
 
         // A rewrite only when something actually matched. Answering `Rewrite` with identical content
         // would fire the metric on every turn and make "the guardrails are firing" meaningless.
-        fn check(stage: Stage, ctx: GuardCtx): Verdict {
+        pub fn check(stage: Stage, ctx: GuardCtx): Verdict {
             mut out: List<Part> = []
             mut changed = false
             for p in ctx.parts {
@@ -520,10 +520,10 @@ fn swapped_result(pattern: Pattern, replacement: string, id: string, content: st
 // the rule is "never discuss X", and expressing that as a regex invites the regex to be subtly wrong.
 // `Redact` is the one that takes a pattern.
 pub struct Blocklist {
-    pub phrases: List<string>
-    pub at: List<Stage>
+    phrases: List<string>
+    at: List<Stage>
 
-    fn new(phrases: List<string>): Blocklist {
+    pub fn new(phrases: List<string>): Blocklist {
         return Blocklist { phrases: phrases, at: [Stage.Input, Stage.Output] }
     }
 
@@ -532,15 +532,15 @@ pub struct Blocklist {
     }
 
     impl Guard {
-        fn guard_name(): string {
+        pub fn guard_name(): string {
             return "blocklist"
         }
 
-        fn stages(): List<Stage> {
+        pub fn stages(): List<Stage> {
             return self.at
         }
 
-        fn check(stage: Stage, ctx: GuardCtx): Verdict {
+        pub fn check(stage: Stage, ctx: GuardCtx): Verdict {
             haystack = ctx.text().lower()
             for phrase in self.phrases {
                 if haystack.contains(phrase.lower()) {
@@ -564,22 +564,22 @@ pub struct Blocklist {
 // `Validate` runs here too: `json.decode_typed` is the same recoverable, validating door
 // `json.try_parse::<T>` is, so an invariant the type declares is checked by this guard for free.
 pub struct SchemaGuard {
-    pub target: string
+    target: string
 
-    fn new(target: string): SchemaGuard {
+    pub fn new(target: string): SchemaGuard {
         return SchemaGuard { target: target }
     }
 
     impl Guard {
-        fn guard_name(): string {
+        pub fn guard_name(): string {
             return "schema"
         }
 
-        fn stages(): List<Stage> {
+        pub fn stages(): List<Stage> {
             return [Stage.Output]
         }
 
-        fn check(stage: Stage, ctx: GuardCtx): Verdict {
+        pub fn check(stage: Stage, ctx: GuardCtx): Verdict {
             text = ctx.text().trim()
             if text == "" {
                 return Verdict.Deny(reason: "the answer was empty and `${self.target}` was required")
@@ -611,14 +611,14 @@ pub struct SchemaGuard {
 // down with it. The failure is a span event instead, so it is visible without being fatal — silence
 // would be the unacceptable half of that trade.
 pub struct Recall {
-    pub src: dyn ToolSource
-    pub tool: string
-    pub top_k: int
+    src: dyn ToolSource
+    tool: string
+    top_k: int
     // The heading the recalled block is filed under. A heading rather than bare text because the
     // model has to be able to tell what it *remembered* from what the user just said.
-    pub heading: string = "Relevant memories:"
+    heading: string = "Relevant memories:"
 
-    fn new(src: dyn ToolSource, tool: string, top_k: int): Recall {
+    pub fn new(src: dyn ToolSource, tool: string, top_k: int): Recall {
         return Recall { src: src, tool: tool, top_k: top_k }
     }
 
@@ -627,15 +627,15 @@ pub struct Recall {
     }
 
     impl Guard {
-        fn guard_name(): string {
+        pub fn guard_name(): string {
             return "recall"
         }
 
-        fn stages(): List<Stage> {
+        pub fn stages(): List<Stage> {
             return [Stage.Input]
         }
 
-        fn check(stage: Stage, ctx: GuardCtx): Verdict {
+        pub fn check(stage: Stage, ctx: GuardCtx): Verdict {
             query = ctx.text().trim()
             if query == "" {
                 return Verdict.Allow
@@ -692,11 +692,11 @@ pub trait Asking {
 // misbehaving judge must not be able to shut down a working agent, and a judge that cannot be relied
 // on to say `FAIL` was never a security control to begin with.
 pub struct Judge {
-    pub model: dyn Asking
-    pub rubric: string
-    pub at: List<Stage>
+    model: dyn Asking
+    rubric: string
+    at: List<Stage>
 
-    fn new(model: dyn Asking, rubric: string): Judge {
+    pub fn new(model: dyn Asking, rubric: string): Judge {
         return Judge { model: model, rubric: rubric, at: [Stage.Output] }
     }
 
@@ -705,15 +705,15 @@ pub struct Judge {
     }
 
     impl Guard {
-        fn guard_name(): string {
+        pub fn guard_name(): string {
             return "judge"
         }
 
-        fn stages(): List<Stage> {
+        pub fn stages(): List<Stage> {
             return self.at
         }
 
-        fn check(stage: Stage, ctx: GuardCtx): Verdict {
+        pub fn check(stage: Stage, ctx: GuardCtx): Verdict {
             content = ctx.text().trim()
             if content == "" {
                 return Verdict.Allow
@@ -992,7 +992,7 @@ fn listed(names: List<string>): string {
         weight: int
 
         impl Validate {
-            fn validate(): Result<void, string> {
+            pub fn validate(): Result<void, string> {
                 if self.weight > 10 {
                     return Err("weight out of range: ${self.weight}")
                 }
@@ -1015,15 +1015,15 @@ fn listed(names: List<string>): string {
         }
 
         impl Guard {
-            fn guard_name(): string {
+            pub fn guard_name(): string {
                 return "spy"
             }
 
-            fn stages(): List<Stage> {
+            pub fn stages(): List<Stage> {
                 return [Stage.Output]
             }
 
-            fn check(stage: Stage, ctx: GuardCtx): Verdict {
+            pub fn check(stage: Stage, ctx: GuardCtx): Verdict {
                 self.stages_seen = self.stages_seen ~ ["${stage}"]
                 return Verdict.Allow
             }
@@ -1050,20 +1050,20 @@ fn listed(names: List<string>): string {
         }
 
         impl ToolSource {
-            fn source_name(): string {
+            pub fn source_name(): string {
                 return "scripted-memory"
             }
 
-            fn tool_type(): string {
+            pub fn tool_type(): string {
                 return "mcp"
             }
 
-            fn specs(): Result<List<ToolSpec>, AiError> {
+            pub fn specs(): Result<List<ToolSpec>, AiError> {
                 empty: List<ToolSpec> = []
                 return Ok(empty)
             }
 
-            fn call(name: string, args: string): Result<string, AiError> {
+            pub fn call(name: string, args: string): Result<string, AiError> {
                 self.calls = self.calls ~ ["${name} ${args}"]
                 if self.fails {
                     return Err(AiError.Mcp(server: "scripted-memory", code: "server_exited", message: "gone"))
@@ -1093,7 +1093,7 @@ fn listed(names: List<string>): string {
         }
 
         impl Asking {
-            fn ask(text: string): Result<string, AiError> {
+            pub fn ask(text: string): Result<string, AiError> {
                 self.seen = self.seen ~ [text]
                 if self.fails {
                     return Err(AiError.Provider(status: 429, code: "rate_limit_error", message: "slow down"))

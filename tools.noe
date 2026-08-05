@@ -69,8 +69,8 @@ use ai.provider
 @attribute(Function, Method)
 @role(Semantic.TrustBoundary)
 pub struct Tool {
-    pub about: string = ""
-    pub name: string = ""
+    about: string = ""
+    name: string = ""
 }
 
 // Per-parameter and per-**field** metadata. `help` becomes the `description` in the derived JSON
@@ -84,7 +84,7 @@ pub struct Tool {
 // `FieldSpec.attrs` for a field.
 @attribute(Param, Field)
 pub struct Arg {
-    pub help: string = ""
+    help: string = ""
 }
 
 // --- What a provider is told ---------------------------------------------------------------------
@@ -95,9 +95,9 @@ pub struct Arg {
 // `Equatable` and `Display` — so a test can assert on the exact schema a signature produced.
 @derive(Equatable, Display)
 pub struct ToolSpec {
-    pub name: string
-    pub description: string = ""
-    pub parameters: string
+    name: string
+    description: string = ""
+    parameters: string
 }
 
 // The shape a structured reply must take — `ToolSpec`'s twin, and deliberately the same three
@@ -115,10 +115,10 @@ pub struct ToolSpec {
 // vendor constrains a schema or tool name to `[A-Za-z0-9_-]`, which a dotted path is not.
 @derive(Equatable, Display)
 pub struct Output {
-    pub name: string
-    pub target: string
-    pub schema: string
-    pub description: string = ""
+    name: string
+    target: string
+    schema: string
+    description: string = ""
 
     // The schema for a declared type, derived from its fields, recursively.
     //
@@ -130,21 +130,21 @@ pub struct Output {
     // Fallible for the same reason `ToolSource.specs` is: a field whose declared type has no JSON
     // representation is a bug in the *type*, and answering with a half-schema would let a vendor
     // enforce a shape that decodes into nothing.
-    fn of<T>(): Result<Output, AiError> {
+    pub fn of<T>(): Result<Output, AiError> {
         return Output.for_name(type_name::<T>(), "")
     }
 
     // The same, with a description the model reads — the structured-output counterpart of
     // `#[Tool(about: …)]`, and worth writing for the same reason. The description is the half of an
     // `Output` that cannot be derived from a declaration, which is why it is still passed in.
-    fn described<T>(about: string): Result<Output, AiError> {
+    pub fn described<T>(about: string): Result<Output, AiError> {
         return Output.for_name(type_name::<T>(), about)
     }
 
     // The same, keyed by a reflection identity computed at run time rather than named in source.
     // `of`/`described` are what a call site wants; this is for the case where the type is not
     // statically known — a name read from a registry, a table, or a wire message.
-    fn for_name(target: string, about: string): Result<Output, AiError> {
+    pub fn for_name(target: string, about: string): Result<Output, AiError> {
         return match schema_for(target) {
             Ok(text) => Ok(Output {
                 name: last_segment(target),
@@ -189,7 +189,7 @@ pub trait ToolSource {
 // Every `#[Tool]` function in the program. Stateless — the reflection index is compile-time, so
 // there is nothing to build and nothing to keep.
 pub struct Local {
-    fn new(): Local {
+    pub fn new(): Local {
         return Local {}
     }
 }
@@ -263,15 +263,15 @@ fn is_method_target(target: string): bool {
 }
 
 impl ToolSource for Local {
-    fn source_name(): string {
+    pub fn source_name(): string {
         return "local"
     }
 
-    fn tool_type(): string {
+    pub fn tool_type(): string {
         return "function"
     }
 
-    fn specs(): Result<List<ToolSpec>, AiError> {
+    pub fn specs(): Result<List<ToolSpec>, AiError> {
         all = declared_tools()
         mut out: List<ToolSpec> = []
         mut claimed: List<string> = []
@@ -311,7 +311,7 @@ impl ToolSource for Local {
         return Ok(out)
     }
 
-    fn call(name: string, args: string): Result<string, AiError> {
+    pub fn call(name: string, args: string): Result<string, AiError> {
         target = match target_of(name) {
             some(t) => t,
             none => "",
@@ -1226,17 +1226,17 @@ pub struct Toolbox {
     sources: List<dyn ToolSource> = []
     entries: List<Entry> = []
 
-    fn new(): Toolbox {
+    pub fn new(): Toolbox {
         return Toolbox {}
     }
 
     // The one-source toolbox — the common case, and what `Agent.tools(src)` builds.
-    fn of(src: dyn ToolSource): Result<Toolbox, AiError> {
+    pub fn of(src: dyn ToolSource): Result<Toolbox, AiError> {
         return Toolbox.new().with(src)
     }
 
     // Add a source, collision-checked. Chains: `Toolbox.of(a)?.with(b)?`.
-    fn with(src: dyn ToolSource): Result<Toolbox, AiError> {
+    pub fn with(src: dyn ToolSource): Result<Toolbox, AiError> {
         specs = src.specs()?
         origin = src.source_name()
         kind = src.tool_type()
@@ -1259,7 +1259,7 @@ pub struct Toolbox {
 
     // What goes on the request. Infallible: every schema was derived (and every collision refused)
     // when the source was added.
-    fn specs(): List<ToolSpec> {
+    pub fn specs(): List<ToolSpec> {
         mut out: List<ToolSpec> = []
         for e in self.entries {
             out = out ~ [e.spec]
@@ -1267,7 +1267,7 @@ pub struct Toolbox {
         return out
     }
 
-    fn names(): List<string> {
+    pub fn names(): List<string> {
         mut out: List<string> = []
         for e in self.entries {
             out = out ~ [e.spec.name]
@@ -1275,15 +1275,15 @@ pub struct Toolbox {
         return out
     }
 
-    fn len(): int {
+    pub fn len(): int {
         return self.entries.len()
     }
 
-    fn is_empty(): bool {
+    pub fn is_empty(): bool {
         return self.entries.len() == 0
     }
 
-    fn has(name: string): bool {
+    pub fn has(name: string): bool {
         return match find_entry(self.entries, name) {
             some(_) => true,
             none => false,
@@ -1291,7 +1291,7 @@ pub struct Toolbox {
     }
 
     // `gen_ai.tool.type` for one tool — `"function"` for a local `#[Tool]`, `"mcp"` for a server's.
-    fn tool_type(name: string): string {
+    pub fn tool_type(name: string): string {
         return match find_entry(self.entries, name) {
             some(e) => e.tool_type,
             none => "function",
@@ -1300,7 +1300,7 @@ pub struct Toolbox {
 
     // Route one call to the source that declared it. An unknown name is an `Err` listing what the
     // agent does have, which is a far better correction turn than "not found".
-    fn call(name: string, args: string): Result<string, AiError> {
+    pub fn call(name: string, args: string): Result<string, AiError> {
         return match find_entry(self.entries, name) {
             some(e) => self.sources[e.at].call(name, args),
             none => Err(AiError.Tool(

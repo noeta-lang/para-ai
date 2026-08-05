@@ -51,7 +51,7 @@ struct Extraction {
     note: ?string
 
     impl Validate {
-        fn validate(): Result<void, string> {
+        pub fn validate(): Result<void, string> {
             if self.confidence < 0.0 || self.confidence > 1.0 {
                 return Err("confidence out of range: ${self.confidence}")
             }

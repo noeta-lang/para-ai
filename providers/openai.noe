@@ -60,45 +60,45 @@ pub enum Auth {
 //     mistake worth naming rather than a block to quietly drop.
 @derive(Equatable, Display)
 pub struct OpenAiCompat {
-    pub key: string = ""
+    key: string = ""
     // The API root, *including* the version segment — `/chat/completions` is appended to it. A
     // gateway, a proxy, or a record/replay fixture server is a constructor argument, not a fork.
-    pub base_url: string = "https://api.openai.com/v1"
+    base_url: string = "https://api.openai.com/v1"
     // `gen_ai.provider.name` on every span and metric this codec's calls produce, so it must be
     // low-cardinality and stable. It is also what an `AiError.Encode` names, which is why a
     // misconfigured gateway does not report itself as "openai".
-    pub vendor: string = "openai"
-    pub auth: Auth = Auth.Bearer
+    vendor: string = "openai"
+    auth: Auth = Auth.Bearer
     // Merged into every request's headers, after the codec's own. OpenRouter's `HTTP-Referer` and
     // `X-Title` live here.
-    pub headers: Map<string, string> = {}
+    headers: Map<string, string> = {}
     // Raw JSON fragments merged into every request body — the hook DESIGN §2.1 asks for. This is
     // where OpenRouter's `provider` routing preferences and `models` fallback array live, and it is
     // the same unchecked-in-content, checked-in-syntax contract `ModelRequest.extra` has. A
     // per-request `extra` is merged *after* this, so a caller can always override a standing key.
-    pub extra: Map<string, string> = {}
-    pub max_tokens_key: string = "max_completion_tokens"
-    pub documents: bool = true
-    pub reasoning_back: bool = false
+    extra: Map<string, string> = {}
+    max_tokens_key: string = "max_completion_tokens"
+    documents: bool = true
+    reasoning_back: bool = false
 
-    fn new(key: string): OpenAiCompat {
+    pub fn new(key: string): OpenAiCompat {
         return OpenAiCompat { key: key }
     }
 
     // The door for a sixth OpenAI-compatible provider. Everything else about this codec already
     // works; what varies is where to send it and what to call it.
-    fn at(base_url: string, key: string, vendor: string = "openai_compat"): OpenAiCompat {
+    pub fn at(base_url: string, key: string, vendor: string = "openai_compat"): OpenAiCompat {
         return OpenAiCompat { key: key, base_url: base_url, vendor: vendor }
     }
 
-    fn with_header(name: string, value: string): OpenAiCompat {
+    pub fn with_header(name: string, value: string): OpenAiCompat {
         return OpenAiCompat { ...self, headers: self.headers.set(name, value) }
     }
 
     // A standing body key, as a raw JSON fragment. Unchecked in content and checked in syntax: a
     // fragment that is not JSON at all is caught at `encode`, naming the key, rather than becoming
     // a vendor-side 400 with no context.
-    fn with_body(key: string, json_fragment: string): OpenAiCompat {
+    pub fn with_body(key: string, json_fragment: string): OpenAiCompat {
         return OpenAiCompat { ...self, extra: self.extra.set(key, json_fragment) }
     }
 }
@@ -111,19 +111,19 @@ pub struct OpenAiCompat {
 
 // OpenAI itself — the family base, and the only configuration that is entirely defaults.
 pub struct OpenAi {
-    fn new(key: string): OpenAiCompat {
+    pub fn new(key: string): OpenAiCompat {
         return OpenAiCompat.new(key)
     }
 
     // Point at Azure OpenAI, a corporate gateway, or a fixture server. The path
     // (`/chat/completions`) is unchanged — this replaces the origin and the version segment.
-    fn at(base_url: string, key: string): OpenAiCompat {
+    pub fn at(base_url: string, key: string): OpenAiCompat {
         return OpenAiCompat { key: key, base_url: base_url }
     }
 
     // Read the key from `OPENAI_API_KEY`. `none` when it is unset or empty — para/ai never reads a
     // config file and never writes one, so the environment is the whole story.
-    fn from_env(): ?OpenAiCompat {
+    pub fn from_env(): ?OpenAiCompat {
         key = env.get("OPENAI_API_KEY") ?? ""
         if key == "" {
             return none
@@ -142,7 +142,7 @@ pub struct OpenAi {
 // `usage.completion_tokens_details.reasoning_tokens`, which is OpenAI's own field, so the base
 // already reads it.
 pub struct OpenRouter {
-    fn new(key: string): OpenAiCompat {
+    pub fn new(key: string): OpenAiCompat {
         return OpenAiCompat {
             key: key,
             base_url: "https://openrouter.ai/api/v1",
@@ -152,7 +152,7 @@ pub struct OpenRouter {
         }
     }
 
-    fn from_env(): ?OpenAiCompat {
+    pub fn from_env(): ?OpenAiCompat {
         key = env.get("OPENROUTER_API_KEY") ?? ""
         if key == "" {
             return none
@@ -162,13 +162,13 @@ pub struct OpenRouter {
 
     // `HTTP-Referer` and `X-Title` are how OpenRouter attributes a request to an app and lists it
     // on their leaderboards. Optional, and inert everywhere else in this codec.
-    fn app(key: string, referer: string, title: string): OpenAiCompat {
+    pub fn app(key: string, referer: string, title: string): OpenAiCompat {
         return OpenRouter.new(key).with_header("HTTP-Referer", referer).with_header("X-Title", title)
     }
 
     // The `models` fallback array: when the first model is unavailable, rate-limited, or refuses,
     // OpenRouter routes to the next one in the list rather than failing the call.
-    fn fallbacks(codec: OpenAiCompat, models: List<string>): OpenAiCompat {
+    pub fn fallbacks(codec: OpenAiCompat, models: List<string>): OpenAiCompat {
         names: List<dyn> = models.map(fn(m) => m)
         return codec.with_body("models", json.stringify(names))
     }
@@ -190,12 +190,12 @@ pub struct OpenRouter {
 // four field values, and it means a program written against OpenAI runs against a local model by
 // changing one constructor call.
 pub struct OllamaCompat {
-    fn local(): OpenAiCompat {
+    pub fn local(): OpenAiCompat {
         return OllamaCompat.at("http://localhost:11434")
     }
 
     // `host` is an origin — `http://localhost:11434` — and `/v1` is appended to it.
-    fn at(host: string): OpenAiCompat {
+    pub fn at(host: string): OpenAiCompat {
         return OpenAiCompat {
             key: "",
             base_url: normalize_host(host) ~ "/v1",
@@ -209,7 +209,7 @@ pub struct OllamaCompat {
 
     // `OLLAMA_HOST` is the variable the vendor's own CLI reads, and it is conventionally written
     // without a scheme (`localhost:11434`), so it is completed rather than rejected.
-    fn from_env(): OpenAiCompat {
+    pub fn from_env(): OpenAiCompat {
         return OllamaCompat.at(env.get("OLLAMA_HOST") ?? "http://localhost:11434")
     }
 }
@@ -711,7 +711,7 @@ pub class OpenAiStream {
     mut opened: bool
     mut stopped: bool
 
-    fn of(vendor: string): OpenAiStream {
+    pub fn of(vendor: string): OpenAiStream {
         return OpenAiStream {
             vendor: vendor,
             ids: {},
@@ -784,7 +784,7 @@ pub class OpenAiStream {
     // module is not the entry, so `OpenAiCompat.decoder()` fails to check from a consuming package
     // while this file's own suite passes. See AGENTS.md.
     impl StreamDecoder {
-        fn push(frame: Frame): Result<List<Delta>, AiError> {
+        pub fn push(frame: Frame): Result<List<Delta>, AiError> {
             // A keepalive comment dispatches no data — OpenRouter sends `: OPENROUTER PROCESSING`
             // every few seconds — and the terminator is not a document.
             if frame.data == "" || frame.data == done_marker() {
@@ -815,7 +815,7 @@ pub class OpenAiStream {
             return Ok(out)
         }
 
-        fn finish(): Result<Usage, AiError> {
+        pub fn finish(): Result<Usage, AiError> {
             if !self.opened {
                 return Err(AiError.Decode(
                     path: "",
@@ -834,11 +834,11 @@ pub class OpenAiStream {
 }
 
 impl Provider for OpenAiCompat {
-    fn name(): string {
+    pub fn name(): string {
         return self.vendor
     }
 
-    fn encode(req: ModelRequest): Result<Wire, AiError> {
+    pub fn encode(req: ModelRequest): Result<Wire, AiError> {
         mut body: Map<string, dyn> = {
             "model": req.model,
             "messages": encode_messages(self, req.messages)?,
@@ -910,7 +910,7 @@ impl Provider for OpenAiCompat {
         return Ok(if req.stream then wire.as_sse() else wire)
     }
 
-    fn decode_deltas(body: string): Result<List<Delta>, AiError> {
+    pub fn decode_deltas(body: string): Result<List<Delta>, AiError> {
         doc = provider.parse_object(body, "${self.vendor} reply")?
         // Some gateways answer 200 with an error document. It is still an error.
         if doc.has("error") {
@@ -928,15 +928,15 @@ impl Provider for OpenAiCompat {
         ])
     }
 
-    fn decode_reply(body: string): Result<ModelReply, AiError> {
+    pub fn decode_reply(body: string): Result<ModelReply, AiError> {
         return Ok(provider.fold(self.decode_deltas(body)?, ""))
     }
 
-    fn decoder(): dyn StreamDecoder {
+    pub fn decoder(): dyn StreamDecoder {
         return OpenAiStream.of(self.vendor)
     }
 
-    fn decode_error(status: int, body: string): AiError {
+    pub fn decode_error(status: int, body: string): AiError {
         return match provider.parse_object(body, "${self.vendor} error") {
             Ok(doc) => typed_error(status, doc),
             // An HTML error page from a proxy, or an empty 502: the raw text is the only evidence of
@@ -949,7 +949,7 @@ impl Provider for OpenAiCompat {
     // could run — OpenAI's is a Python/Rust library and a byte-pair table, Ollama's lives inside the
     // served model. Returning a fabricated number here would be trusted absolutely and be wrong by a
     // few percent, which surfaces as a vendor-side context error in the middle of a run.
-    fn estimate_tokens(msgs: List<Message>): ?int {
+    pub fn estimate_tokens(msgs: List<Message>): ?int {
         return none
     }
 }
