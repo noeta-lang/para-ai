@@ -3,16 +3,16 @@ version = 2
 
 [[package]]
 name = "para/api"
-version = "0.2.0"
+version = "0.3.0"
 source = "git"
 url = "https://github.com/noeta-lang/para-api"
-tag = "v0.2.0"
-sha = "0646807d17121e176db398851e64ece93f7943ba"
+tag = "v0.3.0"
+sha = "960c993aa43ce7159442f3b6f44b4bf33cfab752"
 native = "native"
 edition = "2026"
-hash = "493eef4f4a197c4df665bf5dbc510dbfb60bef789a04b88bd947e2c662f36efb"
+hash = "d69d2cc190a9ecda5030bacdf52c6bced77f8cc938ca44904d78062cf46cbbf9"
 
 [[scope]]
 name = "para/api"
 issuer = "https://token.actions.githubusercontent.com"
-identity = "https://github.com/noeta-lang/para-api/.github/workflows/release.yml@refs/tags/v0.2.0"
+identity = "https://github.com/noeta-lang/para-api/.github/workflows/release.yml@refs/tags/v0.3.0"
